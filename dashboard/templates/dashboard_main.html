@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="20">
+<title>MediaDEV Monitor</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --ok:#10b981;--stale:#f59e0b;--err:#ef4444;--dis:#6b7280;--blue:#3b82f6;--purple:#8b5cf6;
+  --bg:#07091a;--c1:#0c0f22;--c2:#111827;--bd:#1e2d45;--bdh:#2d4060;
+  --tx:#e2e8f0;--muted:#64748b;--r:10px
+}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--tx);min-height:100vh}
+
+/* TOPBAR */
+.tb{background:rgba(12,15,34,.96);backdrop-filter:blur(12px);border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:99}
+.tbi{max-width:1500px;margin:0 auto;padding:12px 24px;display:flex;align-items:center;justify-content:space-between}
+.logo{display:flex;align-items:center;gap:9px;font-size:15px;font-weight:700}
+.dot{width:8px;height:8px;background:var(--ok);border-radius:50%;animation:p 2s infinite}
+@keyframes p{0%,100%{box-shadow:0 0 0 2px rgba(16,185,129,.2)}50%{box-shadow:0 0 0 7px rgba(16,185,129,0)}}
+.badge{display:flex;align-items:center;gap:5px;background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--ok);font-size:10px;font-weight:700;padding:3px 9px;border-radius:20px;letter-spacing:.08em;text-transform:uppercase}
+.tb-r{display:flex;align-items:center;gap:14px;font-size:12px;color:var(--muted)}
+
+/* LAYOUT */
+.main{max-width:1500px;margin:0 auto;padding:28px 24px}
+
+/* KPIs */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:15px;margin-bottom:32px}
+.k{background:var(--c1);border:1px solid var(--bd);border-radius:var(--r);padding:20px 22px;position:relative;overflow:hidden;transition:border-color .2s}
+.k:hover{border-color:var(--bdh)}
+.k-shine{position:absolute;top:-50px;right:-50px;width:140px;height:140px;border-radius:50%;opacity:.07;pointer-events:none}
+.k-ico{font-size:20px;margin-bottom:10px;display:block}
+.k-lbl{font-size:10px;font-weight:700;text-transform:uppercase;color:var(--muted);letter-spacing:.1em;margin-bottom:6px}
+.k-val{font-size:34px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums;letter-spacing:-1px}
+.k-val.g{color:var(--ok)}.k-val.b{color:var(--blue)}.k-val.y{color:var(--stale)}.k-val.r{color:var(--err)}.k-val.p{color:var(--purple)}
+.k-sub{font-size:11px;color:var(--muted);margin-top:7px}
+
+/* SECTION */
+.sh{display:flex;align-items:center;gap:10px;margin-bottom:18px}
+.sh-t{font-size:14px;font-weight:700}
+.sh-tag{font-size:10px;background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.2);color:var(--blue);padding:2px 8px;border-radius:4px}
+
+/* STREAM GRID */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+
+/* STREAM CARD */
+.sc{background:var(--c1);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden;text-decoration:none;color:inherit;display:block;transition:box-shadow .2s,border-color .2s,transform .15s}
+.sc:hover{border-color:var(--bdh);box-shadow:0 6px 24px rgba(0,0,0,.5);transform:translateY(-2px)}
+.sc.ok{border-top:3px solid var(--ok)}.sc.stale{border-top:3px solid var(--stale)}.sc.error{border-top:3px solid var(--err)}.sc.disabled{border-top:3px solid var(--dis)}
+
+.sc-body{padding:16px 18px}
+.sc-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.sc-name{font-size:13px;font-weight:700;font-family:'SF Mono','Fira Code',monospace}
+.sc-badges{display:flex;gap:5px}
+
+.pill{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:700;padding:3px 8px;border-radius:20px;text-transform:uppercase;letter-spacing:.05em}
+.pill.ok{background:rgba(16,185,129,.1);color:var(--ok);border:1px solid rgba(16,185,129,.2)}
+.pill.stale{background:rgba(245,158,11,.1);color:var(--stale);border:1px solid rgba(245,158,11,.2)}
+.pill.error{background:rgba(239,68,68,.1);color:var(--err);border:1px solid rgba(239,68,68,.2)}
+.pill.disabled{background:rgba(107,114,128,.1);color:var(--dis);border:1px solid rgba(107,114,128,.2)}
+.pill.cb{background:rgba(239,68,68,.08);color:#fca5a5;border:1px solid rgba(239,68,68,.2);font-size:9px}
+.pdot{width:4px;height:4px;border-radius:50%;background:currentColor}
+
+/* UPTIME BAR */
+.ub{margin-bottom:12px}
+.ub-h{display:flex;justify-content:space-between;font-size:10px;color:var(--muted);margin-bottom:4px;font-weight:600;letter-spacing:.05em}
+.ub-t{height:3px;background:var(--c2);border-radius:3px;overflow:hidden}
+.ub-f{height:100%;border-radius:3px}
+
+/* METRICS 2x3 */
+.mg{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.mb{background:var(--c2);border:1px solid var(--bd);border-radius:6px;padding:8px 10px}
+.ml{font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:3px}
+.mv{font-size:13px;font-weight:700;font-variant-numeric:tabular-nums}
+.mv.g{color:var(--ok)}.mv.y{color:var(--stale)}.mv.r{color:var(--err)}.mv.b{color:var(--blue)}
+
+/* FOOTER */
+.sc-footer{padding:9px 18px;background:var(--c2);border-top:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between}
+.sc-meta{font-size:10px;color:var(--muted)}
+.arr{font-size:13px;color:var(--muted)}
+
+/* PAGE FOOTER */
+.pf{text-align:center;margin-top:40px;padding-top:20px;border-top:1px solid var(--bd);font-size:11px;color:var(--muted)}
+.pf a{color:var(--blue);text-decoration:none}
+
+@media(max-width:600px){.kpis{grid-template-columns:1fr 1fr}.grid{grid-template-columns:1fr}.main{padding:16px 12px}}
+</style>
+</head>
+<body>
+
+<div class="tb">
+  <div class="tbi">
+    <div class="logo"><div class="dot"></div>MediaDEV Monitor</div>
+    <div class="tb-r">
+      <span>{{ updated }}</span>
+      <span class="badge"><div class="dot" style="width:6px;height:6px"></div>Live</span>
+    </div>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- KPIs GLOBALES -->
+  <div class="kpis">
+    <div class="k">
+      <div class="k-shine" style="background:var(--ok)"></div>
+      <span class="k-ico">📡</span>
+      <div class="k-lbl">Online ahora</div>
+      <div class="k-val {% if online == total %}g{% elif online > total//2 %}y{% else %}r{% endif %}">
+        {{ online }}<span style="font-size:18px;font-weight:400;color:var(--muted)">/{{ total }}</span>
+      </div>
+      <div class="k-sub">{{ ((online/total)*100)|int }}% de streams activos</div>
+    </div>
+
+    <div class="k">
+      <div class="k-shine" style="background:var(--blue)"></div>
+      <span class="k-ico">⏱️</span>
+      <div class="k-lbl">Uptime sistema</div>
+      <div class="k-val {% if uptime_global>=95 %}g{% elif uptime_global>=80 %}y{% else %}r{% endif %}">
+        {{ uptime_global }}<span style="font-size:18px;font-weight:400;color:var(--muted)">%</span>
+      </div>
+      <div class="k-sub">Promedio todos los streams (24h)</div>
+    </div>
+
+    <div class="k">
+      <div class="k-shine" style="background:var(--blue)"></div>
+      <span class="k-ico">💾</span>
+      <div class="k-lbl">Datos relayados</div>
+      <div class="k-val b">{{ mb_global }}<span style="font-size:18px;font-weight:400;color:var(--muted)"> MB</span></div>
+      <div class="k-sub">Últimas 24 horas</div>
+    </div>
+
+    <div class="k">
+      <div class="k-shine" style="background:var(--purple)"></div>
+      <span class="k-ico">⚡</span>
+      <div class="k-lbl">Bitrate total</div>
+      <div class="k-val p">{{ bitrate_total }}<span style="font-size:18px;font-weight:400;color:var(--muted)"> KB/s</span></div>
+      <div class="k-sub">Todos los streams (1h)</div>
+    </div>
+
+    <div class="k">
+      <div class="k-shine" style="background:var(--err)"></div>
+      <span class="k-ico">🚨</span>
+      <div class="k-lbl">Incidentes activos</div>
+      <div class="k-val {% if incidents==0 %}g{% else %}r{% endif %}">{{ incidents }}</div>
+      <div class="k-sub">
+        {% if cb_open > 0 %}⚠ {{ cb_open }} con circuit breaker abierto{% else %}Todo nominal{% endif %}
+      </div>
+    </div>
+
+    <div class="k">
+      <div class="k-shine" style="background:var(--stale)"></div>
+      <span class="k-ico">🔄</span>
+      <div class="k-lbl">Reinicios hoy</div>
+      <div class="k-val {% if restarts==0 %}g{% elif restarts<5 %}y{% else %}r{% endif %}">{{ restarts }}</div>
+      <div class="k-sub">Acumulado del día (GMT-6)</div>
+    </div>
+  </div>
+
+  <!-- STREAMS -->
+  <div class="sh">
+    <div class="sh-t">📺 Streams</div>
+    <div class="sh-tag">{{ streams|length }} canales — click para detalle y player</div>
+  </div>
+
+  <div class="grid">
+  {% for s in streams %}
+  <a class="sc {{ s.color }}" href="/stream/{{ s.id }}">
+    <div class="sc-body">
+      <div class="sc-top">
+        <div class="sc-name">{{ s.id }}</div>
+        <div class="sc-badges">
+          {% if s.cb_state == 'OPEN' %}
+          <span class="pill cb">⛔ CB</span>
+          {% endif %}
+          <span class="pill {{ s.color }}">
+            <span class="pdot"></span>
+            {{ s.status }}
+          </span>
+        </div>
+      </div>
+
+      <!-- Uptime bar -->
+      {% set up = s.uptime_24h %}
+      <div class="ub">
+        <div class="ub-h">
+          <span>Uptime 24h</span>
+          {% if up is none %}
+          <span style="color:var(--muted)">—</span>
+          {% else %}
+          <span style="color:{% if up>=95 %}var(--ok){% elif up>=80 %}var(--stale){% else %}var(--err){% endif %}">{{ up }}%</span>
+          {% endif %}
+        </div>
+        <div class="ub-t">
+          <div class="ub-f" style="width:{{ up or 0 }}%;background:{% if (up or 0)>=95 %}var(--ok){% elif (up or 0)>=80 %}var(--stale){% else %}var(--err){% endif %}"></div>
+        </div>
+      </div>
+
+      <!-- Métricas 3x2 -->
+      <div class="mg">
+        <div class="mb">
+          <div class="ml">MB 24h</div>
+          <div class="mv b">{{ s.mb_24h }}</div>
+        </div>
+        <div class="mb">
+          <div class="ml">Bitrate</div>
+          <div class="mv">{{ s.bitrate }}<span style="font-size:9px;color:var(--muted)"> KB/s</span></div>
+        </div>
+        <div class="mb">
+          <div class="ml">Caídas 24h</div>
+          <div class="mv {% if s.downs_24h==0 %}g{% elif s.downs_24h<=2 %}y{% else %}r{% endif %}">{{ s.downs_24h }}</div>
+        </div>
+        <div class="mb">
+          <div class="ml">Segmentos</div>
+          <div class="mv">{{ s.segs }}</div>
+        </div>
+        <div class="mb">
+          <div class="ml">Antigüedad</div>
+          <div class="mv {% if s.age > 60 %}r{% elif s.age > 30 %}y{% else %}g{% endif %}">{{ s.age }}s</div>
+        </div>
+        <div class="mb">
+          <div class="ml">Reiniciado</div>
+          <div class="mv {% if s.restart_today > 0 %}y{% else %}g{% endif %}">{{ s.restart_today }}x</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sc-footer">
+      <div class="sc-meta">
+        {% if s.last_down != '—' %}↓ {{ s.last_down }}{% else %}Sin caídas registradas{% endif %}
+      </div>
+      <span class="arr">→</span>
+    </div>
+  </a>
+  {% endfor %}
+  </div>
+
+  <div class="pf">
+    MediaDEV Stream Analytics • 12 canales Honduras • 24/7 &nbsp;|&nbsp;
+    <a href="/api/status">API JSON</a>
+  </div>
+</div>
+</body>
+</html>

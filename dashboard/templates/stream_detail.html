@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>{{ sid }} — MediaDEV</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --ok:#10b981;--stale:#f59e0b;--err:#ef4444;--dis:#6b7280;--blue:#3b82f6;--purple:#8b5cf6;
+  --bg:#07091a;--c1:#0c0f22;--c2:#111827;--bd:#1e2d45;--bdh:#2d4060;
+  --tx:#e2e8f0;--muted:#64748b;--r:10px
+}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--tx)}
+
+/* TOPBAR */
+.tb{background:rgba(12,15,34,.96);backdrop-filter:blur(12px);border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:99}
+.tbi{max-width:1200px;margin:0 auto;padding:11px 24px;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.back{color:var(--muted);text-decoration:none;font-size:13px;transition:color .15s}
+.back:hover{color:var(--tx)}
+.tb-id{font-size:14px;font-weight:700;font-family:'SF Mono','Fira Code',monospace}
+.snav{display:flex;gap:5px;flex-wrap:wrap}
+.snav a{font-size:10px;padding:2px 7px;border-radius:4px;border:1px solid var(--bd);color:var(--muted);text-decoration:none;font-family:monospace;transition:all .15s}
+.snav a:hover{border-color:var(--bdh);color:var(--tx)}
+.snav a.cur{border-color:var(--blue);color:var(--blue);background:rgba(59,130,246,.08)}
+
+/* MAIN */
+.main{max-width:1200px;margin:0 auto;padding:26px 24px}
+
+/* HERO */
+.hero{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:28px;flex-wrap:wrap}
+.h-id{font-size:26px;font-weight:800;font-family:'SF Mono','Fira Code',monospace;letter-spacing:-.5px;margin-bottom:6px}
+.h-meta{font-size:12px;color:var(--muted);line-height:1.8}
+
+.pill{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:700;padding:4px 11px;border-radius:20px;text-transform:uppercase;letter-spacing:.05em}
+.pill.ok{background:rgba(16,185,129,.1);color:var(--ok);border:1px solid rgba(16,185,129,.25)}
+.pill.stale{background:rgba(245,158,11,.1);color:var(--stale);border:1px solid rgba(245,158,11,.25)}
+.pill.error{background:rgba(239,68,68,.1);color:var(--err);border:1px solid rgba(239,68,68,.25)}
+.pill.disabled{background:rgba(107,114,128,.1);color:var(--dis);border:1px solid rgba(107,114,128,.25)}
+.pdot{width:6px;height:6px;border-radius:50%;background:currentColor;animation:pp 2s infinite}
+@keyframes pp{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* CARD */
+.card{background:var(--c1);border:1px solid var(--bd);border-radius:var(--r);padding:22px;margin-bottom:22px}
+.card-t{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:18px;padding-bottom:12px;border-top:0;border-bottom:1px solid var(--bd)}
+
+/* PLAYER */
+.player-wrap{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:center}
+video.ha{width:100%;height:44px;border-radius:6px;background:#000}
+.p-ctrl{display:flex;flex-direction:column;align-items:center;gap:8px}
+.p-btn{width:48px;height:48px;background:var(--blue);border:none;border-radius:50%;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:transform .15s,background .15s;flex-shrink:0}
+.p-btn:hover{background:#2563eb;transform:scale(1.07)}
+.p-status{font-size:10px;font-weight:600;text-align:center;min-width:70px}
+.p-status.loading{color:var(--stale)}.p-status.playing{color:var(--ok)}.p-status.stopped{color:var(--muted)}.p-status.error{color:var(--err)}
+.p-url{margin-top:10px;background:var(--c2);border:1px solid var(--bd);border-radius:5px;padding:7px 11px;font-size:10px;font-family:monospace;color:var(--muted);word-break:break-all}
+
+/* PERÍODOS */
+.periods{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}
+.per{background:var(--c1);border:1px solid var(--bd);border-radius:var(--r);padding:18px}
+.per-t{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--bd)}
+.per-rows{display:flex;flex-direction:column;gap:8px}
+.pr{display:flex;justify-content:space-between;align-items:center}
+.pr-l{font-size:11px;color:var(--muted)}
+.pr-v{font-size:13px;font-weight:700;font-variant-numeric:tabular-nums}
+.pr-v.g{color:var(--ok)}.pr-v.y{color:var(--stale)}.pr-v.r{color:var(--err)}.pr-v.b{color:var(--blue)}
+
+/* AUDIT */
+.audit-g{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px}
+.ag{background:var(--c2);border:1px solid var(--bd);border-radius:7px;padding:12px 14px}
+.ag-l{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:5px}
+.ag-v{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
+.ag-v.g{color:var(--ok)}.ag-v.b{color:var(--blue)}
+
+/* EVENTS */
+.ev-list{display:flex;flex-direction:column;gap:6px;max-height:300px;overflow-y:auto}
+.ev{display:flex;align-items:flex-start;gap:10px;padding:8px 10px;background:var(--c2);border-radius:6px;font-size:11px}
+.ev-badge{padding:2px 7px;border-radius:4px;font-weight:700;font-size:9px;text-transform:uppercase;white-space:nowrap;letter-spacing:.05em}
+.ev-badge.UP{background:rgba(16,185,129,.15);color:var(--ok)}
+.ev-badge.DOWN{background:rgba(239,68,68,.15);color:var(--err)}
+.ev-badge.RESTART{background:rgba(59,130,246,.15);color:var(--blue)}
+.ev-badge.CB_OPEN{background:rgba(239,68,68,.1);color:#fca5a5}
+.ev-badge.CB_CLOSE{background:rgba(16,185,129,.1);color:var(--ok)}
+.ev-ts{color:var(--muted);white-space:nowrap}
+.ev-det{color:var(--muted);font-style:italic}
+
+/* CHART */
+.chart-wrap{position:relative;height:180px}
+.no-data{display:flex;align-items:center;justify-content:center;height:160px;color:var(--muted);font-size:12px;flex-direction:column;gap:6px}
+
+/* RECORDINGS */
+.rec-list{display:flex;flex-wrap:wrap;gap:8px}
+.rec-tag{font-size:11px;padding:4px 10px;background:var(--c2);border:1px solid var(--bd);border-radius:5px;color:var(--muted);font-family:monospace}
+
+@media(max-width:700px){
+  .periods{grid-template-columns:1fr 1fr}
+  .player-wrap{grid-template-columns:1fr;justify-items:center}
+  .snav{display:none}
+  .main{padding:16px 12px}
+}
+</style>
+</head>
+<body>
+
+<div class="tb">
+  <div class="tbi">
+    <a class="back" href="/">← Dashboard</a>
+    <div class="tb-id">{{ sid }}</div>
+    <div class="snav">
+      {% for s in all_streams %}
+      <a href="/stream/{{ s }}" class="{% if s == sid %}cur{% endif %}">{{ s }}</a>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- HERO -->
+  <div class="hero">
+    <div>
+      <div class="h-id">{{ sid }}</div>
+      <div class="h-meta">
+        Supervisor: <strong>{{ sup }}</strong> &nbsp;·&nbsp;
+        Segmentos activos: <strong>{{ segs }}</strong> &nbsp;·&nbsp;
+        Antigüedad: <strong>{{ age }}s</strong>
+        {% if cb_state == 'OPEN' %}&nbsp;·&nbsp;<span style="color:var(--err)">⛔ Circuit Breaker ABIERTO ({{ cb_fails }} fallos)</span>{% endif %}
+        <br>Reinicios hoy: <strong>{{ restart_today }}</strong> &nbsp;·&nbsp;
+        Última caída: <strong>{{ last_down }}</strong> &nbsp;·&nbsp;
+        Última subida: <strong>{{ last_up }}</strong>
+      </div>
+    </div>
+    <div class="pill {{ color }}"><span class="pdot"></span>{{ status }}</div>
+  </div>
+
+  <!-- PLAYER -->
+  <div class="card">
+    <div class="card-t">🎙️ Reproductor en Vivo</div>
+    <div class="player-wrap">
+      <div style="width:100%">
+        <video id="hlsV" class="ha" controls playsinline></video>
+        <div class="p-url">{{ url }}</div>
+      </div>
+      <div class="p-ctrl">
+        <button class="p-btn" id="pBtn" onclick="togglePlay()">
+          <svg id="pi" width="16" height="18" viewBox="0 0 16 18" fill="white"><path d="M0 0L16 9L0 18Z"/></svg>
+          <svg id="pau" width="12" height="16" viewBox="0 0 12 16" fill="white" style="display:none"><rect x="0" y="0" width="4" height="16" rx="1"/><rect x="8" y="0" width="4" height="16" rx="1"/></svg>
+        </button>
+        <div class="p-status stopped" id="pSt">Detenido</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- KPIs POR PERÍODO -->
+  <div class="periods">
+    {% for label, p in periods.items() %}
+    <div class="per">
+      <div class="per-t">{{ {"1h":"⏱ 1 hora","8h":"🕗 8 horas","24h":"📅 24 horas","7d":"🗓 7 días"}[label] }}</div>
+      <div class="per-rows">
+        <div class="pr">
+          <span class="pr-l">Uptime</span>
+          <span class="pr-v {% if p.uptime is none %}{% elif p.uptime>=95 %}g{% elif p.uptime>=80 %}y{% else %}r{% endif %}">
+            {% if p.uptime is none %}—{% else %}{{ p.uptime }}%{% endif %}
+          </span>
+        </div>
+        <div class="pr">
+          <span class="pr-l">MB transmitido</span>
+          <span class="pr-v b">{{ p.mb }}</span>
+        </div>
+        <div class="pr">
+          <span class="pr-l">Bitrate avg</span>
+          <span class="pr-v">{{ p.bitrate }} <span style="font-size:9px;color:var(--muted)">KB/s</span></span>
+        </div>
+        <div class="pr">
+          <span class="pr-l">Caídas</span>
+          <span class="pr-v {% if p.downs==0 %}g{% elif p.downs<=2 %}y{% else %}r{% endif %}">{{ p.downs }}</span>
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <!-- GRÁFICOS 24H -->
+  <div class="card">
+    <div class="card-t">📈 Uptime y Throughput — últimas 24 horas (por hora)</div>
+    <div class="chart-wrap">
+      <canvas id="mainChart"></canvas>
+      <div class="no-data" id="ndChart">⏳<span>Acumulando datos…</span></div>
+    </div>
+  </div>
+
+  <!-- AUDITORÍA -->
+  <div class="card">
+    <div class="card-t">🗄️ Almacenamiento en Disco</div>
+    <div class="audit-g">
+      <div class="ag"><div class="ag-l">Segmentos guardados</div><div class="ag-v b">{{ audit_segs }}</div></div>
+      <div class="ag"><div class="ag-l">Horas almacenadas</div><div class="ag-v {% if audit_hours >= 7 %}g{% else %}y{% endif %}">{{ audit_hours }}h</div></div>
+      <div class="ag"><div class="ag-l">Espacio en disco</div><div class="ag-v">{{ audit_mb }} MB</div></div>
+      <div class="ag"><div class="ag-l">Retención máx.</div><div class="ag-v g">8h</div></div>
+    </div>
+    {% if rec_files %}
+    <div style="margin-top:14px">
+      <div style="font-size:10px;font-weight:600;text-transform:uppercase;color:var(--muted);margin-bottom:8px;letter-spacing:.07em">Grabaciones horarias disponibles</div>
+      <div class="rec-list">
+        {% for rf in rec_files[:8] %}
+        <span class="rec-tag">{{ rf }}.mp3</span>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- EVENTOS -->
+  <div class="card">
+    <div class="card-t">📋 Eventos recientes</div>
+    {% if events %}
+    <div class="ev-list">
+      {% for e in events %}
+      <div class="ev">
+        <span class="ev-badge {{ e.etype }}">{{ e.etype }}</span>
+        <span class="ev-ts">{{ e.ts }}</span>
+        {% if e.detail %}<span class="ev-det">{{ e.detail }}</span>{% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div style="font-size:12px;color:var(--muted);padding:12px 0">Sin eventos registrados aún</div>
+    {% endif %}
+  </div>
+
+</div>
+
+<script>
+// ── CHART ──
+const labels = {{ chart_labels|safe }};
+const upData = {{ chart_up|safe }};
+const bwData = {{ chart_bw|safe }};
+
+if (labels.length > 1) {
+  document.getElementById('ndChart').style.display = 'none';
+  new Chart(document.getElementById('mainChart'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        type: 'bar',
+        label: 'Uptime %',
+        data: upData,
+        backgroundColor: upData.map(v => v>=95 ? 'rgba(16,185,129,.6)' : v>=80 ? 'rgba(245,158,11,.6)' : 'rgba(239,68,68,.6)'),
+        borderRadius: 3,
+        yAxisID: 'y1',
+      },{
+        type: 'line',
+        label: 'MB/hora',
+        data: bwData,
+        borderColor: '#3b82f6',
+        backgroundColor: 'rgba(59,130,246,.1)',
+        borderWidth: 2,
+        tension: 0.3,
+        fill: true,
+        pointRadius: 2,
+        yAxisID: 'y2',
+      }]
+    },
+    options: {
+      responsive:true, maintainAspectRatio:false,
+      animation:{duration:400},
+      plugins:{
+        legend:{labels:{color:'#64748b',font:{size:11},usePointStyle:true}},
+        tooltip:{backgroundColor:'#0c0f22',borderColor:'#1e2d45',borderWidth:1,titleColor:'#e2e8f0',bodyColor:'#94a3b8',padding:10}
+      },
+      scales:{
+        x:{grid:{color:'rgba(30,45,69,.5)'},ticks:{color:'#475569',font:{size:10}}},
+        y1:{beginAtZero:true,max:100,position:'left',grid:{color:'rgba(30,45,69,.5)'},ticks:{color:'#475569',font:{size:10},callback:v=>v+'%'}},
+        y2:{beginAtZero:true,position:'right',grid:{display:false},ticks:{color:'#3b82f6',font:{size:10},callback:v=>v+'MB'}}
+      }
+    }
+  });
+} else {
+  document.getElementById('mainChart').style.display = 'none';
+}
+
+// ── HLS PLAYER ──
+const SRC = "{{ url }}";
+const video = document.getElementById('hlsV');
+const pSt   = document.getElementById('pSt');
+const pi    = document.getElementById('pi');
+const pau   = document.getElementById('pau');
+let hls = null, loaded = false;
+
+function setS(msg, cls){ pSt.textContent = msg; pSt.className = 'p-status ' + cls; }
+function showP(playing){ pi.style.display = playing ? 'none':'block'; pau.style.display = playing ? 'block':'none'; }
+
+function initHls(){
+  if (loaded) return;
+  loaded = true;
+  setS('Cargando…','loading');
+  if (Hls.isSupported()){
+    hls = new Hls({enableWorker:true,lowLatencyMode:true,backBufferLength:60});
+    hls.loadSource(SRC);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(()=>{}));
+    hls.on(Hls.Events.ERROR, (e,d) => { if(d.fatal){ setS('Error: '+d.type,'error'); loaded=false; }});
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')){
+    video.src = SRC; video.play().catch(()=>{});
+  } else {
+    setS('Navegador no soporta HLS','error');
+  }
+}
+
+function togglePlay(){
+  if (!loaded){ initHls(); return; }
+  if (video.paused) video.play().catch(()=>{}); else video.pause();
+}
+
+video.addEventListener('playing', () => { setS('▶ En vivo','playing'); showP(true); });
+video.addEventListener('pause',   () => { setS('Pausado','stopped'); showP(false); });
+video.addEventListener('waiting', () => setS('Buffering…','loading'));
+video.addEventListener('error',   () => { setS('Error','error'); loaded=false; showP(false); });
+
+{% if color == 'ok' %}window.addEventListener('load', () => setTimeout(initHls, 800));{% endif %}
+</script>
+</body>
+</html>

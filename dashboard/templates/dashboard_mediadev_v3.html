@@ -1,0 +1,764 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MediaDEV — Stream Analytics</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.4.12/dist/hls.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        :root {
+            --primary:    #3b82f6;
+            --success:    #10b981;
+            --warning:    #f59e0b;
+            --danger:     #ef4444;
+            --bg:         #080c1c;
+            --bg-card:    #0d1123;
+            --bg-surface: #111827;
+            --border:     #1f2d47;
+            --border-hi:  #2d3f5e;
+            --text:       #e2e8f0;
+            --text-muted: #64748b;
+            --radius:     10px;
+        }
+
+        html { font-size: 14px; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+
+        /* ─── TOPBAR ─── */
+        .topbar {
+            background: rgba(13,17,35,0.95);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--border);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .topbar-inner {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 14px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 16px;
+            font-weight: 700;
+            letter-spacing: -0.3px;
+        }
+
+        .pulse-dot {
+            width: 9px; height: 9px;
+            background: var(--success);
+            border-radius: 50%;
+            animation: pulse 2s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%,100% { box-shadow: 0 0 0 2px rgba(16,185,129,0.2); }
+            50%      { box-shadow: 0 0 0 7px rgba(16,185,129,0); }
+        }
+
+        .live-badge {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            background: rgba(16,185,129,0.08);
+            border: 1px solid rgba(16,185,129,0.2);
+            color: var(--success);
+            font-size: 11px;
+            font-weight: 600;
+            padding: 4px 10px;
+            border-radius: 20px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        .topbar-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        /* ─── MAIN ─── */
+        .main {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 30px 24px;
+        }
+
+        /* ─── KPI ROW ─── */
+        .kpi-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 32px;
+        }
+
+        .kpi {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 22px;
+            position: relative;
+            overflow: hidden;
+            transition: border-color .2s;
+        }
+        .kpi:hover { border-color: var(--border-hi); }
+
+        .kpi-shine {
+            position: absolute;
+            top: -60px; right: -60px;
+            width: 160px; height: 160px;
+            border-radius: 50%;
+            opacity: 0.06;
+            pointer-events: none;
+        }
+
+        .kpi-icon  { font-size: 22px; margin-bottom: 14px; display: block; }
+        .kpi-label { font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); letter-spacing: .1em; margin-bottom: 6px; }
+
+        .kpi-val {
+            font-size: 38px;
+            font-weight: 800;
+            line-height: 1;
+            font-variant-numeric: tabular-nums;
+            letter-spacing: -1px;
+        }
+        .kpi-val.green  { color: var(--success); }
+        .kpi-val.blue   { color: var(--primary); }
+        .kpi-val.yellow { color: var(--warning); }
+        .kpi-val.red    { color: var(--danger); }
+
+        .kpi-sub { font-size: 12px; color: var(--text-muted); margin-top: 8px; }
+
+        /* ─── SECTION HEADER ─── */
+        .section-header { display: flex; align-items: center; gap: 10px; margin-bottom: 20px; }
+        .section-title  { font-size: 15px; font-weight: 700; }
+        .section-tag    { font-size: 11px; background: rgba(59,130,246,.1); border: 1px solid rgba(59,130,246,.2); color: var(--primary); padding: 2px 8px; border-radius: 4px; }
+
+        /* ─── CHARTS ─── */
+        .charts-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
+            gap: 20px;
+            margin-bottom: 36px;
+        }
+
+        .chart-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 22px;
+        }
+
+        .chart-label {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: .08em;
+            margin-bottom: 18px;
+            padding-bottom: 14px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .chart-wrap { position: relative; height: 220px; }
+
+        .no-data {
+            display: none;
+            align-items: center;
+            justify-content: center;
+            height: 200px;
+            color: var(--text-muted);
+            font-size: 12px;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        /* ─── STREAMS GRID ─── */
+        .streams-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+            gap: 16px;
+        }
+
+        .stream-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            overflow: hidden;
+            transition: box-shadow .2s, border-color .2s;
+        }
+        .stream-card:hover {
+            border-color: var(--border-hi);
+            box-shadow: 0 4px 20px rgba(0,0,0,.4);
+        }
+
+        .stream-card.ok    { border-top: 3px solid var(--success); }
+        .stream-card.stale { border-top: 3px solid var(--warning); }
+        .stream-card.error { border-top: 3px solid var(--danger); }
+
+        .stream-body { padding: 18px; }
+
+        .stream-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 14px;
+        }
+
+        .stream-name {
+            font-size: 14px;
+            font-weight: 700;
+            font-family: 'SF Mono','Fira Code', monospace;
+        }
+
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 3px 9px;
+            border-radius: 20px;
+            text-transform: uppercase;
+            letter-spacing: .05em;
+        }
+        .pill.ok    { background: rgba(16,185,129,.1); color: var(--success); border: 1px solid rgba(16,185,129,.2); }
+        .pill.stale { background: rgba(245,158,11,.1);  color: var(--warning); border: 1px solid rgba(245,158,11,.2); }
+        .pill.error { background: rgba(239,68,68,.1);   color: var(--danger);  border: 1px solid rgba(239,68,68,.2); }
+        .pill-dot   { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+
+        /* uptime bar */
+        .uptime-bar-wrap    { margin-bottom: 12px; }
+        .uptime-bar-header  { display: flex; justify-content: space-between; font-size: 10px; color: var(--text-muted); margin-bottom: 5px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+        .uptime-bar-track   { height: 4px; background: var(--bg-surface); border-radius: 4px; overflow: hidden; }
+        .uptime-bar-fill    { height: 100%; border-radius: 4px; transition: width .6s ease; }
+
+        /* metrics 2×2 */
+        .metrics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+
+        .metric-box {
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 10px 12px;
+        }
+
+        .m-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .07em; color: var(--text-muted); margin-bottom: 4px; }
+        .m-val   { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+        .m-val.green  { color: var(--success); }
+        .m-val.yellow { color: var(--warning); }
+        .m-val.blue   { color: var(--primary); }
+        .m-val.red    { color: var(--danger); }
+
+        /* ─── STREAM FOOTER ─── */
+        .stream-footer {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 18px;
+            background: var(--bg-surface);
+            border-top: 1px solid var(--border);
+        }
+
+        .stream-meta { font-size: 11px; color: var(--text-muted); line-height: 1.7; }
+
+        .play-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(59,130,246,.12);
+            border: 1px solid rgba(59,130,246,.3);
+            color: var(--primary);
+            font-size: 12px;
+            font-weight: 600;
+            padding: 7px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: inherit;
+            transition: background .15s, transform .1s;
+            white-space: nowrap;
+        }
+        .play-btn:hover  { background: rgba(59,130,246,.22); transform: scale(1.04); }
+        .play-btn:active { transform: scale(.97); }
+
+        .play-circle {
+            width: 20px; height: 20px;
+            background: var(--primary);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        /* ─── PLAYER MODAL ─── */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,.75);
+            backdrop-filter: blur(6px);
+            z-index: 200;
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-overlay.open { display: flex; }
+
+        .modal-box {
+            background: #0d1123;
+            border: 1px solid var(--border-hi);
+            border-radius: 14px;
+            padding: 28px;
+            width: 440px;
+            max-width: 95vw;
+            box-shadow: 0 24px 60px rgba(0,0,0,.7);
+            animation: modalIn .2s ease;
+        }
+        @keyframes modalIn {
+            from { opacity: 0; transform: translateY(14px) scale(.97); }
+            to   { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        .modal-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+        }
+
+        .modal-title {
+            font-size: 15px;
+            font-weight: 700;
+            font-family: 'SF Mono','Fira Code', monospace;
+            color: var(--text);
+        }
+
+        .modal-close {
+            width: 28px; height: 28px;
+            border-radius: 50%;
+            background: rgba(255,255,255,.06);
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            font-size: 16px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background .15s;
+            font-family: inherit;
+        }
+        .modal-close:hover { background: rgba(239,68,68,.15); color: var(--danger); }
+
+        .player-wrap {
+            background: #06080f;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 22px;
+            margin-bottom: 18px;
+            text-align: center;
+        }
+
+        .player-icon { font-size: 40px; margin-bottom: 12px; }
+
+        audio {
+            width: 100%;
+            margin-top: 10px;
+            accent-color: var(--primary);
+        }
+
+        /* Custom audio styles for Chromium */
+        audio::-webkit-media-controls-panel {
+            background: var(--bg-surface);
+        }
+
+        .player-status {
+            font-size: 12px;
+            color: var(--text-muted);
+            margin-top: 12px;
+            min-height: 18px;
+        }
+
+        .player-status.loading { color: var(--warning); }
+        .player-status.playing { color: var(--success); }
+        .player-status.error   { color: var(--danger); }
+
+        .modal-url {
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 10px 14px;
+            font-size: 11px;
+            font-family: 'SF Mono','Fira Code', monospace;
+            color: var(--text-muted);
+            word-break: break-all;
+        }
+
+        /* ─── FOOTER ─── */
+        .page-footer {
+            text-align: center;
+            margin-top: 50px;
+            padding-top: 24px;
+            border-top: 1px solid var(--border);
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+        .page-footer a { color: var(--primary); text-decoration: none; }
+
+        /* ─── RESPONSIVE ─── */
+        @media (max-width: 600px) {
+            .kpi-row    { grid-template-columns: 1fr 1fr; }
+            .charts-row { grid-template-columns: 1fr; }
+            .streams-grid { grid-template-columns: 1fr; }
+            .main { padding: 20px 12px; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- TOPBAR -->
+    <div class="topbar">
+        <div class="topbar-inner">
+            <div class="logo">
+                <div class="pulse-dot"></div>
+                MediaDEV Analytics
+            </div>
+            <div class="topbar-right">
+                <span>Actualizado: <strong style="color:var(--text)">{{ updated }}</strong></span>
+                <span class="live-badge">
+                    <span class="pulse-dot" style="width:6px;height:6px"></span>
+                    Live
+                </span>
+            </div>
+        </div>
+    </div>
+
+    <div class="main">
+
+        <!-- KPIs -->
+        <div class="kpi-row">
+            <div class="kpi">
+                <div class="kpi-shine" style="background:var(--success)"></div>
+                <span class="kpi-icon">📡</span>
+                <div class="kpi-label">Streams Online</div>
+                <div class="kpi-val green">{{ summary.get('ok', 0) }}<span style="font-size:20px;font-weight:500;color:var(--text-muted)">/{{ summary.get('total', 0) }}</span></div>
+                <div class="kpi-sub">{{ ((summary.get('ok', 0) / (summary.get('total', 1))) * 100) | int }}% disponibles ahora mismo</div>
+            </div>
+
+            <div class="kpi">
+                <div class="kpi-shine" style="background:var(--primary)"></div>
+                <span class="kpi-icon">⏱️</span>
+                <div class="kpi-label">Uptime Promedio</div>
+                <div class="kpi-val {% if total_uptime >= 95 %}green{% elif total_uptime >= 80 %}yellow{% else %}red{% endif %}">{{ total_uptime }}<span style="font-size:20px;font-weight:500;color:var(--text-muted)">%</span></div>
+                <div class="kpi-sub">Últimas 24 horas</div>
+            </div>
+
+            <div class="kpi">
+                <div class="kpi-shine" style="background:var(--primary)"></div>
+                <span class="kpi-icon">💾</span>
+                <div class="kpi-label">Datos Relayados</div>
+                <div class="kpi-val blue">{{ total_mb }}<span style="font-size:20px;font-weight:500;color:var(--text-muted)"> MB</span></div>
+                <div class="kpi-sub">Todos los streams (24h)</div>
+            </div>
+
+            <div class="kpi">
+                <div class="kpi-shine" style="background:var(--danger)"></div>
+                <span class="kpi-icon">⚠️</span>
+                <div class="kpi-label">Con Fallo</div>
+                <div class="kpi-val {% if summary.get('fail', 0) == 0 %}green{% else %}red{% endif %}">{{ summary.get('fail', 0) }}</div>
+                <div class="kpi-sub">{% if summary.get('fail', 0) == 0 %}Todo nominal{% else %}Verificar streams{% endif %}</div>
+            </div>
+        </div>
+
+        <!-- CHARTS -->
+        <div class="section-header">
+            <div class="section-title">📈 Throughput Histórico</div>
+            <div class="section-tag">MB por minuto</div>
+        </div>
+        <div class="charts-row">
+            <div class="chart-card">
+                <div class="chart-label">Última 1 hora</div>
+                <div class="chart-wrap">
+                    <canvas id="chart1h"></canvas>
+                    <div class="no-data" id="nd1h">⏳<span>Acumulando datos…</span></div>
+                </div>
+            </div>
+            <div class="chart-card">
+                <div class="chart-label">Últimas 24 horas</div>
+                <div class="chart-wrap">
+                    <canvas id="chart1d"></canvas>
+                    <div class="no-data" id="nd1d">⏳<span>Acumulando datos…</span></div>
+                </div>
+            </div>
+            <div class="chart-card" style="grid-column: 1 / -1;">
+                <div class="chart-label">Últimos 7 días — todos los streams</div>
+                <div class="chart-wrap" style="height:280px">
+                    <canvas id="chart7d"></canvas>
+                    <div class="no-data" id="nd7d">⏳<span>Acumulando datos…</span></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- STREAMS -->
+        <div class="section-header">
+            <div class="section-title">📺 Streams Monitoreados</div>
+            <div class="section-tag">{{ streams | length }} canales</div>
+        </div>
+
+        <div class="streams-grid">
+            {% for s in streams %}
+            <div class="stream-card {{ s.color }}">
+                <div class="stream-body">
+                    <div class="stream-top">
+                        <div class="stream-name">{{ s.id }}</div>
+                        <div class="pill {{ s.color }}">
+                            <span class="pill-dot"></span>
+                            {{ s.status }}
+                        </div>
+                    </div>
+
+                    <div class="uptime-bar-wrap">
+                        <div class="uptime-bar-header">
+                            <span>Uptime 24h</span>
+                            <span style="color:{% if s.uptime >= 95 %}var(--success){% elif s.uptime >= 80 %}var(--warning){% else %}var(--danger){% endif %}">{{ s.uptime }}%</span>
+                        </div>
+                        <div class="uptime-bar-track">
+                            <div class="uptime-bar-fill" style="width:{{ s.uptime }}%; background:{% if s.uptime >= 95 %}var(--success){% elif s.uptime >= 80 %}var(--warning){% else %}var(--danger){% endif %}"></div>
+                        </div>
+                    </div>
+
+                    <div class="metrics-grid">
+                        <div class="metric-box">
+                            <div class="m-label">MB (24h)</div>
+                            <div class="m-val blue">{{ s.mb_total }}</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="m-label">Throughput</div>
+                            <div class="m-val">{{ s.throughput }}<span style="font-size:11px;color:var(--text-muted)"> MB/m</span></div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="m-label">Caídas</div>
+                            <div class="m-val {% if s.downtime_events == 0 %}green{% elif s.downtime_events <= 2 %}yellow{% else %}red{% endif %}">{{ s.downtime_events }}</div>
+                        </div>
+                        <div class="metric-box">
+                            <div class="m-label">Segmentos</div>
+                            <div class="m-val">{{ s.segs }}</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="stream-footer">
+                    <div class="stream-meta">
+                        <div>Antigüedad: <strong>{{ s.age }}s</strong></div>
+                        <div>Supervisor: <strong>{{ s.sup }}</strong></div>
+                    </div>
+                    <button class="play-btn" onclick="openPlayer('{{ s.id }}', '{{ s.url }}')">
+                        <span class="play-circle">
+                            <svg width="8" height="10" viewBox="0 0 8 10" fill="white">
+                                <path d="M0 0L8 5L0 10Z"/>
+                            </svg>
+                        </span>
+                        Escuchar
+                    </button>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+
+        <div class="page-footer">
+            <p>MediaDEV Stream Analytics • 12 canales Honduras • Monitoreo 24/7</p>
+            <p style="margin-top:8px">
+                <a href="/api/status">API JSON</a> &nbsp;•&nbsp;
+                Refresca automáticamente cada 30 segundos
+            </p>
+        </div>
+    </div>
+
+    <!-- ─── PLAYER MODAL ─── -->
+    <div class="modal-overlay" id="playerModal" onclick="closeOnOverlay(event)">
+        <div class="modal-box">
+            <div class="modal-header">
+                <div class="modal-title" id="modalTitle">—</div>
+                <button class="modal-close" onclick="closePlayer()">✕</button>
+            </div>
+
+            <div class="player-wrap">
+                <div class="player-icon">🎙️</div>
+                <audio id="hlsAudio" controls autoplay></audio>
+                <div class="player-status loading" id="playerStatus">Cargando stream…</div>
+            </div>
+
+            <div class="modal-url" id="modalUrl">—</div>
+        </div>
+    </div>
+
+    <script>
+    /* ─── CHARTS ─── */
+    const rawCharts = {{ charts | safe }};
+
+    const COLORS = [
+        '#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6',
+        '#06b6d4','#f97316','#ec4899','#84cc16','#14b8a6',
+        '#a855f7','#fb923c'
+    ];
+
+    const baseOpts = {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 500, easing: 'easeOutQuart' },
+        plugins: {
+            legend: {
+                display: true,
+                labels: { color: '#64748b', font: { size: 10 }, boxWidth: 10, padding: 10, usePointStyle: true }
+            },
+            tooltip: {
+                backgroundColor: '#0d1123',
+                borderColor: '#1f2d47',
+                borderWidth: 1,
+                titleColor: '#e2e8f0',
+                bodyColor: '#94a3b8',
+                padding: 10
+            }
+        },
+        scales: {
+            x: { grid: { color: 'rgba(31,45,71,.5)' }, ticks: { color: '#475569', font: { size: 10 }, maxTicksLimit: 8 } },
+            y: { beginAtZero: true, grid: { color: 'rgba(31,45,71,.5)' }, ticks: { color: '#475569', font: { size: 10 } } }
+        }
+    };
+
+    function buildChart(canvasId, noDataId, period) {
+        const data = rawCharts[period] || {};
+        const ids = Object.keys(data);
+
+        if (!ids.length) {
+            document.getElementById(canvasId).style.display = 'none';
+            document.getElementById(noDataId).style.display = 'flex';
+            return;
+        }
+
+        const allTs = [...new Set(ids.flatMap(id => data[id].map(e => e.ts)))].sort();
+
+        if (allTs.length < 2) {
+            document.getElementById(canvasId).style.display = 'none';
+            document.getElementById(noDataId).style.display = 'flex';
+            return;
+        }
+
+        const datasets = ids.map((id, i) => {
+            const map = Object.fromEntries(data[id].map(e => [e.ts, e.mb]));
+            return {
+                label: id,
+                data: allTs.map(t => map[t] ?? null),
+                borderColor: COLORS[i % COLORS.length],
+                backgroundColor: COLORS[i % COLORS.length] + '15',
+                borderWidth: 1.5,
+                tension: 0.4,
+                fill: false,
+                pointRadius: allTs.length > 60 ? 0 : 2,
+                spanGaps: true
+            };
+        });
+
+        new Chart(document.getElementById(canvasId), {
+            type: 'line',
+            data: { labels: allTs, datasets },
+            options: baseOpts
+        });
+    }
+
+    buildChart('chart1h', 'nd1h', '1h');
+    buildChart('chart1d', 'nd1d', '1d');
+    buildChart('chart7d', 'nd7d', '7d');
+
+    /* ─── HLS PLAYER ─── */
+    let hlsInstance = null;
+
+    function openPlayer(name, url) {
+        document.getElementById('modalTitle').textContent = name;
+        document.getElementById('modalUrl').textContent   = url;
+        document.getElementById('playerStatus').textContent  = 'Cargando stream…';
+        document.getElementById('playerStatus').className    = 'player-status loading';
+        document.getElementById('playerModal').classList.add('open');
+
+        const audio = document.getElementById('hlsAudio');
+
+        // Destruir instancia anterior
+        if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+        audio.pause();
+        audio.src = '';
+
+        if (Hls.isSupported()) {
+            hlsInstance = new Hls({
+                enableWorker: true,
+                lowLatencyMode: true,
+                backBufferLength: 30
+            });
+            hlsInstance.loadSource(url);
+            hlsInstance.attachMedia(audio);
+
+            hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+                audio.play().catch(() => {});
+            });
+
+            hlsInstance.on(Hls.Events.ERROR, (event, data) => {
+                if (data.fatal) {
+                    document.getElementById('playerStatus').textContent = 'Error al cargar el stream';
+                    document.getElementById('playerStatus').className   = 'player-status error';
+                }
+            });
+
+            audio.addEventListener('playing', () => {
+                document.getElementById('playerStatus').textContent = '▶ Reproduciendo en vivo';
+                document.getElementById('playerStatus').className   = 'player-status playing';
+            }, { once: false });
+
+            audio.addEventListener('waiting', () => {
+                document.getElementById('playerStatus').textContent = '⏳ Buffering…';
+                document.getElementById('playerStatus').className   = 'player-status loading';
+            });
+
+        } else if (audio.canPlayType('application/vnd.apple.mpegurl')) {
+            // Safari — soporta HLS nativo
+            audio.src = url;
+            audio.play().catch(() => {});
+        } else {
+            document.getElementById('playerStatus').textContent = 'Tu navegador no soporta HLS. Usa Chrome o Firefox.';
+            document.getElementById('playerStatus').className   = 'player-status error';
+        }
+    }
+
+    function closePlayer() {
+        document.getElementById('playerModal').classList.remove('open');
+        const audio = document.getElementById('hlsAudio');
+        audio.pause();
+        audio.src = '';
+        if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+    }
+
+    function closeOnOverlay(e) {
+        if (e.target === document.getElementById('playerModal')) closePlayer();
+    }
+
+    document.addEventListener('keydown', e => {
+        if (e.key === 'Escape') closePlayer();
+    });
+    </script>
+</body>
+</html>

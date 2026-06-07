@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+venv/
+env/
+
+# Base de datos y almacenamiento
+*.db
+*.db-shm
+*.db-wal
+/var/www/streams/*/seg_*.ts
+/var/www/streams/*/index.m3u8
+/var/www/streams/*/recordings/
+/var/www/streams/audit_index/
+
+# Logs
+*.log
+/var/log/streams/
+
+# Backups
+*.bak
+*.bak_utc
+scripts_backup_rpi/
+
+# OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporal
+.tmp/
+/tmp/
