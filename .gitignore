@@ -35,3 +35,7 @@ scripts_backup_rpi/
 # Temporal
 .tmp/
 /tmp/
+
+# Credenciales
+.env
+*.env
