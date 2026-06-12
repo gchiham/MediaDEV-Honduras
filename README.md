@@ -30,10 +30,10 @@ graph LR
     C --> F["Flask + Gunicorn<br/>dashboard_v4.py :9000"]
     C --> G["nginx :80"]
     D --> H["/var/www/streams/<br/>seg_NNNNN.ts<br/>recordings/HHh.mp3"]
-    E --> I[("SQLite WAL<br/>mediadev.db")]
-    J --> L[("PostgreSQL<br/>media-db<br/>gateways + catálogo")]
+    E --> L[("PostgreSQL<br/>media-db<br/>estado + gateways + catálogo")]
+    J --> L
     K --> M[("S3<br/>mediadev-recordings<br/>video_segments/")]
-    F --> I
+    F --> L
     G --> F
     G --> H
     G --> N["/estaciones/<br/>catálogo 195 estaciones"]
@@ -96,14 +96,19 @@ Calcula el epoch desde el `mtime` del archivo (sin depender de SQLite). Estos se
 son la fuente que **Destroyer** consume para reconstruir clips de video de los anuncios detectados.
 
 ### 7. Stream Daemon (Python)
-Loop único de mantenimiento. Intervalos conservadores:
+Loop único de mantenimiento. El estado operativo vive **en memoria** (se recalcula desde el
+filesystem con los `mtime`) y se **espeja a PostgreSQL** para que lo lea el dashboard. Si la
+DB no está disponible, el daemon sigue operando con normalidad — PostgreSQL es solo el espejo.
 
 | Tarea | Intervalo | Descripción |
 |---|---|---|
-| Health check | 15s | Verifica m3u8 age + segs, maneja Circuit Breaker |
+| Health check | 15s | Verifica m3u8 age + segs, maneja Circuit Breaker, UPSERT estado a PG |
+| Metrics | 60s | Snapshot (status + bytes del último minuto) → `mediadev_metrics` |
 | Recordings | 120s | Genera MP3 horario de la hora anterior |
-| Cleanup | 30min | Elimina .ts > 8h, purga métricas antiguas |
+| Cleanup | 30min | Elimina .ts > 8h, purga métricas (>7d) y eventos (>30d) en PG |
 | Daily reset | 1h | Resetea contadores diarios (restart_today, etc.) |
+
+Las transiciones de estado (DOWN/UP, CB_OPEN/CB_CLOSE) se registran en `mediadev_events`.
 
 **Por qué estos intervalos**: en una versión anterior con health=3s e index=10s el daemon
 saturó el servidor (97% CPU). Estos son el mínimo seguro. El loop principal hace `sleep(2)`.
@@ -115,23 +120,27 @@ saturó el servidor (97% CPU). Estos son el mínimo seguro. El loop principal ha
   (12 grabando + 183 en catálogo) con reproductor en vivo (HLS.js para M3U8, HTML5 audio para
   el resto). Datos del `stream_catalog` en media-db.
 
-### 9. Bases de Datos
-- **SQLite WAL** (`/var/www/streams/mediadev.db`) — estado operativo local de los streams
-  (salud, métricas, segmentos, eventos). WAL permite lectura concurrente del dashboard sin
-  bloquear la escritura del daemon.
+### 9. Base de Datos — PostgreSQL (DO Managed, media-db)
+Toda la persistencia vive en **una sola PostgreSQL managed** (media-db), compartida con
+Destroyer. Ya no se usa SQLite local — el daemon mantiene el estado en memoria y lo espeja aquí.
 
-  ```sql
-  stream_status (stream_id PK, status, sup, segs, age, cb_state, cb_fails, cb_since,
-                 restart_today, last_down, last_up, updated_at)
-  metrics       (stream_id, ts, status, segs, bytes)           -- retención 7 días
-  segments      (stream_id, filename, ts_start, ts_end, bytes)  -- retención 8h
-  events        (id, stream_id, ts, etype, detail)              -- retención 30 días
-  ```
+Tablas propias de MediaDEV (prefijo `mediadev_`):
+```sql
+mediadev_stream_status (stream_id PK, status, sup, segs, age, cb_state, cb_fails,
+                        cb_since, restart_today, last_down, last_up, updated_at)
+mediadev_metrics       (stream_id, ts, status, segs, bytes)   -- snapshot 60s, retención 7 días
+mediadev_events        (id, stream_id, ts, etype, detail)     -- transiciones, retención 30 días
+```
+> La auditoría de segmentos (`segs`/MB en disco) se deriva en vivo del filesystem en el
+> dashboard — no se registra cada `.ts` en la DB para evitar tráfico innecesario.
 
-- **PostgreSQL (DO Managed, media-db)** — datos compartidos con Destroyer:
-  - `stream_catalog` — catálogo de 195 estaciones (activas + inactivas) con stream_url, logo, ciudad.
-  - Estado y telemetría de la red de gateways.
-  - Tablas de detección de anuncios (`found_detections`, `advertisements`, ...).
+Tablas compartidas con Destroyer:
+- `stream_catalog` — catálogo de 195 estaciones (activas + inactivas) con stream_url, logo, ciudad.
+- Estado y telemetría de la red de gateways.
+- Detección de anuncios (`found_detections`, `advertisements`, ...).
+
+**Credenciales**: `/etc/mediadev-db.env` (`PG_HOST/PORT/DB/USER/PASS`, `chmod 600`), cargado por
+systemd en el daemon y el dashboard vía `EnvironmentFile`.
 
 ### 10. Monitoreo WireGuard (Telegram)
 `monitor/monitor.py` (`mediadev-monitor`) — vigila el túnel WireGuard y envía alertas por
@@ -187,13 +196,12 @@ Internet
     └── install.sh
 
 /var/www/streams/
-├── mediadev.db             # SQLite WAL (estado operativo local)
 ├── {stream_id}/
 │   ├── index.m3u8          # Playlist HLS activa
 │   ├── seg_NNNNN.ts        # Segmentos (audio, o audio+video en TV) — últimas 8h
 │   └── recordings/
 │       └── YYYY-MM-DD_HHh.mp3   # Grabaciones horarias de audio (GMT-6)
-└── audit_index/            # Legado CSV/JSONL (ya migrado a SQLite)
+└── audit_index/            # Legado CSV/JSONL (en desuso)
 
 /var/www/html/estaciones/
 └── index.html             # Dashboard de catálogo (195 estaciones)
@@ -211,7 +219,7 @@ MediaDEV es su proveedor de datos:
 Todo el sistema usa **America/Tegucigalpa (GMT-6 / CST)**.
 - Servidor OS: `timedatectl` → America/Tegucigalpa
 - Python: `TGU = timezone(timedelta(hours=-6))`
-- SQLite/PostgreSQL: timestamps como Unix epoch (tz-neutral) — conversión solo en presentación
+- PostgreSQL: timestamps como Unix epoch (tz-neutral) — conversión solo en presentación
 
 ## Despliegue — orden de arranque
 ```bash
@@ -259,7 +267,7 @@ Protege contra restart storms cuando un stream está permanentemente caído:
 - Segmentos .ts se acumulan en disco durante 8 horas.
 - El daemon genera `recordings/YYYY-MM-DD_HHh.mp3` (audio) al inicio de cada hora.
 - Los segmentos de video de TV se archivan en S3 indefinidamente (hasta que Destroyer los consume).
-- Para extraer contenido por timestamp: consultar `segments` y concatenar los .ts del rango.
+- Para extraer contenido por timestamp: ubicar los `.ts` por `mtime` en disco y concatenarlos.
 - Audio: AAC 64kbps mono 22050Hz — compatible con transcripción Whisper.
 
 ## Cambiar gateway SOCKS5

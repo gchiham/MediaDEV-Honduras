@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-MediaDEV Stream Daemon — sin SQLite, estado en memoria + mtime
-Health: 15s | Record: 120s | Cleanup: 1800s
+MediaDEV Stream Daemon — estado en memoria + mtime, espejado a PostgreSQL
+Health: 15s | Metrics: 60s | Record: 120s | Cleanup: 1800s
+
+El estado operativo (salud, circuit breaker) vive en memoria y se recalcula
+desde el filesystem. PostgreSQL (media-db) es un espejo de solo-lectura para el
+dashboard; si la DB no está disponible el daemon sigue operando normalmente.
 """
 import os, sys, subprocess, time, signal, logging, boto3
+import psycopg2
 from botocore.exceptions import ClientError
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -49,10 +54,65 @@ def s3_upload(local_path: Path, stream_id: str) -> bool:
         return False
 
 # Intervalos
-INTERVAL_HEALTH = 15
-INTERVAL_RECORD = 120
-INTERVAL_CLEAN  = 1800
-LOOP_SLEEP      = 2
+INTERVAL_HEALTH  = 15
+INTERVAL_METRICS = 60
+INTERVAL_RECORD  = 120
+INTERVAL_CLEAN   = 1800
+LOOP_SLEEP       = 2
+
+# ── PostgreSQL (estado para el dashboard) ──────────────────────────────────────
+# El estado operativo vive en memoria; PostgreSQL es solo un espejo para el
+# dashboard. Si la DB no está disponible el daemon sigue funcionando igual.
+PG_HOST = os.environ.get("PG_HOST")
+PG_PORT = int(os.environ.get("PG_PORT", "25060"))
+PG_DB   = os.environ.get("PG_DB")
+PG_USER = os.environ.get("PG_USER")
+PG_PASS = os.environ.get("PG_PASS")
+METRICS_RETENTION_DAYS = 7
+EVENTS_RETENTION_DAYS  = 30
+
+_pg = None
+
+def pg():
+    """Devuelve una conexión PG viva (autocommit) o None si no se puede conectar."""
+    global _pg
+    if not (PG_HOST and PG_PASS):
+        return None
+    try:
+        if _pg is None or _pg.closed:
+            _pg = psycopg2.connect(
+                host=PG_HOST, port=PG_PORT, dbname=PG_DB,
+                user=PG_USER, password=PG_PASS,
+                connect_timeout=5, sslmode="require",
+            )
+            _pg.autocommit = True
+        return _pg
+    except Exception as e:
+        log.warning(f"[pg] sin conexión: {e}")
+        _pg = None
+        return None
+
+def pg_write(sql, params=(), many=False):
+    """Ejecuta una escritura PG tolerando fallos (nunca lanza)."""
+    conn = pg()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            if many:
+                cur.executemany(sql, params)
+            else:
+                cur.execute(sql, params)
+    except Exception as e:
+        log.warning(f"[pg] escritura falló: {e}")
+        global _pg
+        _pg = None
+
+def pg_event(sid, etype, detail=""):
+    pg_write(
+        "INSERT INTO mediadev_events (stream_id, ts, etype, detail) VALUES (%s,%s,%s,%s)",
+        (sid, int(time.time()), etype, detail),
+    )
 
 # ── LOGGING ───────────────────────────────────────────────────────────────────
 Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
@@ -68,6 +128,9 @@ def init_state():
     return {
         sid: {
             "status":        "UNKNOWN",
+            "sup":           "UNKNOWN",
+            "segs":          0,
+            "age":           0,
             "cb_state":      "CLOSED",
             "cb_fails":      0,
             "cb_since":      0,
@@ -124,10 +187,15 @@ def do_health(state):
         else:
             age = segs = 0; ok = False; empty_playlist = False
 
+        s["sup"]  = sup
+        s["age"]  = age
+        s["segs"] = segs
+
         if s["cb_state"] == "OPEN":
             if now - s["cb_since"] >= CB_RESET_SECS:
                 s["cb_state"] = "CLOSED"; s["cb_fails"] = 0
                 log.info(f"[{sid}] CB → CLOSED (reset)")
+                pg_event(sid, "CB_CLOSE", "reset automático")
                 restart_stream(state, sid)
             else:
                 s["status"] = "DISABLED"
@@ -138,6 +206,7 @@ def do_health(state):
             if prev not in ("OK", "UNKNOWN"):
                 log.info(f"[{sid}] ↑ UP")
                 s["last_up"] = now
+                pg_event(sid, "UP")
             s["status"] = "OK"
         else:
             s["status"] = "STALE" if m3u8.exists() else "NO_M3U8"
@@ -145,12 +214,60 @@ def do_health(state):
             if prev == "OK":
                 log.warning(f"[{sid}] ↓ DOWN age={age}s cb_fails={s['cb_fails']} empty={empty_playlist}")
                 s["last_down"] = now
+                pg_event(sid, "DOWN", f"age={age}s empty={empty_playlist}")
             if not empty_playlist and s["cb_fails"] >= RESTART_AFTER_FAILS and s["cb_fails"] <= CB_FAIL_OPEN:
                 log.info(f"[{sid}] Reiniciando ffmpeg tras {s['cb_fails']} fallos")
                 restart_stream(state, sid)
             if s["cb_fails"] >= CB_FAIL_OPEN and s["cb_state"] == "CLOSED":
                 s["cb_state"] = "OPEN"; s["cb_since"] = now
                 log.warning(f"[{sid}] CB → OPEN tras {s['cb_fails']} fallos")
+                pg_event(sid, "CB_OPEN", f"{s['cb_fails']} fallos")
+
+    pg_sync_status(state)
+
+# ── SYNC ESTADO A POSTGRES ─────────────────────────────────────────────────────
+def pg_sync_status(state):
+    now = int(time.time())
+    rows = [
+        (sid, s["status"], s["sup"], s["segs"], s["age"], s["cb_state"],
+         s["cb_fails"], s["cb_since"], s["restart_today"],
+         s["last_down"], s["last_up"], now)
+        for sid, s in state.items()
+    ]
+    pg_write(
+        """INSERT INTO mediadev_stream_status
+             (stream_id,status,sup,segs,age,cb_state,cb_fails,cb_since,
+              restart_today,last_down,last_up,updated_at)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           ON CONFLICT (stream_id) DO UPDATE SET
+             status=EXCLUDED.status, sup=EXCLUDED.sup, segs=EXCLUDED.segs,
+             age=EXCLUDED.age, cb_state=EXCLUDED.cb_state, cb_fails=EXCLUDED.cb_fails,
+             cb_since=EXCLUDED.cb_since, restart_today=EXCLUDED.restart_today,
+             last_down=EXCLUDED.last_down, last_up=EXCLUDED.last_up,
+             updated_at=EXCLUDED.updated_at""",
+        rows, many=True,
+    )
+
+# ── METRICS (snapshot por minuto) ───────────────────────────────────────────────
+def do_metrics(state):
+    now    = int(time.time())
+    window = now - INTERVAL_METRICS
+    rows   = []
+    for sid in STREAMS:
+        # bytes producidos en la última ventana (throughput aproximado)
+        b = 0
+        for seg in (STREAMS_ROOT / sid).glob("seg_*.ts"):
+            try:
+                if seg.stat().st_mtime >= window:
+                    b += seg.stat().st_size
+            except:
+                pass
+        s = state[sid]
+        rows.append((sid, now, s["status"], s["segs"], b))
+    pg_write(
+        "INSERT INTO mediadev_metrics (stream_id,ts,status,segs,bytes) VALUES (%s,%s,%s,%s,%s)",
+        rows, many=True,
+    )
 
 # ── HOURLY RECORDINGS ─────────────────────────────────────────────────────────
 def do_record(state):
@@ -207,6 +324,13 @@ def do_cleanup(state):
     if deleted:
         log.info(f"Cleanup: {deleted} segmentos eliminados")
 
+    # Purga de retención en PostgreSQL
+    now = int(time.time())
+    pg_write("DELETE FROM mediadev_metrics WHERE ts < %s",
+             (now - METRICS_RETENTION_DAYS * 86400,))
+    pg_write("DELETE FROM mediadev_events WHERE ts < %s",
+             (now - EVENTS_RETENTION_DAYS * 86400,))
+
 # ── DAILY RESET ───────────────────────────────────────────────────────────────
 _last_reset_day = None
 def do_daily_reset(state):
@@ -222,8 +346,8 @@ def do_daily_reset(state):
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 50)
-    log.info("MediaDEV Stream Daemon — sin SQLite")
-    log.info(f"health={INTERVAL_HEALTH}s clean={INTERVAL_CLEAN}s loop={LOOP_SLEEP}s")
+    log.info("MediaDEV Stream Daemon")
+    log.info(f"health={INTERVAL_HEALTH}s metrics={INTERVAL_METRICS}s clean={INTERVAL_CLEAN}s loop={LOOP_SLEEP}s")
 
     state = init_state()
 
@@ -234,14 +358,18 @@ def main():
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT,  _stop)
 
-    last = {k: 0 for k in ("health","record","clean","daily")}
+    last = {k: 0 for k in ("health","metrics","record","clean","daily")}
     log.info(f"Monitoreando {len(STREAMS)} streams")
+    log.info(f"PostgreSQL: {'configurado' if (PG_HOST and PG_PASS) else 'NO configurado (solo memoria)'}")
 
     while running[0]:
         now = time.time()
 
         if now - last["health"] >= INTERVAL_HEALTH:
             do_health(state);        last["health"] = now
+
+        if now - last["metrics"] >= INTERVAL_METRICS:
+            do_metrics(state);       last["metrics"] = now
 
         if now - last["record"] >= INTERVAL_RECORD:
             do_record(state);        last["record"] = now
