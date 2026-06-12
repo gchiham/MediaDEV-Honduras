@@ -20,7 +20,7 @@ graph LR
     C --> E[stream-daemon\nPython loop\nhealth+metrics]
     C --> F[Flask+Gunicorn\ndashboard_v4.py\n:9000]
     C --> G[nginx\n:80]
-    D --> H[/var/www/streams/\nseg_NNNNN.ts\nindex.m3u8\nrecordings/*.mp3]
+    D --> H["/var/www/streams/<br/>seg_NNNNN.ts<br/>recordings/HHh.mp3"]
     E --> I[(SQLite WAL\nmediadev.db)]
     F --> I
     G --> F
