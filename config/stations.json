@@ -39,7 +39,7 @@
       "id": "xy_hrn",
       "name": "XY HRN",
       "type": "radio",
-      "route": "honduras",
+      "route": "gateway",
       "gateway": "hn02",
       "url": "https://ice42.securenetsystems.net/HRN",
       "enabled": true
@@ -48,7 +48,7 @@
       "id": "xy_tgu",
       "name": "XY TGU",
       "type": "radio",
-      "route": "honduras",
+      "route": "gateway",
       "gateway": "hn02",
       "url": "https://ice42.securenetsystems.net/XY905",
       "enabled": true
@@ -57,7 +57,7 @@
       "id": "xy_sps",
       "name": "XY SPS",
       "type": "radio",
-      "route": "honduras",
+      "route": "gateway",
       "gateway": "hn02",
       "url": "https://ice42.securenetsystems.net/XY1073",
       "enabled": true
@@ -66,7 +66,7 @@
       "id": "radio_satelite",
       "name": "Radio Satelite",
       "type": "radio",
-      "route": "honduras",
+      "route": "gateway",
       "gateway": "hn02",
       "url": "http://ice42.securenetsystems.net/SATELITE",
       "enabled": true
@@ -75,7 +75,7 @@
       "id": "fm_941",
       "name": "94.1 FM",
       "type": "radio",
-      "route": "honduras",
+      "route": "gateway",
       "gateway": "hn02",
       "url": "https://ice42.securenetsystems.net/94SUFM",
       "enabled": true
@@ -84,7 +84,7 @@
       "id": "suave_fm",
       "name": "Suave FM",
       "type": "radio",
-      "route": "honduras",
+      "route": "gateway",
       "gateway": "hn02",
       "url": "http://ice42.securenetsystems.net/SUAVE",
       "enabled": true
@@ -93,7 +93,7 @@
       "id": "radio_america",
       "name": "Radio America",
       "type": "radio",
-      "route": "honduras",
+      "route": "auto",
       "gateway": "hn02",
       "url": "https://27403.live.streamtheworld.com/AMERICA_SC",
       "enabled": true
@@ -102,7 +102,7 @@
       "id": "radio_globo",
       "name": "Radio Globo",
       "type": "radio",
-      "route": "honduras",
+      "route": "auto",
       "gateway": "hn02",
       "url": "https://stream.radiosmundiales.com/stream/radioglobo",
       "enabled": true
@@ -111,7 +111,7 @@
       "id": "radio_el_patio",
       "name": "Radio El Patio",
       "type": "radio",
-      "route": "honduras",
+      "route": "auto",
       "gateway": "hn02",
       "url": "http://51.89.173.53:8045/elpatio",
       "enabled": true
@@ -120,7 +120,7 @@
       "id": "hch_tv",
       "name": "HCH TV",
       "type": "tv",
-      "route": "honduras",
+      "route": "auto",
       "gateway": "hn02",
       "url": "https://live.streamhch.com/live/streams/hch1.m3u8",
       "enabled": true
@@ -129,7 +129,7 @@
       "id": "teleceiba",
       "name": "Teleceiba",
       "type": "tv",
-      "route": "honduras",
+      "route": "auto",
       "gateway": "hn02",
       "url": "https://teleceiba.com/stream/tlcb720.m3u8",
       "enabled": true
@@ -138,7 +138,7 @@
       "id": "radio_choluteca",
       "name": "Radio Choluteca",
       "type": "radio",
-      "route": "honduras",
+      "route": "gateway",
       "gateway": "hn02",
       "url": "https://ice42.securenetsystems.net/CHOLUTEC",
       "enabled": true

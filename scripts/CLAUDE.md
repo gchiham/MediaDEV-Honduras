@@ -1,39 +1,40 @@
 # Scripts de Stream — CLAUDE.md
 
 ## Propósito
-Un script bash por stream, gestionado por supervisord. Captura el stream origen y lo
-recodifica a HLS. Audio para radios; **video preservado para TV**.
+La captura de los 12 streams la hace un **runner unificado** `stream_run.sh <stream_id>`,
+gestionado por supervisord (un `[program:stream_{id}]` por estación, todos invocan el runner).
+Captura el stream origen y lo recodifica a HLS: audio para radios, video preservado para TV.
 
-## Tres patrones de conexión
-Determinados por geo-restricción de la fuente:
+## stream_run.sh — cómo decide
+Lee `url`, `type` y `route` de `config/stations.json` y resuelve tres ejes:
 
-### SOCKS5 directo (7): fm_941, radio_choluteca, radio_satelite, suave_fm, xy_hrn, xy_sps, xy_tgu
-```bash
-source /etc/mediadev/gateway.conf        # fuente de verdad del gateway (GW_SOCKS5)
-curl -s --socks5-hostname $GW_SOCKS5 URL | ffmpeg -i pipe:0 ...
-```
+1. **Captura**: si la URL es `ice42.securenetsystems.net` (Icecast) → `curl` pipe con headers
+   `Icy-MetaData` (ffmpeg no puede mandar esos headers vía proxy). El resto → `ffmpeg -i` directo.
+2. **Transporte** (campo `route`):
+   - `gateway` → siempre por el gateway (curl `--socks5-hostname $GW_SOCKS5`, o ffmpeg `-http_proxy`).
+   - `direct` → siempre conexión directa.
+   - `auto` → `probe_direct()` prueba la URL; si responde 2xx va directo, si no usa gateway.
+     **Re-evalúa en cada arranque**, así que si bloquean una fuente directa, el reinicio de
+     supervisord cae solo al gateway. Este es el mecanismo de fallback.
+3. **Salida**: `type=radio` → `-vn -c:a aac -b:a 64k -ac 1 -ar 22050`;
+   `type=tv` → `-c:v copy -c:a aac -b:a 128k`.
 
-### Privoxy/HTTP (3): radio_america, radio_el_patio, radio_globo
-```bash
-ffmpeg -http_proxy http://127.0.0.1:3128 -i URL ...   # Privoxy reenvía a SOCKS5
-```
+> `probe_direct()` usa el **código HTTP** (`curl -w %{http_code}`), NO range requests:
+> muchos Icecast ignoran `-r` y mandan stream continuo → el range daba falsos negativos.
 
-### Directo sin proxy (2): hch_tv, teleceiba
-Fuentes NO geo-restringidas (streamhch.com, teleceiba.com) — ffmpeg conecta directo.
+## route por estación (config/stations.json)
+- `gateway` (7): las de `ice42.securenetsystems.net` (geo-bloqueadas) — fm_941, suave_fm,
+  radio_satelite, radio_choluteca, xy_hrn, xy_sps, xy_tgu.
+- `auto` (5): radio_america, radio_globo, radio_el_patio, hch_tv, teleceiba — van directo
+  mientras puedan, con fallback automático a gateway.
 
 ## Parámetros ffmpeg
-Radios (audio):
 ```bash
--vn -c:a aac -b:a 64k -ac 1 -ar 22050    # mono 22kHz, codec antes de -ac
-```
-TV (video preservado, para reconstruir clips de anuncios en S3):
-```bash
--c:v copy -c:a aac -b:a 128k             # NO usar -vn en hch_tv / teleceiba
-```
-Comunes:
-```bash
--hls_time 4 -hls_list_size 10 -hls_flags append_list   # sin delete_segments (auditoría 8h)
+# Comunes:
+-hls_time 4 -hls_list_size 10 -hls_flags append_list   # SIN delete_segments (auditoría 8h)
 -hls_segment_filename "$OUT_DIR/seg_%05d.ts"
+# Radio: -vn -c:a aac -b:a 64k -ac 1 -ar 22050  (codec antes de -ac)
+# TV:    -c:v copy -c:a aac -b:a 128k           (NO -vn — Destroyer necesita el video)
 ```
 
 ## Cambiar gateway — usar gateway_switch.sh (NO editar a mano)
@@ -54,15 +55,21 @@ y reinicia los streams. El failover normalmente es automático (health_engine).
 - `deploy_peer_b.sh` — configura un peer de respaldo.
 - `backup_healthcheck.py` — failover active-active de grabaciones en S3.
 
+## Agregar un stream
+1. Añadir entrada a `config/stations.json` (con `route`, normalmente `auto`).
+2. Añadir `[program:stream_{id}]` con `command=stream_run.sh {id}` a supervisor.
+3. `supervisorctl reread && supervisorctl update`.
+No se crea ningún script nuevo — el runner es compartido.
+
 ## Supervisord
 ```bash
 supervisorctl status                      # 12 streams
 supervisorctl restart all
-supervisorctl tail stream_fm_941 stderr
-# Config: /etc/supervisor/conf.d/
+supervisorctl tail stream_fm_941 stdout   # ver decisión de routing (use_gateway=...)
+# Config: /etc/supervisor/conf.d/mediadev_streams.conf
 ```
 
 ## Pitfalls
-- Orden de flags ffmpeg de audio: `-c:a aac -b:a 64k -ac 1` (codec antes del canal).
 - NO poner `-vn` en hch_tv/teleceiba — perdería el video que necesita Destroyer.
-- Si la fuente está caída (404), el Circuit Breaker la deshabilita tras 5 fallos.
+- `route=auto` agrega ~5s al arranque (el probe espera respuesta). Es aceptable.
+- Si la fuente está caída, el Circuit Breaker (stream-daemon) la deshabilita tras 5 fallos.

@@ -144,7 +144,7 @@ Campos de `/api/streams`: `status` (OK/STALE/NO_M3U8/DISABLED), `sup` (estado su
 ├── dashboard/dashboard_v4.py     ← Dashboard web + API JSON (lee de PostgreSQL)
 ├── monitor/monitor.py            ← Monitoreo WireGuard + alertas Telegram
 └── scripts/
-    ├── stream_{id}.sh            ← Relay ffmpeg por estación (12)
+    ├── stream_run.sh            ← Runner unificado (lee url/type/route de stations.json)
     ├── video_segment_uploader.py ← TV .ts → S3
     ├── gateway_switch.sh         ← Cambia el gateway activo
     └── gateway_watchdog.py       ← Watchdog del gateway (cron cada minuto)
@@ -189,56 +189,31 @@ curl -s --max-time 15 --socks5-hostname $GW_SOCKS5 https://URL_DEL_STREAM \
   "id": "nueva_radio",
   "name": "Nombre de la Emisora",
   "type": "radio",
-  "route": "honduras",
+  "route": "auto",
   "gateway": "hn02",
   "url": "https://URL_DEL_STREAM",
   "enabled": true
 }
 ```
-> `"type": "tv"` para televisión. El `"gateway"` debe ser uno de los definidos (hn01/hn02/hn03).
+Campos clave:
+- `"type"`: `radio` (audio) o `tv` (video).
+- `"route"`: cómo sale el stream — lo aplica el **runner unificado** (`stream_run.sh`):
+  | valor | comportamiento |
+  |---|---|
+  | `auto` | prueba directo; si falla usa gateway. **Recomendado** — re-evalúa en cada arranque, así que si bloquean la fuente, cae solo al gateway |
+  | `gateway` | siempre por gateway (úsalo para fuentes geo-bloqueadas fijas como `ice42.securenetsystems.net`) |
+  | `direct` | siempre directo (sin gateway, sin fallback) |
 
-### Paso 3 — Crear el script de relay
-Elegir patrón según la fuente:
+> No hay que crear un script por estación: el **runner único** `stream_run.sh` lee la URL,
+> el tipo y el route desde `stations.json` y decide captura (curl-pipe para Icecast, ffmpeg
+> para el resto), transporte (directo/gateway) y salida (audio/video) automáticamente.
 
-| Si la fuente... | Patrón |
-|---|---|
-| es `ice42.securenetsystems.net` (Icecast) | **A** — curl pipe + SOCKS5 |
-| está geobloqueada pero no es Icecast | **B** — ffmpeg + privoxy |
-| NO está geobloqueada (CDN global) | **C** — ffmpeg directo |
-
-**Patrón A — curl pipe (radio Icecast):**
-```bash
-#!/bin/bash
-source /etc/mediadev/gateway.conf
-OUT_DIR="/var/www/streams/nueva_radio"; mkdir -p "$OUT_DIR"
-exec curl -s --retry 999 --retry-delay 3 --socks5-hostname $GW_SOCKS5 \
-  -A "MediaDEV/1.0" -H "Icy-MetaData: 1" "https://ice42.securenetsystems.net/STREAM_ID" \
-| ffmpeg -y -loglevel warning -fflags nobuffer -i pipe:0 \
-  -vn -c:a aac -b:a 64k -ac 1 -ar 22050 \
-  -f hls -hls_time 4 -hls_list_size 10 -hls_flags append_list \
-  -hls_segment_filename "$OUT_DIR/seg_%05d.ts" "$OUT_DIR/index.m3u8"
-```
-
-**Patrón B — privoxy (radio geobloqueada no-Icecast):** igual pero
-`ffmpeg -http_proxy http://127.0.0.1:3128 -i "URL" ...` (sin el curl).
-
-**Patrón C — directo (TV / CDN global):** ffmpeg directo, y para **TV preservar video**:
-```bash
-exec ffmpeg -y -loglevel warning -fflags nobuffer -i "https://URL.m3u8" \
-  -c:v copy -c:a aac -b:a 128k \
-  -f hls -hls_time 4 -hls_list_size 10 -hls_flags append_list \
-  -hls_segment_filename "$OUT_DIR/seg_%05d.ts" "$OUT_DIR/index.m3u8"
-```
-
-> **No usar `delete_segments`** — los segmentos deben persistir para auditoría.
-> **Radio:** `-vn -c:a aac -b:a 64k -ac 1 -ar 22050`. **TV:** `-c:v copy -c:a aac -b:a 128k`.
-
-### Paso 4 — Registrar en supervisord
+### Paso 3 — Registrar en supervisord
 ```bash
 cat >> /etc/supervisor/conf.d/mediadev_streams.conf << 'CONF'
 
 [program:stream_nueva_radio]
-command=/opt/media-ai/scripts/stream_nueva_radio.sh
+command=/opt/media-ai/scripts/stream_run.sh nueva_radio
 autostart=true
 autorestart=true
 startsecs=5
@@ -248,13 +223,14 @@ stdout_logfile=/var/log/streams/nueva_radio.log
 stderr_logfile=/var/log/streams/nueva_radio.err
 environment=HOME="/root"
 CONF
-chmod +x /opt/media-ai/scripts/stream_nueva_radio.sh
 ```
 
-### Paso 5 — Activar y verificar
+### Paso 4 — Activar y verificar
 ```bash
 supervisorctl reread && supervisorctl update
 supervisorctl status stream_nueva_radio
+# Ver qué transporte eligió (directo o gateway):
+supervisorctl tail stream_nueva_radio stdout | grep use_gateway
 sleep 20
 curl -s http://localhost/streams/nueva_radio/index.m3u8 | head -5
 ```
@@ -271,9 +247,9 @@ supervisorctl stop stream_{id}      # reactivar: supervisorctl start stream_{id}
 supervisorctl stop stream_{id}
 nano /etc/supervisor/conf.d/mediadev_streams.conf   # borrar bloque [program:stream_{id}]
 supervisorctl reread && supervisorctl update
-rm -f /opt/media-ai/scripts/stream_{id}.sh
 rm -rf /var/www/streams/{id}/
 nano /opt/media-ai/config/stations.json             # quitar la entrada
+# (no hay script por estación que borrar — el runner es compartido)
 ```
 
 ---
@@ -427,7 +403,7 @@ supervisorctl status   # 12 procesos ffmpeg
 | Ruta | Descripción |
 |---|---|
 | `/opt/media-ai/config/stations.json` | Estaciones + gateways |
-| `/opt/media-ai/scripts/stream_{id}.sh` | Relay de cada estación |
+| `/opt/media-ai/scripts/stream_run.sh` | Runner unificado de streams (todos) |
 | `/etc/mediadev/gateway.conf` | Gateway activo (vía gateway_switch.sh) |
 | `/etc/mediadev-{s3,db}.env` | Credenciales (chmod 600) |
 | `/var/www/streams/{id}/index.m3u8` | Playlist HLS activa |

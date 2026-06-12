@@ -79,10 +79,23 @@ Cada nodo tiene su par de claves e IP en `10.101.0.0/24`.
 - **SOCKS5 directo**: `curl --socks5-hostname 10.101.0.X:1080 URL | ffmpeg -i pipe:0`
 - **Privoxy HTTP**: `ffmpeg -http_proxy http://127.0.0.1:3128` donde Privoxy reenvía a SOCKS5
 
-### 5. Captura HLS (supervisord + ffmpeg)
-12 procesos ffmpeg persistentes, uno por stream:
+### 5. Captura HLS (supervisord + runner unificado)
+12 procesos persistentes, uno por stream, todos invocan el **runner único**
+`stream_run.sh <id>` (supervisord). El runner lee `url`/`type`/`route` de `stations.json` y
+decide captura, transporte y salida:
 - **10 radios** → audio AAC mono 64kbps 22050Hz, `-vn` (sin video).
 - **2 canales TV** (`hch_tv`, `teleceiba`) → **preservan video** con `-c:v copy -c:a aac -b:a 128k`.
+
+El campo `route` en `stations.json` define el transporte:
+
+| `route` | Comportamiento |
+|---|---|
+| `gateway` | Siempre por el gateway (fuentes geo-bloqueadas fijas, ej. ice42) — 7 streams |
+| `auto` | Prueba directo; si falla usa gateway. **Re-evalúa en cada arranque** → si bloquean una fuente directa, el reinicio cae solo al gateway (fallback automático) — 5 streams |
+| `direct` | Siempre directo, sin fallback |
+
+Hoy van directo (vía `auto`): radio_america, radio_globo, radio_el_patio y las 2 TV. El resto
+(ice42) requiere gateway. El runner detecta Icecast (curl-pipe) vs ffmpeg y audio vs video solo.
 
 Segmentos de 4s, playlist HLS de 10 segmentos. Los .ts NO se eliminan por ffmpeg
 (`append_list` sin `delete_segments`) — se acumulan para auditoría y para el uploader de video.
@@ -202,7 +215,7 @@ Internet
 ├── monitor/
 │   └── monitor.py          # Monitoreo WireGuard + alertas Telegram
 └── scripts/
-    ├── stream_*.sh             # 12 scripts ffmpeg (uno por stream)
+    ├── stream_run.sh           # Runner unificado (lee url/type/route de stations.json)
     ├── video_segment_uploader.py   # TV .ts → S3
     ├── gateway_switch.sh           # Aplica cambio de gateway activo
     ├── gateway_watchdog.py         # Watchdog del gateway
