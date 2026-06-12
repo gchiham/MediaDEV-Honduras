@@ -1,13 +1,37 @@
 {
   "version": "1.0",
-  "updated_at": "2026-06-04",
+  "updated_at": "2026-06-09",
   "gateways": {
     "hn01": {
       "name": "Honduras Raspberry 01",
       "country": "HN",
       "vpn_ip": "10.101.0.2",
       "socks5": "socks5://10.101.0.2:1080",
-      "enabled": true
+      "enabled": false,
+      "note": "Inactivo desde 2026-06-11 15:38:10 -- cambiado por gateway_switch.sh",
+      "priority": 2,
+      "role": "failover-1"
+    },
+    "hn02": {
+      "name": "PC-LCE Gateway",
+      "country": "HN",
+      "vpn_ip": "10.101.0.5",
+      "socks5": "socks5://10.101.0.5:1080",
+      "enabled": true,
+      "note": "Activo desde 2026-06-11 15:38:10 -- cambiado por gateway_switch.sh",
+      "priority": 1,
+      "role": "primary"
+    },
+    "hn03": {
+      "name": "RPi-Levi",
+      "country": "HN",
+      "vpn_ip": "10.101.0.6",
+      "socks5": "socks5://10.101.0.6:1080",
+      "enabled": false,
+      "note": "Inactivo desde 2026-06-09 18:02:39 -- cambiado por gateway_switch.sh",
+      "wg_pubkey": "iLWsb6GyE2bys9XOkiBUPXlx1mtxhz18TXjDmkFFjWk=",
+      "priority": 3,
+      "role": "failover-2"
     }
   },
   "stations": [
@@ -16,7 +40,7 @@
       "name": "XY HRN",
       "type": "radio",
       "route": "honduras",
-      "gateway": "hn01",
+      "gateway": "hn02",
       "url": "https://ice42.securenetsystems.net/HRN",
       "enabled": true
     },
@@ -25,7 +49,7 @@
       "name": "XY TGU",
       "type": "radio",
       "route": "honduras",
-      "gateway": "hn01",
+      "gateway": "hn02",
       "url": "https://ice42.securenetsystems.net/XY905",
       "enabled": true
     },
@@ -34,7 +58,7 @@
       "name": "XY SPS",
       "type": "radio",
       "route": "honduras",
-      "gateway": "hn01",
+      "gateway": "hn02",
       "url": "https://ice42.securenetsystems.net/XY1073",
       "enabled": true
     },
@@ -43,7 +67,7 @@
       "name": "Radio Satelite",
       "type": "radio",
       "route": "honduras",
-      "gateway": "hn01",
+      "gateway": "hn02",
       "url": "http://ice42.securenetsystems.net/SATELITE",
       "enabled": true
     },
@@ -52,7 +76,7 @@
       "name": "94.1 FM",
       "type": "radio",
       "route": "honduras",
-      "gateway": "hn01",
+      "gateway": "hn02",
       "url": "https://ice42.securenetsystems.net/94SUFM",
       "enabled": true
     },
@@ -61,7 +85,7 @@
       "name": "Suave FM",
       "type": "radio",
       "route": "honduras",
-      "gateway": "hn01",
+      "gateway": "hn02",
       "url": "http://ice42.securenetsystems.net/SUAVE",
       "enabled": true
     },
@@ -70,7 +94,7 @@
       "name": "Radio America",
       "type": "radio",
       "route": "honduras",
-      "gateway": "hn01",
+      "gateway": "hn02",
       "url": "https://27403.live.streamtheworld.com/AMERICA_SC",
       "enabled": true
     },
@@ -79,7 +103,7 @@
       "name": "Radio Globo",
       "type": "radio",
       "route": "honduras",
-      "gateway": "hn01",
+      "gateway": "hn02",
       "url": "https://stream.radiosmundiales.com/stream/radioglobo",
       "enabled": true
     },
@@ -88,7 +112,7 @@
       "name": "Radio El Patio",
       "type": "radio",
       "route": "honduras",
-      "gateway": "hn01",
+      "gateway": "hn02",
       "url": "http://51.89.173.53:8045/elpatio",
       "enabled": true
     },
@@ -97,7 +121,7 @@
       "name": "HCH TV",
       "type": "tv",
       "route": "honduras",
-      "gateway": "hn01",
+      "gateway": "hn02",
       "url": "https://live.streamhch.com/live/streams/hch1.m3u8",
       "enabled": true
     },
@@ -106,7 +130,7 @@
       "name": "Teleceiba",
       "type": "tv",
       "route": "honduras",
-      "gateway": "hn01",
+      "gateway": "hn02",
       "url": "https://teleceiba.com/stream/tlcb720.m3u8",
       "enabled": true
     },
@@ -115,7 +139,7 @@
       "name": "Radio Choluteca",
       "type": "radio",
       "route": "honduras",
-      "gateway": "hn01",
+      "gateway": "hn02",
       "url": "https://ice42.securenetsystems.net/CHOLUTEC",
       "enabled": true
     }

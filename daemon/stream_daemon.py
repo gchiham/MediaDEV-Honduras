@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-MediaDEV Stream Daemon — optimizado 1 vCPU / 2GB RAM
-Health: 15s | Index: 60s | Metrics: 60s | Record: 120s | Cleanup: 1800s
+MediaDEV Stream Daemon — sin SQLite, estado en memoria + mtime
+Health: 15s | Record: 120s | Cleanup: 1800s
 """
-import os, sys, sqlite3, subprocess, time, signal, logging
+import os, sys, subprocess, time, signal, logging, boto3
+from botocore.exceptions import ClientError
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-DB_PATH      = "/var/www/streams/mediadev.db"
-STREAMS_ROOT = Path("/var/www/streams")
-LOG_FILE     = "/var/log/streams/daemon.log"
+STREAMS_ROOT = Path(os.environ.get("STREAMS_ROOT", "/var/www/streams"))
+LOG_FILE     = os.environ.get("STREAMS_LOG",  "/var/log/streams/daemon.log")
 
 STREAMS = [
     "fm_941","hch_tv","radio_america","radio_choluteca","radio_el_patio",
@@ -18,21 +18,41 @@ STREAMS = [
     "xy_hrn","xy_sps","xy_tgu",
 ]
 
-STALE_SECS     = 30
-CB_FAIL_OPEN   = 5
-CB_RESET_SECS  = 1800
-SEG_DURATION   = 4
-TGU = timezone(timedelta(hours=-6))  # America/Tegucigalpa GMT-6
+STALE_SECS          = 60
+CB_FAIL_OPEN        = 5
+CB_RESET_SECS       = 1800
+RESTART_AFTER_FAILS = 3
+SEG_DURATION        = 4
+TGU = timezone(timedelta(hours=-6))
 KEEP_SEG_HOURS = 8
-KEEP_MET_DAYS  = 7
+KEEP_MP3_COUNT = 8
 
-# Intervalos conservadores para 1 vCPU
-INTERVAL_HEALTH = 15    # era 3s  → ahora 15s
-INTERVAL_INDEX  = 60    # era 10s → ahora 60s
-INTERVAL_METRIC = 60
+# ── S3 ────────────────────────────────────────────────────────────────────────
+S3_BUCKET  = os.environ.get("S3_BUCKET",  "mediadev-recordings")
+S3_REGION  = os.environ.get("S3_REGION",  "us-east-1")
+PEER_ROLE  = os.environ.get("PEER_ROLE",  "primary")
+BACKUP_PFX = "_backup"
+
+def s3_upload(local_path: Path, stream_id: str) -> bool:
+    try:
+        s3 = boto3.client("s3", region_name=S3_REGION)
+        date_part = local_path.name[:10]
+        year, month = date_part[:4], date_part[5:7]
+        canon = f"{stream_id}/{year}/{month}/{local_path.name}"
+        key   = f"{BACKUP_PFX}/{canon}" if PEER_ROLE == "backup" else canon
+        s3.upload_file(str(local_path), S3_BUCKET, key,
+                       ExtraArgs={"ContentType": "audio/mpeg"})
+        log.info(f"[{stream_id}] S3 OK [{PEER_ROLE}] → s3://{S3_BUCKET}/{key}")
+        return True
+    except Exception as e:
+        log.error(f"[{stream_id}] S3 FAIL: {e}")
+        return False
+
+# Intervalos
+INTERVAL_HEALTH = 15
 INTERVAL_RECORD = 120
-INTERVAL_CLEAN  = 1800  # era 900s → ahora 30min
-LOOP_SLEEP      = 2     # era 0.5s → ahora 2s
+INTERVAL_CLEAN  = 1800
+LOOP_SLEEP      = 2
 
 # ── LOGGING ───────────────────────────────────────────────────────────────────
 Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
@@ -43,74 +63,23 @@ logging.basicConfig(
 )
 log = logging.getLogger("daemon")
 
-# ── SCHEMA ────────────────────────────────────────────────────────────────────
-SCHEMA = """
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous  = NORMAL;
-
-CREATE TABLE IF NOT EXISTS stream_status (
-    stream_id      TEXT PRIMARY KEY,
-    status         TEXT DEFAULT 'UNKNOWN',
-    sup            TEXT DEFAULT 'UNKNOWN',
-    segs           INTEGER DEFAULT 0,
-    age            INTEGER DEFAULT 0,
-    cb_state       TEXT DEFAULT 'CLOSED',
-    cb_fails       INTEGER DEFAULT 0,
-    cb_since       INTEGER DEFAULT 0,
-    restart_today  INTEGER DEFAULT 0,
-    last_down      INTEGER DEFAULT 0,
-    last_up        INTEGER DEFAULT 0,
-    updated_at     INTEGER DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS metrics (
-    stream_id  TEXT    NOT NULL,
-    ts         INTEGER NOT NULL,
-    status     TEXT    NOT NULL,
-    segs       INTEGER DEFAULT 0,
-    bytes      INTEGER DEFAULT 0,
-    PRIMARY KEY (stream_id, ts)
-);
-CREATE INDEX IF NOT EXISTS idx_met ON metrics(stream_id, ts DESC);
-
-CREATE TABLE IF NOT EXISTS segments (
-    stream_id  TEXT    NOT NULL,
-    filename   TEXT    NOT NULL,
-    ts_start   INTEGER NOT NULL,
-    ts_end     INTEGER NOT NULL,
-    bytes      INTEGER DEFAULT 0,
-    PRIMARY KEY (stream_id, filename)
-);
-CREATE INDEX IF NOT EXISTS idx_seg ON segments(stream_id, ts_start);
-
-CREATE TABLE IF NOT EXISTS events (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    stream_id  TEXT    NOT NULL,
-    ts         INTEGER NOT NULL,
-    etype      TEXT    NOT NULL,
-    detail     TEXT    DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS idx_evt ON events(stream_id, ts DESC);
-"""
-
-def init_db():
-    db = sqlite3.connect(DB_PATH, check_same_thread=False)
-    db.row_factory = sqlite3.Row
-    db.executescript(SCHEMA)
-    for sid in STREAMS:
-        db.execute("INSERT OR IGNORE INTO stream_status (stream_id) VALUES (?)", (sid,))
-    db.commit()
-    return db
-
-def log_event(db, sid, etype, detail=""):
-    db.execute(
-        "INSERT INTO events (stream_id,ts,etype,detail) VALUES (?,?,?,?)",
-        (sid, int(time.time()), etype, detail)
-    )
+# ── STATE (en memoria) ────────────────────────────────────────────────────────
+def init_state():
+    return {
+        sid: {
+            "status":        "UNKNOWN",
+            "cb_state":      "CLOSED",
+            "cb_fails":      0,
+            "cb_since":      0,
+            "last_down":     0,
+            "last_up":       0,
+            "restart_today": 0,
+        }
+        for sid in STREAMS
+    }
 
 # ── HEALTH CHECK ──────────────────────────────────────────────────────────────
 def sup_statuses():
-    """Una sola llamada para todos los streams."""
     try:
         out = subprocess.check_output(
             ["timeout","5","supervisorctl","status"],
@@ -124,144 +93,67 @@ def sup_statuses():
         return {}
 
 def m3u8_seg_count(m3u8: Path) -> int:
-    """Cuenta segmentos desde el m3u8 — sin tocar el disco."""
     try:
         return sum(1 for l in m3u8.read_text().splitlines() if l.endswith(".ts"))
     except:
         return 0
 
-def restart_stream(db, sid):
+def restart_stream(state, sid):
     subprocess.Popen(
         ["supervisorctl","restart",f"stream_{sid}"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
-    db.execute(
-        "UPDATE stream_status SET restart_today=restart_today+1 WHERE stream_id=?",
-        (sid,)
-    )
+    state[sid]["restart_today"] += 1
 
-def do_health(db, state):
+def do_health(state):
     now  = int(time.time())
     sups = sup_statuses()
 
     for sid in STREAMS:
-        row = db.execute(
-            "SELECT status,cb_state,cb_fails,cb_since,last_down,last_up "
-            "FROM stream_status WHERE stream_id=?", (sid,)
-        ).fetchone()
-        prev  = row["status"]
-        cb_st = row["cb_state"]
-        cb_f  = row["cb_fails"]
-        cb_s  = row["cb_since"]
-        l_d   = row["last_down"]
-        l_u   = row["last_up"]
+        s    = state[sid]
+        prev = s["status"]
 
         sup  = sups.get(sid, "UNKNOWN")
         m3u8 = STREAMS_ROOT / sid / "index.m3u8"
 
-        # Leer SOLO el m3u8 — sin glob en disco
         if m3u8.exists():
             age  = now - int(m3u8.stat().st_mtime)
             segs = m3u8_seg_count(m3u8)
+            empty_playlist = (segs == 0 and m3u8.stat().st_size > 50)
             ok   = age <= STALE_SECS and segs > 0
         else:
-            age = segs = 0; ok = False
+            age = segs = 0; ok = False; empty_playlist = False
 
-        # Circuit Breaker
-        if cb_st == "OPEN":
-            if now - cb_s >= CB_RESET_SECS:
-                cb_st = "CLOSED"; cb_f = 0
+        if s["cb_state"] == "OPEN":
+            if now - s["cb_since"] >= CB_RESET_SECS:
+                s["cb_state"] = "CLOSED"; s["cb_fails"] = 0
                 log.info(f"[{sid}] CB → CLOSED (reset)")
-                log_event(db, sid, "CB_CLOSE")
-                restart_stream(db, sid)
+                restart_stream(state, sid)
             else:
-                db.execute(
-                    "UPDATE stream_status SET status='DISABLED',sup=?,segs=?,age=?,"
-                    "cb_state=?,cb_fails=?,updated_at=? WHERE stream_id=?",
-                    (sup, segs, age, cb_st, cb_f, now, sid)
-                )
-                db.commit()
-                state["cur"][sid] = "DISABLED"
+                s["status"] = "DISABLED"
                 continue
 
         if ok:
-            new_st = "OK"; cb_f = 0
+            s["cb_fails"] = 0
             if prev not in ("OK", "UNKNOWN"):
                 log.info(f"[{sid}] ↑ UP")
-                log_event(db, sid, "UP")
-                l_u = now
+                s["last_up"] = now
+            s["status"] = "OK"
         else:
-            new_st = "STALE" if m3u8.exists() else "NO_M3U8"
-            cb_f  += 1
+            s["status"] = "STALE" if m3u8.exists() else "NO_M3U8"
+            s["cb_fails"] += 1
             if prev == "OK":
-                log.warning(f"[{sid}] ↓ DOWN age={age}s cb_fails={cb_f}")
-                log_event(db, sid, "DOWN", f"age={age}s")
-                l_d = now
-                if cb_f <= CB_FAIL_OPEN:
-                    restart_stream(db, sid)
-            if cb_f >= CB_FAIL_OPEN and cb_st == "CLOSED":
-                cb_st = "OPEN"; cb_s = now
-                log.warning(f"[{sid}] CB → OPEN tras {cb_f} fallos")
-                log_event(db, sid, "CB_OPEN", f"fails={cb_f}")
-
-        db.execute(
-            "UPDATE stream_status SET status=?,sup=?,segs=?,age=?,cb_state=?,"
-            "cb_fails=?,cb_since=?,last_down=?,last_up=?,updated_at=? "
-            "WHERE stream_id=?",
-            (new_st, sup, segs, age, cb_st, cb_f, cb_s, l_d, l_u, now, sid)
-        )
-        db.commit()
-        state["cur"][sid] = new_st
-
-# ── SEGMENT INDEXER ───────────────────────────────────────────────────────────
-def do_index(db, state):
-    """Solo indexa archivos NUEVOS (mtime >= último run)."""
-    since = state.get("last_index_ts", 0) - SEG_DURATION
-    now   = int(time.time())
-
-    for sid in STREAMS:
-        sdir = STREAMS_ROOT / sid
-        if not sdir.exists():
-            continue
-        new = []
-        for seg in sdir.glob("seg_*.ts"):
-            try:
-                st = seg.stat()
-                if st.st_mtime < since:
-                    continue   # ya indexado en ciclo anterior
-                mtime = int(st.st_mtime)
-                new.append((sid, seg.name, mtime - SEG_DURATION, mtime, st.st_size))
-                state["bw"][sid] = state["bw"].get(sid, 0) + st.st_size
-            except:
-                pass
-        if new:
-            db.executemany(
-                "INSERT OR IGNORE INTO segments "
-                "(stream_id,filename,ts_start,ts_end,bytes) VALUES (?,?,?,?,?)",
-                new
-            )
-            db.commit()
-
-    state["last_index_ts"] = now
-
-# ── METRICS ───────────────────────────────────────────────────────────────────
-def do_metrics(db, state):
-    now = int(time.time())
-    ts  = now - now % 60
-    rows = []
-    for sid in STREAMS:
-        r    = db.execute("SELECT segs FROM stream_status WHERE stream_id=?", (sid,)).fetchone()
-        segs = r["segs"] if r else 0
-        bw   = state["bw"].pop(sid, 0)
-        rows.append((sid, ts, state["cur"].get(sid, "UNKNOWN"), segs, bw))
-    db.executemany(
-        "INSERT OR REPLACE INTO metrics (stream_id,ts,status,segs,bytes) VALUES (?,?,?,?,?)",
-        rows
-    )
-    db.commit()
+                log.warning(f"[{sid}] ↓ DOWN age={age}s cb_fails={s['cb_fails']} empty={empty_playlist}")
+                s["last_down"] = now
+            if not empty_playlist and s["cb_fails"] >= RESTART_AFTER_FAILS and s["cb_fails"] <= CB_FAIL_OPEN:
+                log.info(f"[{sid}] Reiniciando ffmpeg tras {s['cb_fails']} fallos")
+                restart_stream(state, sid)
+            if s["cb_fails"] >= CB_FAIL_OPEN and s["cb_state"] == "CLOSED":
+                s["cb_state"] = "OPEN"; s["cb_since"] = now
+                log.warning(f"[{sid}] CB → OPEN tras {s['cb_fails']} fallos")
 
 # ── HOURLY RECORDINGS ─────────────────────────────────────────────────────────
-def do_record(db, state):
+def do_record(state):
     now = int(time.time())
     if (now % 3600) // 60 > 3:
         return
@@ -276,14 +168,11 @@ def do_record(db, state):
         if out.exists():
             continue
 
-        rows = db.execute(
-            "SELECT filename FROM segments WHERE stream_id=? "
-            "AND ts_start>=? AND ts_start<? ORDER BY ts_start",
-            (sid, h_start, h_end)
-        ).fetchall()
-
-        segs = [STREAMS_ROOT / sid / r["filename"] for r in rows]
-        segs = [f for f in segs if f.exists()]
+        segs = sorted(
+            [f for f in (STREAMS_ROOT / sid).glob("seg_*.ts")
+             if f.exists() and h_start <= f.stat().st_mtime < h_end],
+            key=lambda f: f.stat().st_mtime
+        )
         if len(segs) < 10:
             continue
 
@@ -296,57 +185,47 @@ def do_record(db, state):
         )
         if result.returncode == 0:
             log.info(f"[{sid}] {h_label}.mp3 OK ({out.stat().st_size//1024}KB)")
-            for old in sorted(rec_dir.glob("*.mp3"), key=lambda f: f.name, reverse=True)[KEEP_SEG_HOURS:]:
+            s3_upload(out, sid)
+            for old in sorted(rec_dir.glob("*.mp3"), key=lambda f: f.name, reverse=True)[KEEP_MP3_COUNT:]:
                 old.unlink()
         else:
             out.unlink(missing_ok=True)
             log.error(f"[{sid}] Fallo grabando {h_label}")
 
 # ── CLEANUP ───────────────────────────────────────────────────────────────────
-def do_cleanup(db, state):
-    cutoff  = int(time.time()) - KEEP_SEG_HOURS * 3600
+def do_cleanup(state):
+    cutoff  = time.time() - KEEP_SEG_HOURS * 3600
     deleted = 0
     for sid in STREAMS:
-        old = db.execute(
-            "SELECT filename FROM segments WHERE stream_id=? AND ts_end<?",
-            (sid, cutoff)
-        ).fetchall()
-        for r in old:
-            (STREAMS_ROOT / sid / r["filename"]).unlink(missing_ok=True)
-            deleted += 1
-        if old:
-            db.execute("DELETE FROM segments WHERE stream_id=? AND ts_end<?", (sid, cutoff))
-    db.execute("DELETE FROM metrics WHERE ts<?", (int(time.time()) - KEEP_MET_DAYS * 86400,))
-    db.execute("DELETE FROM events  WHERE ts<?", (int(time.time()) - 30 * 86400,))
-    db.commit()
+        for seg in (STREAMS_ROOT / sid).glob("seg_*.ts"):
+            try:
+                if seg.stat().st_mtime < cutoff:
+                    seg.unlink()
+                    deleted += 1
+            except:
+                pass
     if deleted:
         log.info(f"Cleanup: {deleted} segmentos eliminados")
 
 # ── DAILY RESET ───────────────────────────────────────────────────────────────
 _last_reset_day = None
-def do_daily_reset(db, state):
+def do_daily_reset(state):
     global _last_reset_day
     today = datetime.now(tz=TGU).date()
     if _last_reset_day == today:
         return
     _last_reset_day = today
-    db.execute("UPDATE stream_status SET restart_today=0")
-    db.commit()
+    for sid in STREAMS:
+        state[sid]["restart_today"] = 0
     log.info("Contadores diarios reseteados")
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 50)
-    log.info("MediaDEV Stream Daemon — 1vCPU mode")
-    log.info(f"health={INTERVAL_HEALTH}s index={INTERVAL_INDEX}s "
-             f"clean={INTERVAL_CLEAN}s loop={LOOP_SLEEP}s")
+    log.info("MediaDEV Stream Daemon — sin SQLite")
+    log.info(f"health={INTERVAL_HEALTH}s clean={INTERVAL_CLEAN}s loop={LOOP_SLEEP}s")
 
-    db    = init_db()
-    state = {
-        "cur":           {s: "UNKNOWN" for s in STREAMS},
-        "bw":            {},
-        "last_index_ts": 0,
-    }
+    state = init_state()
 
     running = [True]
     def _stop(sig, frame):
@@ -355,33 +234,26 @@ def main():
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT,  _stop)
 
-    last = {k: 0 for k in ("health","index","metric","record","clean","daily")}
+    last = {k: 0 for k in ("health","record","clean","daily")}
     log.info(f"Monitoreando {len(STREAMS)} streams")
 
     while running[0]:
         now = time.time()
 
         if now - last["health"] >= INTERVAL_HEALTH:
-            do_health(db, state);  last["health"] = now
-
-        if now - last["index"] >= INTERVAL_INDEX:
-            do_index(db, state);   last["index"]  = now
-
-        if now - last["metric"] >= INTERVAL_METRIC:
-            do_metrics(db, state); last["metric"] = now
+            do_health(state);        last["health"] = now
 
         if now - last["record"] >= INTERVAL_RECORD:
-            do_record(db, state);  last["record"] = now
+            do_record(state);        last["record"] = now
 
         if now - last["clean"] >= INTERVAL_CLEAN:
-            do_cleanup(db, state); last["clean"]  = now
+            do_cleanup(state);       last["clean"]  = now
 
         if now - last["daily"] >= 3600:
-            do_daily_reset(db, state); last["daily"] = now
+            do_daily_reset(state);   last["daily"]  = now
 
         time.sleep(LOOP_SLEEP)
 
-    db.close()
     log.info("Daemon detenido")
 
 if __name__ == "__main__":

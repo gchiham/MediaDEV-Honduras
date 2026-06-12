@@ -6,10 +6,9 @@ mkdir -p "$OUT_DIR"
 exec ffmpeg -y \
   -loglevel warning \
   -fflags nobuffer \
-  -http_proxy http://127.0.0.1:3128 \
   -user_agent "MediaDEV/1.0" \
   -i "https://live.streamhch.com/live/streams/hch1.m3u8" \
-  -vn -c:a aac -b:a 64k -ac 1 -ar 22050 \
+  -c:v copy -c:a aac -b:a 128k \
   -f hls \
   -hls_time 4 \
   -hls_list_size 10 \

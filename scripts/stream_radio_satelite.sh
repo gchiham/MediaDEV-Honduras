@@ -1,10 +1,15 @@
 #!/bin/bash
+# Cargar el gateway activo (fuente de verdad: /etc/mediadev/gateway.conf)
+# Para cambiar de gateway usa: sudo gateway_switch.sh <gateway_id>
+# shellcheck source=/etc/mediadev/gateway.conf
+source /etc/mediadev/gateway.conf
+
 # Stream relay: Radio Satelite
 # URL: http://ice42.securenetsystems.net/SATELITE
 OUT_DIR="/var/www/streams/radio_satelite"
 mkdir -p "$OUT_DIR"
 exec curl -s --retry 999 --retry-delay 3 \
-  --socks5-hostname 10.101.0.3:1080 \
+  --socks5-hostname $GW_SOCKS5 \
   -A "MediaDEV/1.0" -H "Icy-MetaData: 1" \
   "http://ice42.securenetsystems.net/SATELITE" \
 | ffmpeg -y \
