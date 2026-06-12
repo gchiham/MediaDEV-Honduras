@@ -244,15 +244,98 @@ def stream_detail(sid):
         url=f"/streams/{sid}/index.m3u8",
         all_streams=STREAMS, updated=updated)
 
-# ─── API ──────────────────────────────────────────────────────────────────────
+# ─── API JSON (para consumo externo / Claude Design) ───────────────────────────
+# Endpoints read-only, sin autenticación (misma política que el resto del panel).
+def _ser(v):
+    """Serializa tipos de PostgreSQL a JSON-friendly."""
+    from decimal import Decimal
+    from uuid import UUID
+    if isinstance(v, datetime): return v.isoformat()
+    if isinstance(v, Decimal):  return float(v)
+    if isinstance(v, UUID):     return str(v)
+    return v
+
+def rows_json(rows):
+    return [{k: _ser(v) for k, v in r.items()} for r in rows]
+
 @app.route("/api/status")
 def api_status():
+    """Estado operativo de los 12 streams que se graban (salud en vivo)."""
     con = db()
-    rows = {r["stream_id"]: dict(r) for r in qall(con, "SELECT * FROM mediadev_stream_status")}
+    rows = {r["stream_id"]: {k: _ser(v) for k, v in r.items()}
+            for r in qall(con, "SELECT * FROM mediadev_stream_status ORDER BY stream_id")}
     con.close()
-    ok = sum(1 for r in rows.values() if r["status"]=="OK")
-    return jsonify({"streams": rows, "summary": {"ok":ok,"total":len(STREAMS)},
+    ok = sum(1 for r in rows.values() if r["status"] == "OK")
+    return jsonify({"streams": rows, "summary": {"ok": ok, "total": len(STREAMS)},
                     "updated": datetime.now(tz=TGU).isoformat()})
+
+# Alias semántico de /api/status
+app.add_url_rule("/api/streams", "api_streams", api_status)
+
+@app.route("/api/stations")
+def api_stations():
+    """Catálogo completo de estaciones (radio/TV) en media-db.
+    Query opcional ?status=active|inactive  y  ?type=radio|tv."""
+    from flask import request
+    con = db()
+    where, params = [], []
+    if request.args.get("status"):
+        where.append("status = %s"); params.append(request.args["status"])
+    if request.args.get("type"):
+        where.append("type = %s");   params.append(request.args["type"])
+    sql = ("SELECT id, name, type, country_code, city, frequency, coverage,"
+           " callsign, logo_url, stream_url, status FROM stream_catalog")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY status, name"
+    rows = rows_json(qall(con, sql, tuple(params)))
+    con.close()
+    return jsonify({"stations": rows, "count": len(rows),
+                    "updated": datetime.now(tz=TGU).isoformat()})
+
+@app.route("/api/detections")
+def api_detections():
+    """Detecciones de anuncios recientes con nombre de anuncio y estación.
+    Query opcional ?limit=N (default 50, máx 500)."""
+    from flask import request
+    try:
+        limit = min(int(request.args.get("limit", 50)), 500)
+    except ValueError:
+        limit = 50
+    con = db()
+    rows = rows_json(qall(con,
+        "SELECT d.id, d.stream_id, a.name AS ad_name, d.air_time, d.ts_label,"
+        " d.score, d.confidence_level, d.clip_s3_key, d.detected_at"
+        " FROM fingerprint_detections d"
+        " LEFT JOIN advertisements a ON a.id = d.ad_id"
+        " WHERE d.deleted_at IS NULL"
+        " ORDER BY d.air_time DESC LIMIT %s", (limit,)))
+    con.close()
+    return jsonify({"detections": rows, "count": len(rows),
+                    "updated": datetime.now(tz=TGU).isoformat()})
+
+@app.route("/api/summary")
+def api_summary():
+    """KPIs globales del sistema para tarjetas de resumen."""
+    con = db()
+    now = ts_now()
+    online = qone(con, "SELECT COUNT(*) c FROM mediadev_stream_status WHERE status='OK'")["c"]
+    total_live = qone(con, "SELECT COUNT(*) c FROM mediadev_stream_status")["c"]
+    cat = qone(con, "SELECT COUNT(*) total,"
+                    " SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) active"
+                    " FROM stream_catalog")
+    det_today = qone(con,
+        "SELECT COUNT(*) c FROM fingerprint_detections"
+        " WHERE deleted_at IS NULL AND air_time >= %s",
+        (datetime.now(tz=TGU).replace(hour=0, minute=0, second=0, microsecond=0),))["c"]
+    det_total = qone(con, "SELECT COUNT(*) c FROM fingerprint_detections WHERE deleted_at IS NULL")["c"]
+    con.close()
+    return jsonify({
+        "streams_live":      {"online": online, "total": total_live},
+        "catalog":           {"active": cat["active"] or 0, "total": cat["total"] or 0},
+        "detections":        {"today": det_today, "total": det_total},
+        "updated": datetime.now(tz=TGU).isoformat(),
+    })
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()

@@ -1,93 +1,84 @@
 # MediaDEV Stream Monitor — Contexto raíz
 
 ## Propósito del proyecto
-Sistema de monitoreo 24/7 de 12 estaciones de radio y TV de Honduras.
-Captura streams de audio, los sirve como HLS, y expone un dashboard con KPIs en tiempo real.
-Incluye capacidad de auditoría: almacena 8 horas de audio por stream y genera grabaciones horarias en MP3.
+Sistema de monitoreo, grabación y auditoría 24/7 de 12 estaciones de Honduras
+(10 radios audio + 2 canales de TV con video). Captura streams vía gateways residenciales
+hondureños (geo-restriction), los sirve como HLS, archiva audio (MP3) y video (S3), expone
+dashboards + API REST, y alimenta el motor de detección de anuncios (Destroyer).
 
 ## Arquitectura de alto nivel
-
 ```
-[Streams Honduras] → [Exit Node SOCKS5] ──WireGuard──► [DigitalOcean 159.223.104.91]
-                                                              │
-                                          ┌───────────────────┼───────────────────┐
-                                     supervisord          stream-daemon        nginx
-                                     (12 ffmpeg)         (Python daemon)    (puerto 80)
-                                          │                    │                  │
-                                   /var/www/streams/     mediadev.db         gunicorn
-                                   {stream}/seg_*.ts    (SQLite WAL)        dashboard_v4.py
-                                   {stream}/index.m3u8                     (puerto 9000)
-                                   {stream}/recordings/
+[Streams HN] → [Gateways SOCKS5 + agente] ──WireGuard──► [DigitalOcean 159.223.104.91]
+                                                                │
+        ┌──────────────┬──────────────┬──────────────┬─────────┴────────┐
+   supervisord     stream-daemon   gateway-api +   video-uploader      nginx :80
+   (12 ffmpeg)    (health+record)  health-engine   (TV .ts → S3)    → gunicorn :9000
+        │              │           (failover)           │           dashboard_v4.py
+  /var/www/streams/    └──────────────┴───────────────────┴──────────► PostgreSQL
+  {stream}/seg_*.ts         (estado, métricas, gateways, catálogo, detecciones)
+  {stream}/recordings/                      media-db (DO Managed)
 ```
 
-## Restricción crítica de hardware
-**1 vCPU / 2 GB RAM / 10 GB Disk (DigitalOcean Droplet)**
-Toda decisión de diseño prioriza este constraint. No agregar workers, no reducir intervalos del daemon, no hacer glob masivo en disco.
+## Hardware
+**2 vCPU / 4 GB RAM (DigitalOcean Droplet).** El diseño prioriza este constraint:
+no agregar workers de gunicorn, no reducir intervalos del daemon, no hacer glob masivo en disco.
 
 ## Componentes principales
-
 | Componente | Ruta | Descripción |
 |---|---|---|
-| Daemon unificado |  | Loop principal: health, index, metrics, record, cleanup |
-| Dashboard Flask |  | API + vistas web |
-| Templates HTML |  | dashboard_main.html, stream_detail.html |
-| Scripts de stream |  | Un script por stream, ffmpeg + proxy |
-| Base de datos |  | SQLite WAL, única fuente de verdad |
-| Configuración |  | Metadatos de estaciones |
+| Stream daemon | `daemon/stream_daemon.py` | Health, grabación MP3, espejo de estado a PG |
+| Dashboard + API | `dashboard/dashboard_v4.py` | Vistas web + endpoints JSON (lee de PG) |
+| Scripts de stream | `scripts/stream_*.sh` | Un script ffmpeg por stream (proxy SOCKS5 o directo) |
+| Video uploader | `scripts/video_segment_uploader.py` | Sube .ts de TV a S3 |
+| Gateways | `/opt/destroyer/gateway/` | API de heartbeats + health engine (failover) |
+| Monitor | `monitor/monitor.py` | Vigila WireGuard, alertas Telegram |
+| Config | `config/stations.json` | Estaciones activas + definición de gateways |
 
-## Responsabilidades por carpeta
+## Base de datos — PostgreSQL (media-db), única persistencia
+Ya NO se usa SQLite local. El daemon mantiene el estado en memoria y lo espeja a PG.
+```sql
+mediadev_stream_status  -- estado actual por stream (1 fila c/u)
+mediadev_metrics        -- muestra cada 60s: status, segs, bytes (retención 7 días)
+mediadev_events         -- transiciones DOWN/UP/CB_OPEN/CB_CLOSE (retención 30 días)
+-- compartidas con Destroyer: stream_catalog, advertisements, fingerprint_detections, gateways...
+```
+Credenciales: `/etc/mediadev-db.env` (cargado por systemd). `monitor/events.db` es una SQLite
+aparte que SÍ usa el monitor — no confundir.
 
--  → Lógica del daemon (health check, indexer, métricas, grabaciones, cleanup)
--  → Flask app + templates Jinja2
--  → Scripts ffmpeg individuales por stream
--  → Segmentos HLS activos (.ts) + playlist (index.m3u8) + grabaciones MP3
--  → Base de datos SQLite
+## API REST (JSON, read-only)
+Servida por `dashboard_v4.py` en `http://159.223.104.91`:
+`/api/summary`, `/api/streams` (=`/api/status`), `/api/stations` (filtros status/type),
+`/api/detections` (?limit). Pensada para consumo externo / Claude Design.
 
-## Servicios del sistema
-
+## Servicios systemd
 ```bash
-systemctl status stream-daemon        # Daemon Python (health+index+metrics+record+cleanup)
-systemctl status dashboard-mediadev   # Gunicorn → Flask (1 worker)
-systemctl status nginx                # Reverse proxy puerto 80
-systemctl status supervisor           # Gestiona 12 procesos ffmpeg
-systemctl status privoxy              # HTTP proxy 127.0.0.1:3128 → SOCKS5
-systemctl status wg-quick@wg0        # Túnel WireGuard
+systemctl status stream-daemon mediadev-gateway-api mediadev-health-engine \
+                 mediadev-monitor video-segment-uploader dashboard-mediadev nginx
+supervisorctl status   # 12 procesos ffmpeg
 ```
 
-## Red y proxies
-
-- **WireGuard wg0**: MediaDEV 10.101.0.1/24
-- **Raspberry Pi** (gateway principal): 10.101.0.2:1080 SOCKS5
-- **PC Sedesol** (gateway temporal): 10.101.0.3:1080 SOCKS5
-- **PC Developer** (gateway temporal): 10.101.0.4:1080 SOCKS5
-- 7 streams usan  directo en ffmpeg
-- 5 streams usan  (Privoxy → SOCKS5)
+## Red y gateways
+- **WireGuard wg0**: MediaDEV `10.101.0.1/24`. Gateways en `config/stations.json`.
+- Fuente de verdad del gateway activo: `/etc/mediadev/gateway.conf` (cambiar SOLO con
+  `gateway_switch.sh <id>`). Los scripts hacen `source` de ese archivo.
+- Streams geo-restringidos usan SOCKS5; los de CDN global (streamtheworld, etc.) van directos.
+- Failover automático lo decide `health_engine.py` por health score.
 
 ## Zona horaria
-Todo el sistema opera en **America/Tegucigalpa (GMT-6 / CST)**. Los timestamps en SQLite se almacenan como Unix epoch (timezone-neutral). La conversión a GMT-6 ocurre únicamente en la capa de presentación del dashboard.
-
-## Schema de base de datos
-```sql
-stream_status  -- estado actual de cada stream (1 fila por stream)
-metrics        -- muestra por minuto: status, segs, bytes (retención 7 días)
-segments       -- índice de segmentos .ts en disco (retención 8h)
-events         -- log de eventos UP/DOWN/RESTART/CB_OPEN/CB_CLOSE (retención 30 días)
-```
+**America/Tegucigalpa (GMT-6)**. Timestamps en PG como Unix epoch; conversión solo en presentación.
 
 ## Principios arquitectónicos
-1. **Un solo daemon** reemplaza 5 cron jobs — evita condiciones de carrera
-2. **SQLite WAL** permite lecturas concurrentes sin bloquear escrituras del daemon
-3. **Circuit Breaker** (5 fallos → OPEN, reset 30min) evita restart storms
-4. **Sin glob masivo** — el health check lee solo el m3u8 en memoria, no escanea disco
-5. **Batch queries** en el dashboard — 4-5 GROUP BY en vez de 72 queries individuales
-6. **Segmentos persistentes** —  sin ; limpieza cada 30min
+1. Un solo daemon de mantenimiento (evita condiciones de carrera).
+2. Estado operativo en memoria + filesystem (mtime); PG es espejo tolerante a fallos.
+3. Circuit Breaker (5 fallos → OPEN, reset 30 min) evita restart storms.
+4. Sin glob masivo en health check — solo lee el m3u8.
+5. Batch queries en el dashboard (GROUP BY), nunca loops por stream.
+6. Segmentos persistentes (8h) para auditoría y para el uploader de video.
 
 ## Instrucciones para AI
-- Leer el CLAUDE.md más cercano a los archivos del task antes de explorar el repo
-- Solo inspeccionar archivos relacionados con la tarea solicitada
-- Evitar búsquedas globales del repositorio salvo necesidad explícita
-- Minimizar uso de tokens — preferir ediciones quirúrgicas
-- Preservar consistencia arquitectónica — no cambiar infraestructura sin pedido explícito
-- Para cambios en streams: siempre verificar si usan socks5 directo o http_proxy
-- No reducir intervalos del daemon sin justificación — el servidor es 1 vCPU
-- Las queries SQL siempre deben usar GROUP BY batch, nunca loops individuales por stream
+- Leer el CLAUDE.md más cercano a los archivos del task antes de explorar.
+- Inspeccionar solo lo relacionado con la tarea; evitar búsquedas globales salvo necesidad.
+- Preferir ediciones quirúrgicas; preservar la arquitectura (no cambiar infra sin pedido).
+- Para cambios en streams: verificar si usan SOCKS5 o conexión directa.
+- No reducir intervalos del daemon sin justificación (2 vCPU).
+- Credenciales siempre en `/etc/*.env` fuera del repo, nunca hardcodeadas.

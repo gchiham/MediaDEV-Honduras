@@ -65,7 +65,10 @@ El cerebro de la red de gateways, corre en MediaDEV como dos servicios:
   **ejecuta failover automático**, evita flapping y envía alertas por Telegram.
 
 Estado y telemetría se guardan en **PostgreSQL (media-db)**. El cambio de gateway lo aplica
-`gateway_switch.sh`, que reescribe los scripts de ffmpeg y Privoxy y reinicia los streams.
+`gateway_switch.sh`, que actualiza la fuente de verdad central
+**`/etc/mediadev/gateway.conf`** (exporta `GW_SOCKS5`), el proxy Privoxy y el estado en
+`stations.json`, y reinicia los streams. Los 7 scripts que usan SOCKS5 leen el gateway con
+`source /etc/mediadev/gateway.conf` — no tienen la IP hardcodeada.
 
 ### 3. WireGuard VPN
 Túnel cifrado entre el servidor y los nodos de salida.
@@ -146,6 +149,25 @@ systemd en el daemon y el dashboard vía `EnvironmentFile`.
 `monitor/monitor.py` (`mediadev-monitor`) — vigila el túnel WireGuard y envía alertas por
 Telegram cuando hay problemas de conectividad con los gateways.
 
+## API REST (JSON)
+Endpoints read-only servidos por `dashboard_v4.py` (vía nginx en `http://159.223.104.91`),
+pensados para consumo externo y para construir interfaces (p.ej. Claude Design). Sin
+autenticación, misma política que el panel.
+
+| Endpoint | Descripción |
+|---|---|
+| `GET /api/summary` | KPIs globales: streams en vivo, catálogo, detecciones (hoy/total) |
+| `GET /api/streams` | Estado de salud en vivo de los 12 streams grabando (alias de `/api/status`) |
+| `GET /api/stations` | Catálogo completo de estaciones. Filtros: `?status=active\|inactive`, `?type=radio\|tv` |
+| `GET /api/detections` | Detecciones de anuncios recientes (con nombre de anuncio y estación). `?limit=N` (máx 500) |
+
+Todos devuelven `{ ...datos, "updated": <ISO-8601 GMT-6> }`. Ejemplos:
+```bash
+curl http://159.223.104.91/api/summary
+curl 'http://159.223.104.91/api/stations?type=tv'
+curl 'http://159.223.104.91/api/detections?limit=20'
+```
+
 ## Topología de red
 
 ```
@@ -186,6 +208,10 @@ Internet
     ├── gateway_watchdog.py         # Watchdog del gateway
     ├── deploy_peer_b.sh            # Deploy de peer B
     └── backup_healthcheck.py       # Health check de backups
+
+/etc/mediadev/gateway.conf      # Gateway activo (fuente de verdad; vía gateway_switch.sh)
+/etc/mediadev-s3.env            # Credenciales AWS S3 (chmod 600)
+/etc/mediadev-db.env            # Credenciales PostgreSQL media-db (chmod 600)
 
 /opt/destroyer/gateway/         # Sistema de gateways (engine + agente)
 ├── engine/
@@ -275,8 +301,9 @@ El failover normalmente es **automático** (health_engine). Para forzarlo manual
 ```bash
 /opt/media-ai/scripts/gateway_switch.sh <gateway_id>   # ej: hn02
 ```
-El script reescribe los scripts de ffmpeg + Privoxy, resetea el Circuit Breaker y reinicia
-los streams. El cambio queda registrado en `config/stations.json` y en media-db.
+El script actualiza `/etc/mediadev/gateway.conf` (fuente de verdad que leen los scripts de
+ffmpeg), reconfigura Privoxy, registra el estado en `config/stations.json` y reinicia los
+streams. **No edites `gateway.conf` a mano** — siempre vía `gateway_switch.sh`.
 
 ## Recuperación ante desastres
 
