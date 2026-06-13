@@ -39,3 +39,14 @@ scripts_backup_rpi/
 # Credenciales
 .env
 *.env
+
+# Backups generados por scripts de migración/patches
+*.bak
+*.bak_
+*.bak_*
+*.bak.*
+*.backup.*
+*.cutoverbak*
+monitor/events.db
+monitor/logs/
+config/stations.json.bak
