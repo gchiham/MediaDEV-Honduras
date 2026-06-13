@@ -5,6 +5,8 @@ Captura streams en vivo a través de gateways residenciales hondureños, los sir
 archiva el contenido (audio MP3 + video en S3) y alimenta el motor de detección de
 publicidad (Destroyer).
 
+> **Documentación viva completa:** [`live_mediaDEV.md`](live_mediaDEV.md) — referencia técnica detallada del ecosistema completo (infraestructura, DB, Destroyer, MCP, decisiones de diseño). Actualizar cuando cambie la arquitectura.
+
 ## Por qué existe este sistema
 
 Las emisoras hondureñas bloquean el acceso desde IPs extranjeras (geo-restriction).
@@ -220,7 +222,8 @@ Internet
     ├── gateway_switch.sh           # Aplica cambio de gateway activo
     ├── gateway_watchdog.py         # Watchdog del gateway
     ├── deploy_peer_b.sh            # Deploy de peer B
-    └── backup_healthcheck.py       # Health check de backups
+    ├── backup_healthcheck.py       # Health check de backups
+    └── release.sh                  # Publica nueva release del Destroyer a S3
 
 /etc/mediadev/gateway.conf      # Gateway activo (fuente de verdad; vía gateway_switch.sh)
 /etc/mediadev-s3.env            # Credenciales AWS S3 (chmod 600)
@@ -247,18 +250,28 @@ Internet
 ```
 
 ## Relación con Destroyer
-**Destroyer** es el sistema de detección de publicidad (droplet efímero `c-32-intel`, corre 4x/día).
+**Destroyer** es el sistema de detección de publicidad (droplet efímero `c-16`, corre 4x/día).
 MediaDEV es su proveedor de datos:
 - Los segmentos de audio/video capturados aquí son la materia prima.
 - Los **segmentos de video en S3** (`video_segments/`) permiten que Destroyer reconstruya clips
   de video MP4 de cada anuncio detectado en TV.
 - Comparten la base **PostgreSQL media-db** (catálogo, detecciones, anuncios, gateways).
 
+**Sistema de releases S3** (implementado 13 jun 2026): el snapshot base del Destroyer contiene
+solo el OS y las dependencias. El código (`worker.py`, `fingerprint.py`) se descarga desde
+`s3://mediadev-recordings/destroyer/releases/` al arrancar el droplet. Para publicar una nueva
+versión: `./scripts/release.sh vX` en el servidor. Ver [`MEDIADEV_DESTROYER_RELEASES.md`](MEDIADEV_DESTROYER_RELEASES.md).
+
 ## Zona horaria
-Todo el sistema usa **America/Tegucigalpa (GMT-6 / CST)**.
-- Servidor OS: `timedatectl` → America/Tegucigalpa
-- Python: `TGU = timezone(timedelta(hours=-6))`
-- PostgreSQL: timestamps como Unix epoch (tz-neutral) — conversión solo en presentación
+
+**Backend UTC, display GMT-6** (cutover: 13 jun 2026 16:07 UTC).
+
+- Todas las timestamps en PostgreSQL son **UTC** (`TIMESTAMPTZ`)
+- El campo `pipeline_version` distingue datos históricos (`legacy`, pre-cutover) de los nuevos (`utc_v2`)
+- Honduras no tiene DST — offset siempre fijo: `UTC - 6h`
+- Frontend convierte: `airTimeHN = airTimeUtc - 6h`
+- Servidor OS: `timedatectl` → UTC
+- Python: `datetime.now(timezone.utc)`
 
 ## Despliegue — orden de arranque
 ```bash
@@ -337,8 +350,10 @@ Todos los servicios arrancan automáticamente via systemd. Recovery time: ~2 min
 
 ## Consideraciones de seguridad
 - Acceso SSH via llave privada (keySED) — no contraseña.
-- **Credenciales fuera del repo**: `/etc/mediadev-s3.env` y `/opt/destroyer/.env` (`chmod 600`),
+- **Credenciales fuera del repo**: `/etc/mediadev-s3.env`, `/opt/destroyer/.env`, `/etc/publiaudit-api.env` (`chmod 600`),
   cargadas por systemd vía `EnvironmentFile`. `.env` está en `.gitignore`.
+- `publiaudit-api` usa `EnvironmentFile=/etc/publiaudit-api.env` — credenciales no visibles en `systemctl show`.
+- CORS de `publiaudit-api` controlado por `CORS_ORIGINS` en el env file (sin hardcodear `*`).
 - UFW activo: puertos 22, 80, 443, 51820/udp.
 - WireGuard cifra todo el tráfico del proxy.
 - Gateway API protegida con token Bearer.
@@ -348,5 +363,4 @@ Todos los servicios arrancan automáticamente via systemd. Recovery time: ~2 min
 - Autenticación en los dashboards.
 - Transcripción automática con Whisper AI.
 - Lifecycle S3 para `video_segments/` (expiración automática de segmentos no consumidos).
-- Rotación de credenciales AWS.
 - Más gateways residenciales para redundancia.
