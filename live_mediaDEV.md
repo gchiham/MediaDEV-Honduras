@@ -408,12 +408,16 @@ Permite a Claude Code consultar el estado del ecosistema MediaDEV en tiempo real
 └── venv/           ← Python venv con mcp[server]
 ```
 
-**Herramientas disponibles (5):**
-- `get_system_status` — estado general del servidor
-- `get_workers` — workers activos del Destroyer
-- `get_queue_stats` — cola de MP3s pendientes
-- `get_service_health` — salud de servicios systemd
-- `get_recent_errors` — errores recientes en logs
+**Herramientas disponibles (7, solo lectura):**
+- `get_system_status` — estado de los 12 streams
+- `get_workers` — procesos ffmpeg + servicios systemd
+- `get_queue_stats` — motor Destroyer: corridas, detecciones, costos
+- `get_service_health` — gateways, VPN, DB, proxies
+- `get_recent_errors` — eventos de stream (DOWN/UP/CB) + failovers de gateway + runs con error
+- `get_service_logs(service, lines, contains)` — tail/grep del journal de un servicio (incluye tracebacks de Python). Allowlist de 9 servicios. **Para diagnosticar un error puntual** (ej. un 500 del API)
+- `get_error_digest(hours)` — escaneo consolidado de errores/tracebacks en todos los servicios clave. Una llamada para "¿qué se está rompiendo?"
+
+> **Diagnóstico de errores (v1.1, 13 jun 2026):** el journal de systemd (134 MB, todos los servicios) tiene los tracebacks reales. `get_service_logs` y `get_error_digest` los exponen al MCP para que la IA diagnostique sin entrar a `journalctl` a mano.
 
 ### Desde Windows (Claude Code desktop)
 
