@@ -41,8 +41,9 @@ qone(con, sql, params)  # fetchone
 `_ser()` convierte datetime→ISO, Decimal→float, UUID→str. Usar `rows_json()` para listas.
 
 ## Zona horaria
+Backend almacena UTC. El display convierte a GMT-6 (Honduras, sin DST, offset fijo).
 ```python
-TGU = timezone(timedelta(hours=-6))  # usar en TODOS los datetime de presentación
+TGU = timezone(timedelta(hours=-6))  # solo para presentación — DB guarda UTC
 ```
 
 ## Pitfalls

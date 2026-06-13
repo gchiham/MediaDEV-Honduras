@@ -1,7 +1,7 @@
 # live_mediaDEV.md — Ecosistema MediaDEV: Referencia Viva
 
 **Última actualización:** 13 junio 2026  
-**Versión del documento:** 1.0  
+**Versión del documento:** 1.1  
 **Servidor:** 159.223.104.91  
 **Mantenido por:** equipo MediaDEV — actualizar cada vez que cambie arquitectura, schema, servicios, o decisiones de diseño
 
@@ -18,7 +18,7 @@
 | IP pública | `159.223.104.91` |
 | Proveedor | DigitalOcean, región `nyc1` |
 | Tamaño | 2 vCPU / 4 GB RAM |
-| OS | Ubuntu 22.04 LTS |
+| OS | Ubuntu 24.04.4 LTS |
 | Acceso | `ssh -i ~/.ssh/keySED root@159.223.104.91` |
 
 ### Base de datos — PostgreSQL Managed (DigitalOcean)
@@ -33,7 +33,7 @@
 
 **Conectarse desde servidor mediaDEV:**
 ```bash
-PGPASSWORD='SgUWgtzmiWUAfZ91vInmUxiVWl4XC' psql \
+PGPASSWORD='<PG_PASS>' psql \
   -h private-media-db-do-user-2116998-0.d.db.ondigitalocean.com \
   -p 25060 -U destroyer -d destroyer_db
 ```
@@ -50,7 +50,7 @@ psql -h localhost -p 5433 -U destroyer -d destroyer_db
 |---|---|
 | Bucket | `mediadev-recordings` |
 | Región | `us-east-1` |
-| Rutas clave | `streams/` (MP3s), `clips/` (clips TV), `destroyer/releases/` (código Destroyer) |
+| Rutas clave | `{stream_id}/YYYY/MM/*.mp3` (MP3s horarios), `video_segments/` (TS TV), `clips/` (evidencia), `destroyer/releases/` (código Destroyer) |
 
 ### VPN y Gateways Honduras
 
@@ -75,7 +75,7 @@ mediaDEV (nyc1)
 | CPU | 16 vCPU (CPU-optimized) |
 | Vida útil | efímero — se destruye al terminar la corrida |
 | Snapshot base | ID `232701378` (`destroyer-base-v9`) |
-| Código | descargado desde S3 al arrancar (ver sección 5) |
+| Código | descargado desde S3 al arrancar (ver sección 4) |
 
 ---
 
@@ -85,12 +85,25 @@ El sistema procesa 12 streams de radio y TV hondureños. Los MP3/TS se graban co
 
 | ID | Tipo | Descripción |
 |---|---|---|
-| (completar con IDs reales de la DB) | Radio / TV | streams activos |
+| `xy_hrn` | Radio | XY HRN |
+| `xy_tgu` | Radio | XY TGU |
+| `xy_sps` | Radio | XY SPS |
+| `radio_satelite` | Radio | Radio Satelite |
+| `fm_941` | Radio | 94.1 FM |
+| `suave_fm` | Radio | Suave FM |
+| `radio_america` | Radio | Radio America |
+| `radio_globo` | Radio | Radio Globo |
+| `radio_el_patio` | Radio | Radio El Patio |
+| `radio_choluteca` | Radio | Radio Choluteca |
+| `hch_tv` | TV | HCH TV |
+| `teleceiba` | TV | Teleceiba |
 
-**Query para ver streams activos:**
+**Fuente de verdad operativa:** `/opt/media-ai/config/stations.json` (12 estaciones `enabled=true`).
+
+**Query para ver catálogo activo en DB:**
 ```sql
-SELECT id, name, type, status, last_seen
-FROM streams
+SELECT id, name, type, status
+FROM stream_catalog
 WHERE status = 'active'
 ORDER BY type, name;
 ```
@@ -101,58 +114,96 @@ Los streams de TV generan clips de video (libx264 ultrafast) además del audio.
 
 ## 3. Base de Datos — Tablas y Schema
 
+### Modelo de negocio (jerarquía multi-tenant)
+
+PubliAudit se organiza en esta jerarquía. La llave de aislamiento es `tenant_id` — cada tenant ve solo su propio mundo:
+
+```
+tenants      (cliente que paga: agencia, central de medios, radio, TV, gobierno)
+├── users    (personas del tenant — el JWT lleva tenant_id)
+└── clients  (anunciante: Pepsi, Molineros, Sec. de Salud)   — 1:N con tenant
+    └── campaigns
+        └── advertisements (ads, con fingerprint de referencia)
+            └── fingerprint_detections (emisiones detectadas)
+                └── report_public_links (evidence portal)
+```
+
+> **Rename 13 jun 2026:** la tabla `clients` original (que era el tenant) se renombró a `tenants`, y `client_id` → `tenant_id` en 10 tablas. La palabra "client" ahora significa **anunciante** (tabla `clients` nueva, 1:N con tenant). Ver [Historial de decisiones](#9-historial-de-decisiones-técnicas).
+
 ### Tablas principales
 
 | Tabla | Propósito |
 |---|---|
-| `s3_scan_log` | Registro de cada MP3/segmento subido a S3 por el stream-daemon |
-| `fingerprint_detections` | Detecciones de audio fingerprinting (cuñas publicitarias encontradas) |
-| `destroyer_runs` | Historial de corridas del Destroyer (una fila por ejecución) |
-| `advertisements` | Catálogo de anuncios con su fingerprint de referencia |
-| `streams` | Lista de streams activos con metadata |
+| `tenants` | Cliente que paga la plataforma (antes `clients`) — llave de aislamiento |
+| `users` | Usuarios del tenant (auth; el JWT lleva `tenant_id`) |
+| `clients` | Anunciantes administrados por el tenant (Pepsi, etc.) — 1:N |
+| `campaigns` | Campañas (`client_id` = anunciante + `tenant_id`) |
+| `advertisements` | Anuncios/cuñas con su fingerprint de referencia |
+| `fingerprint_detections` | Detecciones de audio fingerprinting |
+| `report_public_links` | Links públicos del evidence portal (token + QR) |
+| `stream_catalog` | Catálogo de ~193 estaciones (id = slug varchar, ej. `"hch_tv"`) |
+| `destroyer_runs` | Historial de corridas del Destroyer |
+| `s3_scan_log` | Registro de MP3s/segmentos subidos a S3 |
+| `gateways`, `stream_assignments` | Red de gateways + asignación stream→gateway |
+| `mediadev_*` | Estado operativo de streams (espejo del stream-daemon) |
 
 ### Columnas clave
 
 **`fingerprint_detections`:**
 ```sql
-air_time        TIMESTAMPTZ   -- siempre UTC desde 13 jun 2026 (utc_v2)
-pipeline_version TEXT         -- 'legacy' (pre-cutover) | 'utc_v2' (post-cutover)
-stream_id       INTEGER
-advertisement_id INTEGER
+tenant_id        UUID          -- aislamiento (antes client_id)
+campaign_id      UUID
+ad_id            UUID          -- FK a advertisements
+stream_id        VARCHAR       -- slug del stream, ej. "hch_tv" (NO integer)
+air_time         TIMESTAMPTZ   -- siempre UTC desde 13 jun 2026
+pipeline_version TEXT          -- 'legacy' (pre-cutover) | 'utc_v2' (post-cutover)
+confidence_level VARCHAR       -- 'very_high' | 'high' | 'medium' | 'low'
+clip_s3_key      VARCHAR       -- ruta del clip (.mp3 audio | .mp4 video TV)
+deleted_at       TIMESTAMPTZ   -- soft-delete
+```
+
+**`clients` (anunciante):**
+```sql
+id         UUID
+tenant_id  UUID NOT NULL       -- 1:N con tenants
+name       TEXT                -- UNIQUE(tenant_id, name)
+industry   TEXT
+logo_url   TEXT
+active     BOOLEAN
 ```
 
 **`destroyer_runs`:**
 ```sql
-id              SERIAL
-status          TEXT          -- 'deploying' | 'running' | 'done' | 'timeout' | 'destroyed'
-files_done      INTEGER
-total_files     INTEGER
-total_detections INTEGER
-release_version TEXT          -- ej: 'destroyer-v10' (NULL en runs anteriores al 13 jun 2026)
-t1_deployed     TIMESTAMPTZ   -- cuando se desplegó el droplet
-t2_started      TIMESTAMPTZ   -- cuando el worker empezó a procesar
-t3_done         TIMESTAMPTZ   -- cuando terminó (NULL si timeout/destroyed)
+id               SERIAL
+status           TEXT          -- 'deploying'|'running'|'done'|'timeout'|'destroyed'
+files_done / total_files / total_detections  INTEGER
+release_version  TEXT          -- ej: 'destroyer-v11'
+t1_deployed / t2_started / t3_completed / t4_destroyed  TIMESTAMPTZ
 ```
 
 ### Queries útiles
 
 ```sql
--- Última corrida del Destroyer
-SELECT status, files_done, total_files, total_detections, release_version,
-       EXTRACT(EPOCH FROM (NOW() - t2_started))::int AS segundos
-FROM destroyer_runs ORDER BY id DESC LIMIT 1;
+-- Jerarquía completa: tenant → anunciante → campaña → ads → detecciones
+SELECT t.name AS tenant, cl.name AS anunciante, ca.name AS campaign,
+       COUNT(DISTINCT a.id) AS ads, COUNT(DISTINCT fd.id) AS detections
+FROM tenants t
+JOIN campaigns ca ON ca.tenant_id = t.id
+JOIN clients cl   ON cl.id = ca.client_id
+LEFT JOIN advertisements a          ON a.campaign_id = ca.id AND a.deleted_at IS NULL
+LEFT JOIN fingerprint_detections fd ON fd.campaign_id = ca.id AND fd.deleted_at IS NULL
+GROUP BY t.name, cl.name, ca.name;
+
+-- Detecciones recientes con nombre del anuncio (ad_id, NO advertisement_id)
+SELECT fd.air_time, a.name AS ad, fd.stream_id
+FROM fingerprint_detections fd
+JOIN advertisements a ON a.id = fd.ad_id
+WHERE fd.deleted_at IS NULL
+ORDER BY fd.air_time DESC LIMIT 20;
 
 -- Detecciones por pipeline_version
 SELECT pipeline_version, COUNT(*), MIN(air_time), MAX(air_time)
-FROM fingerprint_detections
-GROUP BY pipeline_version;
-
--- Detecciones recientes con nombre del anuncio
-SELECT fd.air_time, a.name, s.name AS stream
-FROM fingerprint_detections fd
-JOIN advertisements a ON a.id = fd.advertisement_id
-JOIN streams s ON s.id = fd.stream_id
-ORDER BY fd.air_time DESC LIMIT 20;
+FROM fingerprint_detections GROUP BY pipeline_version;
 ```
 
 ---
@@ -194,13 +245,14 @@ El Destroyer toma ~70-90s para provisionar (DigitalOcean) + <1s para descargar e
 
 ### Sistema de releases S3 (implementado 13 jun 2026)
 
-**El snapshot base es estable.** Contiene: Ubuntu 22.04, ffmpeg, Python 3.11, venv con todas las librerías (boto3, psycopg2, scipy, numpy, requests). Raramente cambia.
+**El snapshot base es estable.** Contiene: Ubuntu 24.04, ffmpeg, Python 3.12, venv con todas las librerías del Destroyer. Raramente cambia.
 
 **El código está en S3, versionado:**
 ```
 s3://mediadev-recordings/
 └── destroyer/releases/
-    ├── destroyer-v10.tar.gz    ← producción actual (worker.py + fingerprint.py)
+    ├── destroyer-v10.tar.gz
+    ├── destroyer-v11.tar.gz    ← producción actual (worker.py + fingerprint.py)
     └── latest.tar.gz           ← siempre = la última publicada
 ```
 
@@ -238,7 +290,7 @@ DESTROYER_RELEASE=destroyer-v10   # en .env
 En `/opt/destroyer/.env`:
 ```bash
 SNAPSHOT_ID=232701378           # ID snapshot base en DigitalOcean
-DESTROYER_RELEASE=destroyer-v10 # Release activa del código
+DESTROYER_RELEASE=destroyer-v11 # Release activa del código
 DESTROYER_WORKERS=32            # Workers paralelos (default: 32)
 DO_TOKEN=...                    # DigitalOcean API token
 AWS_ACCESS_KEY_ID=...
@@ -260,6 +312,7 @@ PIPELINE_VERSION=utc_v2         # etiqueta que se graba en cada detección
 | Release | Fecha | Cambios |
 |---|---|---|
 | `destroyer-v10` | 13 jun 2026 | Primera release S3. Fix libx264 ultrafast para clips TV. Migración UTC (pipeline_version=utc_v2). |
+| `destroyer-v11` | 13 jun 2026 | Launcher con releases S3 en producción. Release activa actual. |
 
 ### Lanzamiento manual
 
@@ -453,6 +506,18 @@ C:\Users\Sedesol\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\
 **Por qué:** Crear un nuevo snapshot tardaba ~10 minutos y no había auditoría de qué código corrió en cada run. Con S3 releases: deploy instantáneo, rollback en 1 línea, columna `release_version` en DB para auditoría completa.
 
 **Cuándo usar snapshot nuevo:** solo cuando cambian dependencias del sistema (librería Python, versión de ffmpeg). Los cambios de código no requieren snapshot.
+
+---
+
+### Modelo tenant → client(anunciante) → campaign → ad (13 jun 2026)
+
+**Decisión:** Jerarquía multi-tenant con `tenant` como cliente que paga (agencia/central/radio/TV/gobierno) y `client` como anunciante (Pepsi, Molineros). Relación tenant↔anunciante **1:N** (cada tenant maneja su propia cartera). Se renombró la tabla `clients` original → `tenants` y `client_id` → `tenant_id` en 10 tablas; se creó `clients` nueva = anunciante con FK `tenant_id`.
+
+**Por qué 1:N y no M2M:** aunque un anunciante fuera compartido entre agencias, las campañas/ads/detecciones quedan aisladas por tenant de todas formas — el M2M solo agregaría complejidad para compartir lo cosmético. La llave de aislamiento sigue siendo `tenant_id` a nivel aplicativo (el JWT lo lleva), por eso no se tocó Auth.
+
+**Sin "pauta esperada vs real":** el sistema solo publica lo **detectado**. Se descartó el módulo de `placements`.
+
+**API:** `publiaudit-api` expone CRUD de anunciantes (`/api/clients`), campañas con `client_name` + filtro `?client_id=`, `PATCH /api/campaigns/{id}` para reasignar anunciante. El evidence portal muestra el anunciante (`advertiser_name`) con el tenant como `provider_name`.
 
 ---
 

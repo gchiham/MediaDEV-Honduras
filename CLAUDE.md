@@ -65,7 +65,9 @@ supervisorctl status   # 12 procesos ffmpeg
 - Failover automático lo decide `health_engine.py` por health score.
 
 ## Zona horaria
-**America/Tegucigalpa (GMT-6)**. Timestamps en PG como Unix epoch; conversión solo en presentación.
+**UTC en backend, GMT-6 solo en display** (cutover: 13 jun 2026 16:07 UTC).
+Timestamps en PG como `TIMESTAMPTZ` en UTC. `pipeline_version='legacy'` = pre-cutover, `'utc_v2'` = post.
+Honduras sin DST — offset fijo `-6h` para presentación.
 
 ## Principios arquitectónicos
 1. Un solo daemon de mantenimiento (evita condiciones de carrera).
