@@ -408,16 +408,26 @@ Permite a Claude Code consultar el estado del ecosistema MediaDEV en tiempo real
 └── venv/           ← Python venv con mcp[server]
 ```
 
-**Herramientas disponibles (7, solo lectura):**
+**Herramientas disponibles (11, solo lectura):**
+
+*Observabilidad:*
 - `get_system_status` — estado de los 12 streams
 - `get_workers` — procesos ffmpeg + servicios systemd
 - `get_queue_stats` — motor Destroyer: corridas, detecciones, costos
 - `get_service_health` — gateways, VPN, DB, proxies
 - `get_recent_errors` — eventos de stream (DOWN/UP/CB) + failovers de gateway + runs con error
-- `get_service_logs(service, lines, contains)` — tail/grep del journal de un servicio (incluye tracebacks de Python). Allowlist de 9 servicios. **Para diagnosticar un error puntual** (ej. un 500 del API)
-- `get_error_digest(hours)` — escaneo consolidado de errores/tracebacks en todos los servicios clave. Una llamada para "¿qué se está rompiendo?"
 
-> **Diagnóstico de errores (v1.1, 13 jun 2026):** el journal de systemd (134 MB, todos los servicios) tiene los tracebacks reales. `get_service_logs` y `get_error_digest` los exponen al MCP para que la IA diagnostique sin entrar a `journalctl` a mano.
+*Diagnóstico de errores (v1.1):*
+- `get_service_logs(service, lines, contains)` — tail/grep del journal de un servicio (incluye tracebacks de Python). Allowlist de 9 servicios
+- `get_error_digest(hours)` — escaneo consolidado de errores/tracebacks. Una llamada para "¿qué se está rompiendo?"
+
+*Decisiones de escalado y costo (v1.2):*
+- `get_host_resources` — CPU/RAM/disco/load + agregado ffmpeg + veredicto. ¿Hay headroom? ¿cuándo desacoplar captura?
+- `get_stream_bandwidth` — bitrate (Mbps) por stream + GB/día. El cuello al escalar TV es red/disco/S3, no CPU
+- `get_destroyer_analytics(limit)` — boot/work/costo por corrida + **detección automática de cuelgues** (timeout con 0 detecciones)
+- `get_droplets` — inventario DO + **caza de droplets Destroyer huérfanos** (money-leaks)
+
+> **Por qué estos tools (v1.1–v1.2, 13 jun 2026):** cada decisión de operación/escalado requería cavar datos a mano (journal, top/ps/df, bitrate de segmentos, `destroyer_runs`, API de DO). Estos tools los exponen para que la IA diagnostique y decida sin escarbar — ej. `get_droplets` caza droplets c-16 huérfanos que cuestan ~$0.95/h, y `get_destroyer_analytics` marca solo el patrón de cuelgue del worker.
 
 ### Desde Windows (Claude Code desktop)
 
