@@ -47,6 +47,8 @@ from tools.queue import get_queue_stats as _get_queue_stats
 from tools.health import get_service_health as _get_service_health
 from tools.errors import get_recent_errors as _get_recent_errors
 from tools.logs import get_service_logs as _get_service_logs, get_error_digest as _get_error_digest
+from tools.capacity import get_host_resources as _get_host_resources, get_stream_bandwidth as _get_stream_bandwidth
+from tools.cost import get_destroyer_analytics as _get_destroyer_analytics, get_droplets as _get_droplets
 
 # Logging a stderr (stdio transport usa stdout para el protocolo)
 logging.basicConfig(
@@ -242,8 +244,83 @@ def get_error_digest(hours: int = 6) -> dict[str, Any]:
         return {"error": str(e)}
 
 
+# ── TOOL 8: get_host_resources ────────────────────────────────────────────────
+
+@mcp.tool()
+def get_host_resources() -> dict[str, Any]:
+    """
+    Recursos del servidor mediaDEV: CPU, RAM, disco, load y procesos top (incl. ffmpeg).
+    Para decidir escalado: ¿hay headroom? ¿cuándo desacoplar la captura a otro nodo?
+
+    Retorna uso de CPU%, RAM disponible, disco, el agregado de los ffmpeg de captura,
+    y un veredicto (cómodo/vigilar/saturado).
+    """
+    try:
+        return _get_host_resources()
+    except Exception as e:
+        log.error(f"get_host_resources error: {e}")
+        return {"error": str(e)}
+
+
+# ── TOOL 9: get_stream_bandwidth ──────────────────────────────────────────────
+
+@mcp.tool()
+def get_stream_bandwidth() -> dict[str, Any]:
+    """
+    Bitrate (Mbps) estimado por stream, de los segmentos .ts recientes.
+    El cuello de botella al escalar TV es red/disco/S3, NO el CPU — este tool lo cuantifica.
+
+    Retorna por stream: Mbps, tipo (tv/radio), GB/día aproximado, y los totales de
+    ingest y de TV. Útil para dimensionar el nodo de captura y modelar costo de S3.
+    """
+    try:
+        return _get_stream_bandwidth()
+    except Exception as e:
+        log.error(f"get_stream_bandwidth error: {e}")
+        return {"error": str(e)}
+
+
+# ── TOOL 10: get_destroyer_analytics ──────────────────────────────────────────
+
+@mcp.tool()
+def get_destroyer_analytics(limit: int = 12) -> dict[str, Any]:
+    """
+    Analítica de las corridas del Destroyer: boot vs trabajo vs costo + detección de cuelgues.
+
+    Detecta automáticamente el patrón de cuelgue (timeout con 0 detecciones = el worker
+    se trabó en un lote grande). Powers: decidir frecuencia de corridas y diagnosticar
+    estabilidad del motor de detección.
+
+    Parámetros:
+      limit: cuántas corridas analizar (1-50, default 12).
+    """
+    try:
+        return _get_destroyer_analytics(limit=limit)
+    except Exception as e:
+        log.error(f"get_destroyer_analytics error: {e}")
+        return {"error": str(e)}
+
+
+# ── TOOL 11: get_droplets ─────────────────────────────────────────────────────
+
+@mcp.tool()
+def get_droplets() -> dict[str, Any]:
+    """
+    Inventario de droplets en DigitalOcean + caza de droplets Destroyer huérfanos.
+
+    Los droplets con tag 'destroyer'/'destroyer-build' deben ser efímeros. Si aparecen
+    'active', un worker se colgó sin auto-destruirse (~$0.95/hora cada uno desperdiciado) —
+    el tool lo marca con un warning. Para auditar costo y cazar money-leaks.
+    """
+    try:
+        return _get_droplets()
+    except Exception as e:
+        log.error(f"get_droplets error: {e}")
+        return {"error": str(e)}
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    log.warning("mediadev-mcp v1.1 iniciando (stdio transport)")
+    log.warning("mediadev-mcp v1.2 iniciando (stdio transport)")
     mcp.run(transport="stdio")
