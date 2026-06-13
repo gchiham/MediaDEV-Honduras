@@ -18,7 +18,7 @@
 | IP pública | `159.223.104.91` |
 | Proveedor | DigitalOcean, región `nyc1` |
 | Tamaño | 2 vCPU / 4 GB RAM |
-| OS | Ubuntu 22.04 LTS |
+| OS | Ubuntu 24.04.4 LTS |
 | Acceso | `ssh -i ~/.ssh/keySED root@159.223.104.91` |
 
 ### Base de datos — PostgreSQL Managed (DigitalOcean)
@@ -33,7 +33,7 @@
 
 **Conectarse desde servidor mediaDEV:**
 ```bash
-PGPASSWORD='SgUWgtzmiWUAfZ91vInmUxiVWl4XC' psql \
+PGPASSWORD='<PG_PASS>' psql \
   -h private-media-db-do-user-2116998-0.d.db.ondigitalocean.com \
   -p 25060 -U destroyer -d destroyer_db
 ```
@@ -50,7 +50,7 @@ psql -h localhost -p 5433 -U destroyer -d destroyer_db
 |---|---|
 | Bucket | `mediadev-recordings` |
 | Región | `us-east-1` |
-| Rutas clave | `streams/` (MP3s), `clips/` (clips TV), `destroyer/releases/` (código Destroyer) |
+| Rutas clave | `{stream_id}/YYYY/MM/*.mp3` (MP3s horarios), `video_segments/` (TS TV), `clips/` (evidencia), `destroyer/releases/` (código Destroyer) |
 
 ### VPN y Gateways Honduras
 
@@ -75,7 +75,7 @@ mediaDEV (nyc1)
 | CPU | 16 vCPU (CPU-optimized) |
 | Vida útil | efímero — se destruye al terminar la corrida |
 | Snapshot base | ID `232701378` (`destroyer-base-v9`) |
-| Código | descargado desde S3 al arrancar (ver sección 5) |
+| Código | descargado desde S3 al arrancar (ver sección 4) |
 
 ---
 
@@ -85,12 +85,25 @@ El sistema procesa 12 streams de radio y TV hondureños. Los MP3/TS se graban co
 
 | ID | Tipo | Descripción |
 |---|---|---|
-| (completar con IDs reales de la DB) | Radio / TV | streams activos |
+| `xy_hrn` | Radio | XY HRN |
+| `xy_tgu` | Radio | XY TGU |
+| `xy_sps` | Radio | XY SPS |
+| `radio_satelite` | Radio | Radio Satelite |
+| `fm_941` | Radio | 94.1 FM |
+| `suave_fm` | Radio | Suave FM |
+| `radio_america` | Radio | Radio America |
+| `radio_globo` | Radio | Radio Globo |
+| `radio_el_patio` | Radio | Radio El Patio |
+| `radio_choluteca` | Radio | Radio Choluteca |
+| `hch_tv` | TV | HCH TV |
+| `teleceiba` | TV | Teleceiba |
 
-**Query para ver streams activos:**
+**Fuente de verdad operativa:** `/opt/media-ai/config/stations.json` (12 estaciones `enabled=true`).
+
+**Query para ver catálogo activo en DB:**
 ```sql
-SELECT id, name, type, status, last_seen
-FROM streams
+SELECT id, name, type, status
+FROM stream_catalog
 WHERE status = 'active'
 ORDER BY type, name;
 ```
@@ -232,13 +245,14 @@ El Destroyer toma ~70-90s para provisionar (DigitalOcean) + <1s para descargar e
 
 ### Sistema de releases S3 (implementado 13 jun 2026)
 
-**El snapshot base es estable.** Contiene: Ubuntu 22.04, ffmpeg, Python 3.11, venv con todas las librerías (boto3, psycopg2, scipy, numpy, requests). Raramente cambia.
+**El snapshot base es estable.** Contiene: Ubuntu 24.04, ffmpeg, Python 3.12, venv con todas las librerías del Destroyer. Raramente cambia.
 
 **El código está en S3, versionado:**
 ```
 s3://mediadev-recordings/
 └── destroyer/releases/
-    ├── destroyer-v10.tar.gz    ← producción actual (worker.py + fingerprint.py)
+    ├── destroyer-v10.tar.gz
+    ├── destroyer-v11.tar.gz    ← producción actual (worker.py + fingerprint.py)
     └── latest.tar.gz           ← siempre = la última publicada
 ```
 
@@ -276,7 +290,7 @@ DESTROYER_RELEASE=destroyer-v10   # en .env
 En `/opt/destroyer/.env`:
 ```bash
 SNAPSHOT_ID=232701378           # ID snapshot base en DigitalOcean
-DESTROYER_RELEASE=destroyer-v10 # Release activa del código
+DESTROYER_RELEASE=destroyer-v11 # Release activa del código
 DESTROYER_WORKERS=32            # Workers paralelos (default: 32)
 DO_TOKEN=...                    # DigitalOcean API token
 AWS_ACCESS_KEY_ID=...
@@ -298,6 +312,7 @@ PIPELINE_VERSION=utc_v2         # etiqueta que se graba en cada detección
 | Release | Fecha | Cambios |
 |---|---|---|
 | `destroyer-v10` | 13 jun 2026 | Primera release S3. Fix libx264 ultrafast para clips TV. Migración UTC (pipeline_version=utc_v2). |
+| `destroyer-v11` | 13 jun 2026 | Launcher con releases S3 en producción. Release activa actual. |
 
 ### Lanzamiento manual
 
