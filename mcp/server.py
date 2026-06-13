@@ -46,6 +46,7 @@ from tools.workers import get_workers as _get_workers
 from tools.queue import get_queue_stats as _get_queue_stats
 from tools.health import get_service_health as _get_service_health
 from tools.errors import get_recent_errors as _get_recent_errors
+from tools.logs import get_service_logs as _get_service_logs, get_error_digest as _get_error_digest
 
 # Logging a stderr (stdio transport usa stdout para el protocolo)
 logging.basicConfig(
@@ -193,8 +194,56 @@ def get_recent_errors(stream_id: str = "", hours: int = 6) -> dict[str, Any]:
         return {"error": str(e)}
 
 
+# ── TOOL 6: get_service_logs ──────────────────────────────────────────────────
+
+@mcp.tool()
+def get_service_logs(service: str, lines: int = 50, contains: str = "") -> dict[str, Any]:
+    """
+    Logs recientes (journal de systemd) de un servicio — incluye tracebacks de Python.
+    Útil para diagnosticar un error específico (ej: un 500 del API).
+
+    Parámetros:
+      service:  nombre del servicio. Permitidos: publiaudit-api, stream-daemon,
+                mediadev-gateway-api, mediadev-health-engine, video-segment-uploader,
+                mediadev-monitor, medio-orchestrator, nginx, privoxy.
+      lines:    cuántas líneas devolver (1-500, default 50).
+      contains: filtro de texto opcional (ej: 'Error', 'Traceback', '/api/runs').
+
+    Para 'publiaudit-api', los tracebacks de FastAPI/uvicorn aparecen aquí.
+    """
+    try:
+        return _get_service_logs(service=service, lines=lines, contains=contains)
+    except Exception as e:
+        log.error(f"get_service_logs error: {e}")
+        return {"error": str(e)}
+
+
+# ── TOOL 7: get_error_digest ──────────────────────────────────────────────────
+
+@mcp.tool()
+def get_error_digest(hours: int = 6) -> dict[str, Any]:
+    """
+    Resumen consolidado de errores/tracebacks en TODOS los servicios clave.
+    Una sola llamada para responder '¿algo se está rompiendo ahora?'.
+
+    Escanea el journal de los 9 servicios buscando Traceback, Exception, ERROR,
+    'Internal Server Error', errores de psycopg2/DB, conexiones rechazadas, etc.
+
+    Parámetros:
+      hours: ventana de búsqueda en horas (1-48, default 6).
+
+    Retorna por servicio con errores: cuántas líneas, la última, y una muestra.
+    Si no hay errores, lo indica explícitamente.
+    """
+    try:
+        return _get_error_digest(hours=hours)
+    except Exception as e:
+        log.error(f"get_error_digest error: {e}")
+        return {"error": str(e)}
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    log.warning("mediadev-mcp v1.0 iniciando (stdio transport)")
+    log.warning("mediadev-mcp v1.1 iniciando (stdio transport)")
     mcp.run(transport="stdio")

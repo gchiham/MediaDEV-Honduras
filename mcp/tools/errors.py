@@ -75,6 +75,16 @@ def get_recent_errors(stream_id: str | None = None, hours: int = 6) -> dict[str,
         LIMIT 10
     """)
 
+    # Failovers de gateway en la ventana
+    failovers = qall("""
+        SELECT stream_id, from_gateway_id, to_gateway_id, reason,
+               trigger_score, auto_triggered, created_at, resolved_at
+        FROM failover_events
+        WHERE created_at >= NOW() - INTERVAL '%s hours'
+        ORDER BY created_at DESC
+        LIMIT 50
+    """, (hours,))
+
     return {
         "period_hours":     hours,
         "stream_filter":    stream_id,
@@ -91,5 +101,18 @@ def get_recent_errors(stream_id: str | None = None, hours: int = 6) -> dict[str,
                 "started_hn":  _fmt_ts(r["t2_started"]),
             }
             for r in destroyer_errors
+        ],
+        "gateway_failovers": [
+            {
+                "stream":        f["stream_id"],
+                "from_gateway":  f["from_gateway_id"],
+                "to_gateway":    f["to_gateway_id"],
+                "reason":        f.get("reason"),
+                "trigger_score": f.get("trigger_score"),
+                "auto":          f.get("auto_triggered"),
+                "time_hn":       _fmt_ts(f["created_at"]),
+                "resolved_hn":   _fmt_ts(f.get("resolved_at")),
+            }
+            for f in failovers
         ],
     }
