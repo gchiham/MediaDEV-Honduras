@@ -22,6 +22,7 @@ STREAMS = [
     "radio_globo","radio_satelite","suave_fm","teleceiba",
     "xy_hrn","xy_sps","xy_tgu",
 ]
+TV_STREAMS = {"hch_tv", "teleceiba"}
 
 STALE_SECS          = 60
 CB_FAIL_OPEN        = 5
@@ -29,6 +30,7 @@ CB_RESET_SECS       = 1800
 RESTART_AFTER_FAILS = 3
 SEG_DURATION        = 4
 TGU = timezone(timedelta(hours=-6))
+RECORDING_NAMING_MODE = os.environ.get("RECORDING_NAMING_MODE", "utc").strip().lower()
 KEEP_SEG_HOURS = 8
 KEEP_MP3_COUNT = 8
 
@@ -73,6 +75,17 @@ EVENTS_RETENTION_DAYS  = 30
 
 _pg = None
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+def utc_epoch() -> int:
+    return int(utc_now().timestamp())
+
+def recording_hour_label(hour_epoch: int) -> str:
+    if RECORDING_NAMING_MODE == "legacy_hn":
+        return datetime.fromtimestamp(hour_epoch, tz=TGU).strftime("%Y-%m-%d_%Hh")
+    return datetime.fromtimestamp(hour_epoch, tz=timezone.utc).strftime("%Y-%m-%dT%HZ")
+
 def pg():
     """Devuelve una conexión PG viva (autocommit) o None si no se puede conectar."""
     global _pg
@@ -111,7 +124,7 @@ def pg_write(sql, params=(), many=False):
 def pg_event(sid, etype, detail=""):
     pg_write(
         "INSERT INTO mediadev_events (stream_id, ts, etype, detail) VALUES (%s,%s,%s,%s)",
-        (sid, int(time.time()), etype, detail),
+        (sid, utc_epoch(), etype, detail),
     )
 
 # ── LOGGING ───────────────────────────────────────────────────────────────────
@@ -169,7 +182,7 @@ def restart_stream(state, sid):
     state[sid]["restart_today"] += 1
 
 def do_health(state):
-    now  = int(time.time())
+    now  = utc_epoch()
     sups = sup_statuses()
 
     for sid in STREAMS:
@@ -227,7 +240,7 @@ def do_health(state):
 
 # ── SYNC ESTADO A POSTGRES ─────────────────────────────────────────────────────
 def pg_sync_status(state):
-    now = int(time.time())
+    now = utc_epoch()
     rows = [
         (sid, s["status"], s["sup"], s["segs"], s["age"], s["cb_state"],
          s["cb_fails"], s["cb_since"], s["restart_today"],
@@ -250,7 +263,7 @@ def pg_sync_status(state):
 
 # ── METRICS (snapshot por minuto) ───────────────────────────────────────────────
 def do_metrics(state):
-    now    = int(time.time())
+    now    = utc_epoch()
     window = now - INTERVAL_METRICS
     rows   = []
     for sid in STREAMS:
@@ -271,12 +284,12 @@ def do_metrics(state):
 
 # ── HOURLY RECORDINGS ─────────────────────────────────────────────────────────
 def do_record(state):
-    now = int(time.time())
+    now = utc_epoch()
     if (now % 3600) // 60 > 3:
         return
     h_start = now - now % 3600 - 3600
     h_end   = h_start + 3600
-    h_label = datetime.fromtimestamp(h_start, tz=TGU).strftime("%Y-%m-%d_%Hh")
+    h_label = recording_hour_label(h_start)
 
     for sid in STREAMS:
         rec_dir = STREAMS_ROOT / sid / "recordings"
@@ -302,7 +315,10 @@ def do_record(state):
         )
         if result.returncode == 0:
             log.info(f"[{sid}] {h_label}.mp3 OK ({out.stat().st_size//1024}KB)")
-            s3_upload(out, sid)
+            if sid in TV_STREAMS:
+                log.info(f"[{sid}] MP3 horario local OK — S3 lo publica video_segment_uploader para mantener sincronia con video")
+            else:
+                s3_upload(out, sid)
             for old in sorted(rec_dir.glob("*.mp3"), key=lambda f: f.name, reverse=True)[KEEP_MP3_COUNT:]:
                 old.unlink()
         else:
@@ -325,7 +341,7 @@ def do_cleanup(state):
         log.info(f"Cleanup: {deleted} segmentos eliminados")
 
     # Purga de retención en PostgreSQL
-    now = int(time.time())
+    now = utc_epoch()
     pg_write("DELETE FROM mediadev_metrics WHERE ts < %s",
              (now - METRICS_RETENTION_DAYS * 86400,))
     pg_write("DELETE FROM mediadev_events WHERE ts < %s",
