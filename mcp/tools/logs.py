@@ -12,7 +12,7 @@ from typing import Any, Optional
 
 # Allowlist — no se acepta cualquier string (evita journalctl con args arbitrarios)
 ALLOWED_SERVICES = {
-    "publiaudit-api",
+    "media-app",
     "stream-daemon",
     "mediadev-gateway-api",
     "mediadev-health-engine",
