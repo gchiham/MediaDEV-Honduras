@@ -259,7 +259,7 @@ El Destroyer toma ~70-90s para provisionar (DigitalOcean) + <1s para descargar e
 
 ### Watchdog
 
-`/opt/destroyer/watchdog.py` corre en mediaDEV en paralelo al droplet. Monitorea la fila activa en `destroyer_runs`. Si detecta que `files_done` no avanza por más de 20 minutos:
+`/opt/destroyer/watchdog.py` corre en `mediaAPP` en paralelo al droplet. Monitorea la fila activa en `destroyer_runs`. Si detecta que `files_done` no avanza por más de 20 minutos:
 1. Envía alerta a Telegram
 2. Destruye el droplet vía API de DigitalOcean
 3. Actualiza `status = 'timeout'` en la DB
@@ -587,7 +587,7 @@ C:\Users\Sedesol\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\
 
 **Corrección aplicada:** `worker.py` vuelve al patrón estable de `ar.get(timeout=...)` y `launcher.py` deja explícito un default de `300s` para `DESTROYER_SCAN_FILE_TIMEOUT`. Además, los `30` rows del run `28` que habían quedado en `scanning` se resetearon a `pending`, y `destroyer_runs.files_error` quedó corregido a `18`.
 
-**Nota de topología:** el `watchdog` y el `launcher` relevantes para Destroyer corren en `mediaAPP`. `mediaCAP` puede tener un cron legado del watchdog, pero el nodo de verdad para releases y corridas del Destroyer es `mediaAPP`.
+**Nota de topología:** el `watchdog` y el `launcher` relevantes para Destroyer corren en `mediaAPP`. El cron legado de `watchdog` fue removido de `mediaCAP`; el único cron oficial del Destroyer vive en `mediaAPP`.
 
 ---
 
