@@ -1,88 +1,52 @@
-# mediadev-mcp — MCP Server v1.0
+# mediadev-mcp — MCP Server v1.2
 
 Servidor Model Context Protocol para MediaDEV.
-Expone observabilidad del sistema a Claude Code, Codex, OpenAI Agents y cualquier
-cliente compatible con MCP.
+Expone observabilidad, diagnóstico y acción del sistema a Claude Code y cualquier cliente MCP compatible.
 
-## Fase A (v1) — Solo Lectura
+## Herramientas disponibles (16 tools)
 
+### Lectura
 | Tool | Descripción |
 |---|---|
-| `get_system_status()` | Estado de los 12 streams (OK/STALE/NO_M3U8/CB) |
-| `get_workers()` | Procesos ffmpeg (supervisord) + servicios systemd |
-| `get_queue_stats(limit)` | Motor Destroyer: corridas, detecciones, costos |
-| `get_service_health()` | Gateways, WireGuard, DB, Privoxy |
-| `get_recent_errors(stream_id, hours)` | Eventos DOWN/UP/CB_OPEN, errores Destroyer |
+| get_system_status() | Estado de todos los streams (OK/STALE/NO_M3U8/CB) |
+| get_workers() | Procesos ffmpeg (supervisord) + servicios systemd |
+| get_queue_stats(limit) | Motor Destroyer: corridas, detecciones, costos |
+| get_service_health() | Gateways, WireGuard, DB, Privoxy |
+| get_recent_errors(stream_id, hours) | Eventos DOWN/UP/CB_OPEN/CB_CLOSE |
+| get_service_logs(service, lines, contains) | Logs de servicios systemd |
+| get_error_digest(hours) | Resumen de errores en todos los servicios |
+| get_host_resources() | CPU, RAM, disco de mediaCAP |
+| get_stream_bandwidth() | Bitrate estimado por stream |
+| get_destroyer_analytics(limit) | Analítica boot/trabajo/costo del Destroyer |
+| get_droplets() | Inventario DigitalOcean + detección de huerfanos |
+
+### Diagnóstico
+| Tool | Descripción |
+|---|---|
+| verify_stream_url(url) | Prueba URL m3u8 — auto-detecta si necesita gateway |
+| get_disk_usage() | Uso de disco por stream en /var/www/streams/ |
+| get_uploader_status() | Backlog TV/radio local + registros s3_scan_log |
+
+### Acción
+| Tool | Descripción |
+|---|---|
+| restart_stream(stream_id) | Reinicia un stream via supervisorctl |
+| add_stream(...) | Agrega canal nuevo (stations.json + supervisor + daemon) |
+| update_stream(stream_id, fields) | Modifica campos de un canal existente |
 
 ## Uso con Claude Code
 
-Agregar en `~/.claude/claude_desktop_config.json` (o `%APPDATA%\Claude\claude_desktop_config.json` en Windows):
+Agregar en :
 
-```json
-{
-  "mcpServers": {
-    "mediadev": {
-      "command": "ssh",
-      "args": [
-        "-i", "C:/Users/Sedesol/.ssh/keySED",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "ConnectTimeout=15",
-        "root@159.223.104.91",
-        "/opt/media-ai/mcp/venv/bin/python",
-        "/opt/media-ai/mcp/server.py"
-      ]
-    }
-  }
-}
-```
 
-## Uso con Codex / OpenAI Agents (SSE)
-
-Próxima fase. Por ahora usar stdio via SSH.
 
 ## Estructura
 
-```
-/opt/media-ai/mcp/
-├── server.py          ← Punto de entrada MCP (stdio)
-├── db.py              ← Conexión PostgreSQL read-only
-├── tools/
-│   ├── system.py      ← get_system_status
-│   ├── workers.py     ← get_workers
-│   ├── queue.py       ← get_queue_stats
-│   ├── health.py      ← get_service_health
-│   └── errors.py      ← get_recent_errors
-├── requirements.txt
-└── install.sh
-```
 
-## Dependencias
-
-```
-mcp[cli]>=1.3.0
-psycopg2-binary>=2.9.9
-python-dotenv>=1.0.0
-httpx>=0.27.0
-```
-
-## Instalación
-
-```bash
-cd /opt/media-ai/mcp
-bash install.sh
-```
 
 ## Seguridad
 
-- **Solo lectura**: `default_transaction_read_only=on` en la conexión PG.
-- **Credenciales desde** `/etc/mediadev-db.env` (chmod 600), nunca hardcodeadas.
-- **IPs de gateways enmascaradas** en el output.
-- **Transport stdio**: acceso vía SSH — la seguridad es la clave SSH.
-- **Sin endpoints HTTP** en v1: no hay superficie de ataque adicional.
-
-## Roadmap
-
-- **Fase B**: `query_database_readonly`, `search_detections`, `get_detection_detail`
-- **Fase C**: `search_logs`, `get_stream_log`
-- **Fase D**: integración GitHub (commits, issues)
-- **Fase E**: `run_safe_command` (whitelist estricta)
+- Lectura PG:  en la conexion DB.
+- Herramientas de accion: ejecutan supervisorctl/systemctl como root via SSH — usar con criterio.
+- Credenciales desde  (chmod 600), nunca hardcodeadas.
+- Transport stdio: acceso via SSH — la seguridad es la clave SSH.
