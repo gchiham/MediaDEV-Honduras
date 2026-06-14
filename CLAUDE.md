@@ -6,22 +6,25 @@ Sistema de monitoreo, grabación y auditoría 24/7 de 12 estaciones de Honduras
 hondureños (geo-restriction), los sirve como HLS, archiva audio (MP3) y video (S3), expone
 dashboards + API REST, y alimenta el motor de detección de anuncios (Destroyer).
 
-## Arquitectura de alto nivel
+## Arquitectura — 2 nodos (split 14 jun 2026)
+Este repo es el código de **mediaCAP** (nodo de captura). El producto (`publiaudit-api`) y la
+orquestación del Destroyer viven en **mediaAPP** (nodo aparte, misma VPC nyc1).
 ```
-[Streams HN] → [Gateways SOCKS5 + agente] ──WireGuard──► [DigitalOcean 159.223.104.91]
-                                                                │
-        ┌──────────────┬──────────────┬──────────────┬─────────┴────────┐
-   supervisord     stream-daemon   gateway-api +   video-uploader      nginx :80
-   (12 ffmpeg)    (health+record)  health-engine   (TV .ts → S3)    → gunicorn :9000
-        │              │           (failover)           │           dashboard_v4.py
-  /var/www/streams/    └──────────────┴───────────────────┴──────────► PostgreSQL
-  {stream}/seg_*.ts         (estado, métricas, gateways, catálogo, detecciones)
-  {stream}/recordings/                      media-db (DO Managed)
+[Streams HN] → [Gateways SOCKS5] ──WireGuard──► mediaCAP (159.223.104.91 · 2vCPU/4GB)
+                                                  │  supervisord (12 ffmpeg) · stream-daemon
+                                                  │  video-uploader · gateway-api · health-engine
+                                                  │  wireguard · privoxy · monitor · MCP
+                                                  └──────────► PostgreSQL media-db (DO Managed)
+                                                                      ▲
+   mediaAPP (137.184.53.234 · 2vCPU/2GB) ─────────────────────────────┘ (DB privada, misma VPC)
+     publiaudit-api + nginx (producto SaaS + evidence portal)
+     Destroyer launcher + watchdog (cron) · MCP
 ```
 
-## Hardware
-**2 vCPU / 4 GB RAM (DigitalOcean Droplet).** El diseño prioriza este constraint:
-no agregar workers de gunicorn, no reducir intervalos del daemon, no hacer glob masivo en disco.
+## Hardware (por nodo)
+- **mediaCAP: 2 vCPU / 4 GB** (captura) — el diseño prioriza este constraint: no glob masivo en
+  disco, no reducir intervalos del daemon. mediaCAP debe quedar lo más liviano posible para grabar.
+- **mediaAPP: 2 vCPU / 2 GB** (app/control).
 
 ## Componentes principales
 | Componente | Ruta | Descripción |
@@ -45,17 +48,20 @@ mediadev_events         -- transiciones DOWN/UP/CB_OPEN/CB_CLOSE (retención 30 
 Credenciales: `/etc/mediadev-db.env` (cargado por systemd). `monitor/events.db` es una SQLite
 aparte que SÍ usa el monitor — no confundir.
 
-## API REST (JSON, read-only)
-Servida por `dashboard_v4.py` en `http://159.223.104.91`:
-`/api/summary`, `/api/streams` (=`/api/status`), `/api/stations` (filtros status/type),
-`/api/detections` (?limit). Pensada para consumo externo / Claude Design.
+## API / Dashboard
+- **Dashboard viejo (`dashboard_v4.py`) ELIMINADO** el 14 jun 2026 (van a hacer uno nuevo). El
+  código sigue en `dashboard/` como referencia; sus endpoints `/api/*` read-only ya no corren.
+- **`publiaudit-api`** (producto SaaS + evidence portal) corre en **mediaAPP** (`137.184.53.234`),
+  NO en este repo — es código aparte, aún sin versionar.
 
 ## Servicios systemd
+**mediaCAP (captura):**
 ```bash
 systemctl status stream-daemon mediadev-gateway-api mediadev-health-engine \
-                 mediadev-monitor video-segment-uploader dashboard-mediadev nginx
+                 mediadev-monitor video-segment-uploader nginx privoxy wg-quick@wg0
 supervisorctl status   # 12 procesos ffmpeg
 ```
+**mediaAPP (app/control):** `publiaudit-api`, `nginx`, + cron del Destroyer (launcher + watchdog).
 
 ## Red y gateways
 - **WireGuard wg0**: MediaDEV `10.101.0.1/24`. Gateways en `config/stations.json`.

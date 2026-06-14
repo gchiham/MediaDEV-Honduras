@@ -7,6 +7,8 @@ publicidad (Destroyer).
 
 > **Documentación viva completa:** [`live_mediaDEV.md`](live_mediaDEV.md) — referencia técnica detallada del ecosistema completo (infraestructura, DB, Destroyer, MCP, decisiones de diseño). Actualizar cuando cambie la arquitectura.
 
+> ⚠️ **Topología — 2 nodos (split 14 jun 2026):** este repo es el código de **mediaCAP** (nodo de captura, `159.223.104.91`). El producto **`publiaudit-api`** (SaaS + evidence portal) y la orquestación del **Destroyer** (launcher + watchdog) se movieron a un 2º nodo **mediaAPP** (`137.184.53.234`), misma VPC. El **dashboard viejo (`dashboard_v4.py`) fue eliminado** (harán uno nuevo) — las secciones de este README que lo mencionan son referencia histórica. mediaCAP corre: ffmpeg + stream-daemon + video-uploader + gateways + wireguard + monitor + MCP. Ver [`live_mediaDEV.md`](live_mediaDEV.md) §1 para el detalle por nodo.
+
 ## Por qué existe este sistema
 
 Las emisoras hondureñas bloquean el acceso desde IPs extranjeras (geo-restriction).
@@ -273,7 +275,7 @@ versión: `./scripts/release.sh vX` en el servidor. Ver [`MEDIADEV_DESTROYER_REL
 - Servidor OS: `timedatectl` → UTC
 - Python: `datetime.now(timezone.utc)`
 
-## Despliegue — orden de arranque
+## Despliegue — orden de arranque (mediaCAP, nodo de captura)
 ```bash
 systemctl start wg-quick@wg0          # 1. VPN primero
 systemctl start supervisor             # 2. Streams ffmpeg
@@ -282,17 +284,18 @@ systemctl start mediadev-gateway-api   # 4. API de heartbeats
 systemctl start mediadev-health-engine # 5. Motor de failover
 systemctl start mediadev-monitor       # 6. Monitoreo WireGuard
 systemctl start video-segment-uploader # 7. Uploader de video TV
-systemctl start dashboard-mediadev     # 8. Dashboard web
-systemctl start nginx                  # 9. Reverse proxy
+systemctl start nginx                  # 8. Reverse proxy (HLS /streams/)
 ```
 
 Todos tienen `systemctl enable` — arrancan automáticamente en reboot.
+> `dashboard-mediadev` fue eliminado (14 jun 2026). **mediaAPP** (nodo aparte) corre `publiaudit-api`
+> + nginx + el cron del Destroyer (launcher/watchdog) — ver `live_mediaDEV.md` §1.
 
 ## Verificar estado completo
 ```bash
 wg show wg0                            # Peers WireGuard (handshake reciente)
 supervisorctl status                   # 12 streams — todos RUNNING
-systemctl is-active stream-daemon dashboard-mediadev nginx privoxy \
+systemctl is-active stream-daemon nginx privoxy \
                     mediadev-gateway-api mediadev-health-engine \
                     mediadev-monitor video-segment-uploader
 curl -s http://127.0.0.1:9000/api/status | python3 -m json.tool
