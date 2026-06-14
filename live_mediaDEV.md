@@ -1,8 +1,8 @@
 # live_mediaDEV.md — Ecosistema MediaDEV: Referencia Viva
 
 **Última actualización:** 14 junio 2026  
-**Versión del documento:** 1.2  
-**Servidor:** 159.223.104.91  
+**Versión del documento:** 1.3  
+**Servidores:** mediaCAP `159.223.104.91` (captura) · mediaAPP `137.184.53.234` (app/control)  
 **Mantenido por:** equipo MediaDEV — actualizar cada vez que cambie arquitectura, schema, servicios, o decisiones de diseño
 
 > Este documento es la fuente de verdad del ecosistema MediaDEV. Cualquier dev o AI que lo lea debe poder entender el sistema completo sin necesidad de preguntas adicionales. Vive en el repo de GitHub.
@@ -11,15 +11,27 @@
 
 ## 1. Infraestructura
 
-### Servidor principal — mediaDEV
+### Topología — 2 nodos (split 14 jun 2026)
 
+El ecosistema corre en **2 droplets** DigitalOcean en `nyc1`, **misma VPC** (`b9207f9e-dc84-11e8-8650-3cfdfea9f8c8`) → red privada + DB privada entre ellos. La DB managed y S3 son compartidos.
+
+**mediaCAP** — nodo de CAPTURA (antes "mediaDEV", droplet `575328180`)
 | Campo | Valor |
 |---|---|
-| IP pública | `159.223.104.91` |
-| Proveedor | DigitalOcean, región `nyc1` |
-| Tamaño | 2 vCPU / 4 GB RAM |
-| OS | Ubuntu 24.04.4 LTS |
+| IP pública / privada | `159.223.104.91` / `10.136.0.7` |
+| Tamaño | 2 vCPU / 4 GB · Ubuntu 24.04 |
 | Acceso | `ssh -i ~/.ssh/keySED root@159.223.104.91` |
+| Corre | 12× ffmpeg (supervisord), stream-daemon, video-segment-uploader, wireguard, privoxy, gateway-api, health-engine, mediadev-monitor, MCP (captura) |
+
+**mediaAPP** — nodo de APP/CONTROL (droplet `577521810`)
+| Campo | Valor |
+|---|---|
+| IP pública / privada | `137.184.53.234` / `10.136.0.6` |
+| Tamaño | 2 vCPU / 2 GB · Ubuntu 24.04 |
+| Acceso | `ssh -i ~/.ssh/keySED root@137.184.53.234` |
+| Corre | publiaudit-api + nginx (producto SaaS + evidence portal), Destroyer launcher + watchdog (cron), MCP (app) |
+
+> **Regla:** mediaCAP solo captura (máximo recurso para grabar); mediaAPP el producto + orquestación. Servicios que leen estado local de captura (ffmpeg, segmentos en disco) se quedan en mediaCAP. El **`worker.py` del Destroyer se edita en mediaAPP** (donde vive el launcher). `medio-orchestrator` (legacy mvp-medios) y el dashboard viejo fueron eliminados.
 
 ### Base de datos — PostgreSQL Managed (DigitalOcean)
 
@@ -413,9 +425,9 @@ CORS_ORIGINS    # opcional: ej. https://app.publiaudit.com,https://admin.publiau
 
 ## 7. MCP Server (mediadev-mcp)
 
-Permite a Claude Code consultar el estado del ecosistema MediaDEV en tiempo real.
+Permite a Claude Code / Codex consultar el estado del ecosistema en tiempo real. **Corre en AMBOS nodos** (14 jun 2026): un MCP en mediaCAP (observa captura) y otro en mediaAPP (observa publiaudit-api + Destroyer launcher). Los tools de DB/DO-API dan datos globales; los de host (`get_service_logs`, `get_host_resources`, `get_workers`, `get_stream_bandwidth`) son **por-nodo**.
 
-### En el servidor
+### En el servidor (idéntico en ambos nodos)
 
 ```
 /opt/media-ai/mcp/
@@ -444,11 +456,13 @@ Permite a Claude Code consultar el estado del ecosistema MediaDEV en tiempo real
 
 > **Por qué estos tools (v1.1–v1.2, 13 jun 2026):** cada decisión de operación/escalado requería cavar datos a mano (journal, top/ps/df, bitrate de segmentos, `destroyer_runs`, API de DO). Estos tools los exponen para que la IA diagnostique y decida sin escarbar — ej. `get_droplets` caza droplets c-16 huérfanos que cuestan ~$0.95/h, y `get_destroyer_analytics` marca solo el patrón de cuelgue del worker.
 
-### Desde Windows (Claude Code desktop)
+### Desde Windows (Claude Code + Codex)
 
-**Wrapper local:** `C:\Users\Sedesol\.ssh\mediadev-mcp.py`
+**Wrappers locales** (uno por nodo, configurados en Claude y Codex):
+- `mediadev` → `C:\Users\Sedesol\.ssh\mediadev-mcp.py` (mediaCAP, captura)
+- `mediadev-app` → `C:\Users\Sedesol\.ssh\mediadev-app-mcp.py` (mediaAPP, app/control)
 
-El wrapper hace SSH al servidor y proxea stdin/stdout del protocolo MCP sin modificaciones.
+El wrapper hace SSH al nodo y proxea stdin/stdout del protocolo MCP sin modificaciones.
 
 ```python
 # Flags críticos para que el protocolo MCP no se corrompa:
