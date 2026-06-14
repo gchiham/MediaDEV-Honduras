@@ -31,8 +31,9 @@ Ubuntu 22.04                     destroyer/releases/
 ffmpeg                             destroyer-v10.tar.gz
 Python 3.11                        destroyer-v11.tar.gz
 venv con:                          destroyer-v14.tar.gz
-  boto3, psycopg2, scipy,          destroyer-v15.tar.gz  ← worker.py + fingerprint.py
-  numpy, requests, etc.            latest.tar.gz         ← apunta a la más reciente
+  boto3, psycopg2, scipy,          destroyer-v15.tar.gz
+  numpy, requests, etc.            destroyer-v16.tar.gz  ← worker.py + fingerprint.py
+                                   latest.tar.gz         ← apunta a la más reciente
 ```
 
 **Flujo al arrancar el droplet:**
@@ -40,13 +41,13 @@ venv con:                          destroyer-v14.tar.gz
 ```
 launcher.py
     │
-    ├─ Lee DESTROYER_RELEASE del .env  (ej: "destroyer-v15")
+    ├─ Lee DESTROYER_RELEASE del .env  (ej: "destroyer-v16")
     │
     ├─ Crea droplet desde snapshot base
     │
     └─ cloud-init ejecuta:
            1. Exporta credenciales y env vars
-           2. aws s3 cp s3://mediadev-recordings/destroyer/releases/destroyer-v15.tar.gz /tmp/release.tar.gz
+           2. aws s3 cp s3://mediadev-recordings/destroyer/releases/destroyer-v16.tar.gz /tmp/release.tar.gz
            3. tar -xzf /tmp/release.tar.gz -C /opt/destroyer/
            4. python worker.py
 ```
@@ -64,7 +65,8 @@ s3://mediadev-recordings/
         ├── destroyer-v10.tar.gz
         ├── destroyer-v11.tar.gz
         ├── destroyer-v14.tar.gz
-        ├── destroyer-v15.tar.gz    ← código de producción actual
+        ├── destroyer-v15.tar.gz
+        ├── destroyer-v16.tar.gz    ← código de producción actual
         └── latest.tar.gz           ← siempre = la última publicada
 ```
 
@@ -79,21 +81,21 @@ fingerprint.py
 ## Publicar una nueva release
 
 ```bash
-# En el servidor mediaDEV (159.223.104.91):
+# En el servidor mediaAPP (137.184.53.234):
 cd /opt/destroyer
-./release.sh v15
+./release.sh v16
 ```
 
 El script hace:
-1. `tar -czf /tmp/destroyer-v15.tar.gz worker.py fingerprint.py`
-2. Sube `destroyer-v15.tar.gz` a S3
+1. `tar -czf /tmp/destroyer-v16.tar.gz worker.py fingerprint.py`
+2. Sube `destroyer-v16.tar.gz` a S3
 3. Actualiza `latest.tar.gz` en S3
 4. Muestra instrucción para activarla
 
 **Activar la release:**
 ```bash
 # Editar /opt/destroyer/.env
-DESTROYER_RELEASE=destroyer-v15
+DESTROYER_RELEASE=destroyer-v16
 ```
 
 El próximo cron del Destroyer (o lanzamiento manual) usará la nueva release.
@@ -105,7 +107,7 @@ El próximo cron del Destroyer (o lanzamiento manual) usará la nueva release.
 ```bash
 # Volver a la versión anterior:
 # Editar /opt/destroyer/.env
-DESTROYER_RELEASE=destroyer-v14
+DESTROYER_RELEASE=destroyer-v15
 ```
 
 Instantáneo. No requiere recrear snapshots ni reiniciar servicios.
@@ -163,9 +165,9 @@ En `/opt/destroyer/.env`:
 
 ```bash
 SNAPSHOT_ID=232701378            # ID del snapshot base en DigitalOcean
-DESTROYER_RELEASE=destroyer-v15  # Release del código a descargar desde S3
+DESTROYER_RELEASE=destroyer-v16  # Release del código a descargar desde S3
 DESTROYER_WORKERS=32             # Número de workers paralelos (default: 32)
-DESTROYER_SCAN_FILE_TIMEOUT=240  # Cap por archivo "veneno"
+DESTROYER_SCAN_FILE_TIMEOUT=300  # Cap por archivo "veneno"
 DESTROYER_WTA_WINDOW_SEC=8       # Ventana cross-ad para WTA
 ```
 
@@ -178,7 +180,18 @@ DESTROYER_WTA_WINDOW_SEC=8       # Ventana cross-ad para WTA
 | `destroyer-v10` | 13 jun 2026 | Primera release S3. Incluye fix libx264 ultrafast para clips TV + migración UTC (pipeline_version=utc_v2) |
 | `destroyer-v11` | 13 jun 2026 | Launcher con releases S3 en producción. |
 | `destroyer-v14` | 14 jun 2026 | `fingerprint.py` colapsa offsets vecinos, `worker.py` aplica dedup por ventana real y Winner Takes All, sube debug logs a S3 y usa timeout por archivo configurable. |
-| `destroyer-v15` | 14 jun 2026 | Inserción idempotente en DB con `ON CONFLICT DO NOTHING`, evita generar clips/Telegram en duplicados exactos y acompaña la migración de deduplicación en `fingerprint_detections`. Release activa actual. |
+| `destroyer-v15` | 14 jun 2026 | Inserción idempotente en DB con `ON CONFLICT DO NOTHING`, evita generar clips/Telegram en duplicados exactos y acompaña la migración de deduplicación en `fingerprint_detections`. Introdujo una regresión en el loop del pool: el timeout empezó a contarse desde `submitted_at`, incluyendo espera en cola. |
+| `destroyer-v16` | 14 jun 2026 | Hotfix del incidente `Destroyer0000`/run `28`: vuelve el timeout efectivo por `ar.get(timeout=...)` y restaura el default a `300s`, evitando que archivos queued expiren antes de ejecutarse. Release activa actual. |
+
+---
+
+## Incidente Destroyer0000 / run 28 (14 jun 2026)
+
+**Síntoma:** run `28` (`Destroyer0000`) quedó en `timeout` con `18/48` archivos procesados, `18` en `error` (`scan timeout 240s`) y `30` atascados en `scanning`.
+
+**Causa raíz:** `destroyer-v15` cambió el pool para medir timeout desde `submitted_at` en vez de desde la espera real del resultado. Con `48` archivos y `28` workers, varios archivos acumulaban tiempo mientras solo esperaban turno en cola. Eso produjo timeouts falsos. Tras varios recreados del pool, la corrida quedó viva pero sin más heartbeats.
+
+**Corrección aplicada:** se publicó `destroyer-v16`, se activó en `mediaAPP`, se dejó explícito `DESTROYER_SCAN_FILE_TIMEOUT=300` y se resetearon `30` rows de `s3_scan_log` de `scanning` a `pending`. El `run 28` quedó corregido en DB con `files_error=18`.
 
 ---
 
@@ -216,4 +229,4 @@ for o in r.get('Contents', []):
 
 ---
 
-*Sistema: MediaDEV · Servidor: 159.223.104.91 · Actualizado: 14 junio 2026*
+*Sistema: Destroyer / mediaAPP · Servidor: 137.184.53.234 · Actualizado: 14 junio 2026*

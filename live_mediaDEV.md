@@ -339,7 +339,8 @@ PIPELINE_VERSION=utc_v2         # etiqueta que se graba en cada detección
 | `destroyer-v10` | 13 jun 2026 | Primera release S3. Fix libx264 ultrafast para clips TV. Migración UTC (pipeline_version=utc_v2). |
 | `destroyer-v11` | 13 jun 2026 | Launcher con releases S3 en producción. |
 | `destroyer-v14` | 14 jun 2026 | Colapso de offsets vecinos en `fingerprint.py`, dedup por ventana real, Winner Takes All por instante, logs de debug a S3 y timeout por archivo configurable. |
-| `destroyer-v15` | 14 jun 2026 | Inserción idempotente en DB con `ON CONFLICT DO NOTHING`, no genera clip/Telegram si la detección ya existe, y queda alineada con la migración de deduplicación en `fingerprint_detections`. Release activa actual. |
+| `destroyer-v15` | 14 jun 2026 | Inserción idempotente en DB con `ON CONFLICT DO NOTHING`, no genera clip/Telegram si la detección ya existe, y queda alineada con la migración de deduplicación en `fingerprint_detections`. Introdujo una regresión en el loop del pool del scanner. |
+| `destroyer-v16` | 14 jun 2026 | Hotfix del incidente `Destroyer0000`/run `28`: timeout vuelve a contarse al esperar el resultado (`ar.get(timeout=...)`) y el default sube otra vez a `300s`. Release activa actual. |
 
 ### Lanzamiento manual
 
@@ -575,6 +576,18 @@ C:\Users\Sedesol\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\
 **Por qué:** el 14 jun 2026 `radio_el_patio` y `teleceiba` mostraron microcortes cortos. `radio_el_patio` incluso necesitó un segundo restart a los ~17s del primero, señal de que el daemon estaba reevaluando antes de que HLS terminara de levantar. El nodo no estaba saturado; el problema era de resiliencia y timing de recuperación.
 
 **Objetivo:** bajar reinicios redundantes y mejorar recuperación automática ante cortes breves del origen o de red, sin cambiar la topología ni el routing por estación.
+
+---
+
+### Hotfix de regresión Destroyer0000 / run 28 (14 jun 2026)
+
+**Decisión:** publicar `destroyer-v16` y activarlo en `mediaAPP` como release del Destroyer.
+
+**Causa raíz:** `destroyer-v15` empezó a medir el timeout por archivo desde `submitted_at`, o sea desde que la tarea entraba al pool, no desde que realmente empezaba a ejecutarse. Con lotes más grandes que el número de workers, archivos queued podían vencer mientras aún esperaban turno.
+
+**Corrección aplicada:** `worker.py` vuelve al patrón estable de `ar.get(timeout=...)` y `launcher.py` deja explícito un default de `300s` para `DESTROYER_SCAN_FILE_TIMEOUT`. Además, los `30` rows del run `28` que habían quedado en `scanning` se resetearon a `pending`, y `destroyer_runs.files_error` quedó corregido a `18`.
+
+**Nota de topología:** el `watchdog` y el `launcher` relevantes para Destroyer corren en `mediaAPP`. `mediaCAP` puede tener un cron legado del watchdog, pero el nodo de verdad para releases y corridas del Destroyer es `mediaAPP`.
 
 ---
 
