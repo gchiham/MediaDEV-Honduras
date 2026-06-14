@@ -1,7 +1,7 @@
 # live_mediaDEV.md — Ecosistema MediaDEV: Referencia Viva
 
-**Última actualización:** 13 junio 2026  
-**Versión del documento:** 1.1  
+**Última actualización:** 14 junio 2026  
+**Versión del documento:** 1.2  
 **Servidor:** 159.223.104.91  
 **Mantenido por:** equipo MediaDEV — actualizar cada vez que cambie arquitectura, schema, servicios, o decisiones de diseño
 
@@ -162,6 +162,15 @@ clip_s3_key      VARCHAR       -- ruta del clip (.mp3 audio | .mp4 video TV)
 deleted_at       TIMESTAMPTZ   -- soft-delete
 ```
 
+**Guardas activas de integridad (14 jun 2026):**
+```sql
+CREATE UNIQUE INDEX ux_fingerprint_detections_source_match_active
+ON fingerprint_detections (tenant_id, campaign_id, ad_id, stream_id, s3_key, ts_seconds)
+WHERE deleted_at IS NULL;
+```
+
+Esta unicidad blinda re-scans del mismo MP3/offset. La limpieza inicial marcó como borradas `95` filas duplicadas activas agrupadas en `58` claves exactas.
+
 **`clients` (anunciante):**
 ```sql
 id         UUID
@@ -252,7 +261,9 @@ El Destroyer toma ~70-90s para provisionar (DigitalOcean) + <1s para descargar e
 s3://mediadev-recordings/
 └── destroyer/releases/
     ├── destroyer-v10.tar.gz
-    ├── destroyer-v11.tar.gz    ← producción actual (worker.py + fingerprint.py)
+    ├── destroyer-v11.tar.gz
+    ├── destroyer-v14.tar.gz
+    ├── destroyer-v15.tar.gz    ← producción actual (worker.py + fingerprint.py)
     └── latest.tar.gz           ← siempre = la última publicada
 ```
 
@@ -266,14 +277,14 @@ cd /opt/destroyer
 **Activar la nueva release:**
 ```bash
 # Editar /opt/destroyer/.env:
-DESTROYER_RELEASE=destroyer-v11
+DESTROYER_RELEASE=destroyer-v15
 ```
 El próximo cron (o lanzamiento manual) usará el nuevo código.
 
 **Rollback instantáneo:**
 ```bash
 # Sin recrear snapshots:
-DESTROYER_RELEASE=destroyer-v10   # en .env
+DESTROYER_RELEASE=destroyer-v14   # en .env
 ```
 
 **Cuándo recrear el snapshot base:**
@@ -289,9 +300,11 @@ DESTROYER_RELEASE=destroyer-v10   # en .env
 
 En `/opt/destroyer/.env`:
 ```bash
-SNAPSHOT_ID=232701378           # ID snapshot base en DigitalOcean
-DESTROYER_RELEASE=destroyer-v11 # Release activa del código
-DESTROYER_WORKERS=32            # Workers paralelos (default: 32)
+SNAPSHOT_ID=232701378              # ID snapshot base en DigitalOcean
+DESTROYER_RELEASE=destroyer-v15    # Release activa del código
+DESTROYER_WORKERS=32               # Workers paralelos (default: 32)
+DESTROYER_SCAN_FILE_TIMEOUT=240    # Cap por archivo "veneno" antes de marcar error
+DESTROYER_WTA_WINDOW_SEC=8         # Ventana cross-ad para Winner Takes All
 DO_TOKEN=...                    # DigitalOcean API token
 AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
@@ -312,7 +325,9 @@ PIPELINE_VERSION=utc_v2         # etiqueta que se graba en cada detección
 | Release | Fecha | Cambios |
 |---|---|---|
 | `destroyer-v10` | 13 jun 2026 | Primera release S3. Fix libx264 ultrafast para clips TV. Migración UTC (pipeline_version=utc_v2). |
-| `destroyer-v11` | 13 jun 2026 | Launcher con releases S3 en producción. Release activa actual. |
+| `destroyer-v11` | 13 jun 2026 | Launcher con releases S3 en producción. |
+| `destroyer-v14` | 14 jun 2026 | Colapso de offsets vecinos en `fingerprint.py`, dedup por ventana real, Winner Takes All por instante, logs de debug a S3 y timeout por archivo configurable. |
+| `destroyer-v15` | 14 jun 2026 | Inserción idempotente en DB con `ON CONFLICT DO NOTHING`, no genera clip/Telegram si la detección ya existe, y queda alineada con la migración de deduplicación en `fingerprint_detections`. Release activa actual. |
 
 ### Lanzamiento manual
 
@@ -523,6 +538,19 @@ C:\Users\Sedesol\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\
 
 ---
 
+### Deduplicación fuerte en DB + Winner Takes All (14 jun 2026)
+
+**Decisión:** separar dos capas de control:
+
+1. **Aplicación (worker/fingerprint):** colapsa offsets parciales del mismo anuncio, deduplica por ventana real según duración y aplica Winner Takes All entre anuncios que compiten en el mismo instante.
+2. **Base de datos:** índice único parcial sobre `(tenant_id, campaign_id, ad_id, stream_id, s3_key, ts_seconds)` para que un re-scan del mismo archivo no duplique filas aunque el worker reintente.
+
+**Por qué:** el ruido observado venía de dos fuentes distintas: detecciones múltiples dentro de una sola emisión y copias exactas causadas por re-scans/reintentos. La capa de aplicación reduce ruido semántico; la unicidad en DB blinda la idempotencia.
+
+**Ejecución real:** el 14 jun 2026 se aplicó la migración de dedup en la DB administrada. Resultado: `58` grupos duplicados activos corregidos, `95` filas extra desactivadas, y `0` duplicados activos remanentes tras la verificación.
+
+---
+
 ### Modelo tenant → client(anunciante) → campaign → ad (13 jun 2026)
 
 **Decisión:** Jerarquía multi-tenant con `tenant` como cliente que paga (agencia/central/radio/TV/gobierno) y `client` como anunciante (Pepsi, Molineros). Relación tenant↔anunciante **1:N** (cada tenant maneja su propia cartera). Se renombró la tabla `clients` original → `tenants` y `client_id` → `tenant_id` en 10 tablas; se creó `clients` nueva = anunciante con FK `tenant_id`.
@@ -583,4 +611,4 @@ C:\Users\Sedesol\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\
 
 ---
 
-*MediaDEV · 159.223.104.91 · DigitalOcean nyc1 · Actualizado: 13 junio 2026*
+*MediaDEV · 159.223.104.91 · DigitalOcean nyc1 · Actualizado: 14 junio 2026*

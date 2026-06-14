@@ -1,6 +1,7 @@
 # Destroyer — Sistema de Releases Versionadas
 
 **Fecha de implementación:** 13 junio 2026  
+**Última actualización:** 14 junio 2026  
 **Motivación:** Separar las dependencias del sistema (snapshot) del código de la aplicación (S3), eliminando la necesidad de recrear el snapshot por cada cambio de código.
 
 ---
@@ -27,11 +28,11 @@ Consecuencias:
 Snapshot base (estable)          S3 releases (versionadas)
 ─────────────────────────        ────────────────────────────────
 Ubuntu 22.04                     destroyer/releases/
-ffmpeg                             destroyer-v10.tar.gz  ← worker.py + fingerprint.py
+ffmpeg                             destroyer-v10.tar.gz
 Python 3.11                        destroyer-v11.tar.gz
-venv con:                          latest.tar.gz         ← apunta a la más reciente
-  boto3, psycopg2, scipy,
-  numpy, requests, etc.
+venv con:                          destroyer-v14.tar.gz
+  boto3, psycopg2, scipy,          destroyer-v15.tar.gz  ← worker.py + fingerprint.py
+  numpy, requests, etc.            latest.tar.gz         ← apunta a la más reciente
 ```
 
 **Flujo al arrancar el droplet:**
@@ -39,13 +40,13 @@ venv con:                          latest.tar.gz         ← apunta a la más re
 ```
 launcher.py
     │
-    ├─ Lee DESTROYER_RELEASE del .env  (ej: "destroyer-v10")
+    ├─ Lee DESTROYER_RELEASE del .env  (ej: "destroyer-v15")
     │
     ├─ Crea droplet desde snapshot base
     │
     └─ cloud-init ejecuta:
            1. Exporta credenciales y env vars
-           2. aws s3 cp s3://mediadev-recordings/destroyer/releases/destroyer-v10.tar.gz /tmp/release.tar.gz
+           2. aws s3 cp s3://mediadev-recordings/destroyer/releases/destroyer-v15.tar.gz /tmp/release.tar.gz
            3. tar -xzf /tmp/release.tar.gz -C /opt/destroyer/
            4. python worker.py
 ```
@@ -60,8 +61,10 @@ launcher.py
 s3://mediadev-recordings/
 └── destroyer/
     └── releases/
-        ├── destroyer-v10.tar.gz    ← código de producción actual
-        ├── destroyer-v11.tar.gz    ← próxima versión
+        ├── destroyer-v10.tar.gz
+        ├── destroyer-v11.tar.gz
+        ├── destroyer-v14.tar.gz
+        ├── destroyer-v15.tar.gz    ← código de producción actual
         └── latest.tar.gz           ← siempre = la última publicada
 ```
 
@@ -78,19 +81,19 @@ fingerprint.py
 ```bash
 # En el servidor mediaDEV (159.223.104.91):
 cd /opt/destroyer
-./release.sh v11
+./release.sh v15
 ```
 
 El script hace:
-1. `tar -czf /tmp/destroyer-v11.tar.gz worker.py fingerprint.py`
-2. Sube `destroyer-v11.tar.gz` a S3
+1. `tar -czf /tmp/destroyer-v15.tar.gz worker.py fingerprint.py`
+2. Sube `destroyer-v15.tar.gz` a S3
 3. Actualiza `latest.tar.gz` en S3
 4. Muestra instrucción para activarla
 
 **Activar la release:**
 ```bash
 # Editar /opt/destroyer/.env
-DESTROYER_RELEASE=destroyer-v11
+DESTROYER_RELEASE=destroyer-v15
 ```
 
 El próximo cron del Destroyer (o lanzamiento manual) usará la nueva release.
@@ -102,7 +105,7 @@ El próximo cron del Destroyer (o lanzamiento manual) usará la nueva release.
 ```bash
 # Volver a la versión anterior:
 # Editar /opt/destroyer/.env
-DESTROYER_RELEASE=destroyer-v10
+DESTROYER_RELEASE=destroyer-v14
 ```
 
 Instantáneo. No requiere recrear snapshots ni reiniciar servicios.
@@ -123,8 +126,8 @@ LIMIT 10;
 Ejemplo de resultado:
 ```
 id | status | files_done | total_detections | release_version  | t2_started
-24 | timeout|    93      |       0          | destroyer-v10    | 2026-06-13 18:34
-23 | timeout|    59      |       0          | (null)           | 2026-06-13 12:01
+27 | destroyed |   199    |      24          | destroyer-v13    | 2026-06-14 01:32
+24 | timeout   |    93    |       0          | destroyer-v10    | 2026-06-13 18:34
 ```
 
 Los runs anteriores a esta migración tienen `release_version = NULL` (usaban código baked en snapshot).
@@ -159,9 +162,11 @@ SNAPSHOT_ID=232XXXXXX
 En `/opt/destroyer/.env`:
 
 ```bash
-SNAPSHOT_ID=232701378         # ID del snapshot base en DigitalOcean
-DESTROYER_RELEASE=destroyer-v10  # Release del código a descargar desde S3
-DESTROYER_WORKERS=32          # Número de workers paralelos (default: 32)
+SNAPSHOT_ID=232701378            # ID del snapshot base en DigitalOcean
+DESTROYER_RELEASE=destroyer-v15  # Release del código a descargar desde S3
+DESTROYER_WORKERS=32             # Número de workers paralelos (default: 32)
+DESTROYER_SCAN_FILE_TIMEOUT=240  # Cap por archivo "veneno"
+DESTROYER_WTA_WINDOW_SEC=8       # Ventana cross-ad para WTA
 ```
 
 ---
@@ -171,6 +176,27 @@ DESTROYER_WORKERS=32          # Número de workers paralelos (default: 32)
 | Release | Fecha | Cambios |
 |---|---|---|
 | `destroyer-v10` | 13 jun 2026 | Primera release S3. Incluye fix libx264 ultrafast para clips TV + migración UTC (pipeline_version=utc_v2) |
+| `destroyer-v11` | 13 jun 2026 | Launcher con releases S3 en producción. |
+| `destroyer-v14` | 14 jun 2026 | `fingerprint.py` colapsa offsets vecinos, `worker.py` aplica dedup por ventana real y Winner Takes All, sube debug logs a S3 y usa timeout por archivo configurable. |
+| `destroyer-v15` | 14 jun 2026 | Inserción idempotente en DB con `ON CONFLICT DO NOTHING`, evita generar clips/Telegram en duplicados exactos y acompaña la migración de deduplicación en `fingerprint_detections`. Release activa actual. |
+
+---
+
+## Migración de deduplicación en DB (14 jun 2026)
+
+Se aplicó la migración `fingerprint_detection_dedup_migration.sql` desde `mediaDEV` contra la DB privada de DO Managed PostgreSQL.
+
+Resultado verificado:
+- `58` grupos duplicados activos detectados antes de migrar
+- `95` filas extra desactivadas por soft-delete
+- `0` grupos duplicados activos después de migrar
+- Índice creado:
+
+```sql
+CREATE UNIQUE INDEX ux_fingerprint_detections_source_match_active
+ON fingerprint_detections (tenant_id, campaign_id, ad_id, stream_id, s3_key, ts_seconds)
+WHERE deleted_at IS NULL;
+```
 
 ---
 
@@ -190,4 +216,4 @@ for o in r.get('Contents', []):
 
 ---
 
-*Sistema: MediaDEV · Servidor: 159.223.104.91 · 13 junio 2026*
+*Sistema: MediaDEV · Servidor: 159.223.104.91 · Actualizado: 14 junio 2026*
