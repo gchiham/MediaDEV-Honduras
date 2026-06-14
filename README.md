@@ -7,7 +7,7 @@ publicidad (Destroyer).
 
 > **Documentación viva completa:** [`live_mediaDEV.md`](live_mediaDEV.md) — referencia técnica detallada del ecosistema completo (infraestructura, DB, Destroyer, MCP, decisiones de diseño). Actualizar cuando cambie la arquitectura.
 
-> ⚠️ **Topología — 2 nodos (split 14 jun 2026):** este repo es el código de **mediaCAP** (nodo de captura, `159.223.104.91`). El producto **`publiaudit-api`** (SaaS + evidence portal) y la orquestación del **Destroyer** (launcher + watchdog) se movieron a un 2º nodo **mediaAPP** (`137.184.53.234`), misma VPC. El **dashboard viejo (`dashboard_v4.py`) fue eliminado** (harán uno nuevo) — las secciones de este README que lo mencionan son referencia histórica. mediaCAP corre: ffmpeg + stream-daemon + video-uploader + gateways + wireguard + monitor + MCP. Ver [`live_mediaDEV.md`](live_mediaDEV.md) §1 para el detalle por nodo.
+> ⚠️ **Topología — 2 nodos (split 14 jun 2026):** este repo es el código de **mediaCAP** (nodo de captura, `159.223.104.91`). El producto **`media-app`** (SaaS + evidence portal) y la orquestación del **Destroyer** (launcher + watchdog) se movieron a un 2º nodo **mediaAPP** (`137.184.53.234`), misma VPC. El **dashboard viejo (`dashboard_v4.py`) fue eliminado** (harán uno nuevo) — las secciones de este README que lo mencionan son referencia histórica. mediaCAP corre: ffmpeg + stream-daemon + video-uploader + gateways + wireguard + monitor + MCP. Ver [`live_mediaDEV.md`](live_mediaDEV.md) §1 para el detalle por nodo.
 
 ## Por qué existe este sistema
 
@@ -288,7 +288,7 @@ systemctl start nginx                  # 8. Reverse proxy (HLS /streams/)
 ```
 
 Todos tienen `systemctl enable` — arrancan automáticamente en reboot.
-> `dashboard-mediadev` fue eliminado (14 jun 2026). **mediaAPP** (nodo aparte) corre `publiaudit-api`
+> `dashboard-mediadev` fue eliminado (14 jun 2026). **mediaAPP** (nodo aparte) corre `media-app`
 > + nginx + el cron del Destroyer (launcher/watchdog) — ver `live_mediaDEV.md` §1.
 
 ## Verificar estado completo
@@ -353,10 +353,10 @@ Todos los servicios arrancan automáticamente via systemd. Recovery time: ~2 min
 
 ## Consideraciones de seguridad
 - Acceso SSH via llave privada (keySED) — no contraseña.
-- **Credenciales fuera del repo**: `/etc/mediadev-s3.env`, `/opt/destroyer/.env`, `/etc/publiaudit-api.env` (`chmod 600`),
+- **Credenciales fuera del repo**: `/etc/mediadev-s3.env`, `/opt/destroyer/.env`, `/etc/media-app.env` (`chmod 600`),
   cargadas por systemd vía `EnvironmentFile`. `.env` está en `.gitignore`.
-- `publiaudit-api` usa `EnvironmentFile=/etc/publiaudit-api.env` — credenciales no visibles en `systemctl show`.
-- CORS de `publiaudit-api` controlado por `CORS_ORIGINS` en el env file (sin hardcodear `*`).
+- `media-app` usa `EnvironmentFile=/etc/media-app.env` — credenciales no visibles en `systemctl show`.
+- CORS de `media-app` controlado por `CORS_ORIGINS` en el env file (sin hardcodear `*`).
 - UFW activo: puertos 22, 80, 443, 51820/udp.
 - WireGuard cifra todo el tráfico del proxy.
 - Gateway API protegida con token Bearer.

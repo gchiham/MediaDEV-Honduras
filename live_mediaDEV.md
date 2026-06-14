@@ -1,7 +1,7 @@
 # live_mediaDEV.md — Ecosistema MediaDEV: Referencia Viva
 
 **Última actualización:** 14 junio 2026  
-**Versión del documento:** 1.3  
+**Versión del documento:** 1.4  
 **Servidores:** mediaCAP `159.223.104.91` (captura) · mediaAPP `137.184.53.234` (app/control)  
 **Mantenido por:** equipo MediaDEV — actualizar cada vez que cambie arquitectura, schema, servicios, o decisiones de diseño
 
@@ -29,7 +29,7 @@ El ecosistema corre en **2 droplets** DigitalOcean en `nyc1`, **misma VPC** (`b9
 | IP pública / privada | `137.184.53.234` / `10.136.0.6` |
 | Tamaño | 2 vCPU / 2 GB · Ubuntu 24.04 |
 | Acceso | `ssh -i ~/.ssh/keySED root@137.184.53.234` |
-| Corre | publiaudit-api + nginx (producto SaaS + evidence portal), Destroyer launcher + watchdog (cron), MCP (app) |
+| Corre | media-app + nginx (producto SaaS + evidence portal), Destroyer launcher + watchdog (cron), MCP (app) |
 
 > **Regla:** mediaCAP solo captura (máximo recurso para grabar); mediaAPP el producto + orquestación. Servicios que leen estado local de captura (ffmpeg, segmentos en disco) se quedan en mediaCAP. El **`worker.py` del Destroyer se edita en mediaAPP** (donde vive el launcher). `medio-orchestrator` (legacy mvp-medios) y el dashboard viejo fueron eliminados.
 
@@ -385,8 +385,8 @@ const airTimeHN  = new Date(airTimeUtc.getTime() - 6 * 60 * 60 * 1000)
 | Servicio | Propósito |
 |---|---|
 | `stream-daemon` | Graba streams de radio/TV y sube MP3s/segmentos a S3 |
-| `nginx` | Reverse proxy para publiaudit-api y gateway-api |
-| `publiaudit-api` | API REST para el producto PubliAudit (FastAPI) |
+| `nginx` | Reverse proxy para media-app y gateway-api |
+| `media-app` | API REST para el producto PubliAudit (FastAPI) |
 | `gateway-api` | API para gestión de gateways WireGuard |
 | `health-engine` | Monitoreo de salud de streams y alertas Telegram |
 | `video-segment-uploader` | Sube segmentos de video TV a S3 |
@@ -396,22 +396,22 @@ const airTimeHN  = new Date(airTimeUtc.getTime() - 6 * 60 * 60 * 1000)
 
 **Comandos útiles:**
 ```bash
-systemctl status publiaudit-api
+systemctl status media-app
 journalctl -u stream-daemon -n 100 --no-pager
-systemctl restart publiaudit-api
+systemctl restart media-app
 ```
 
-### Credenciales de publiaudit-api
+### Credenciales de media-app
 
-Las credenciales están en `/etc/publiaudit-api.env` (chmod 600, root:root). NO están en el `.service` para evitar exposición vía `systemctl show`.
+Las credenciales están en `/etc/media-app.env` (chmod 600, root:root). NO están en el `.service` para evitar exposición vía `systemctl show`.
 
 ```ini
-# /etc/systemd/system/publiaudit-api.service
+# /etc/systemd/system/media-app.service
 [Service]
-EnvironmentFile=/etc/publiaudit-api.env   ← así, no como Environment= inline
+EnvironmentFile=/etc/media-app.env   ← así, no como Environment= inline
 ```
 
-Variables en `/etc/publiaudit-api.env`:
+Variables en `/etc/media-app.env`:
 ```bash
 PG_HOST, PG_PORT, PG_DB, PG_USER, PG_PASS
 JWT_SECRET, JWT_EXP_HOURS
@@ -425,7 +425,7 @@ CORS_ORIGINS    # opcional: ej. https://app.publiaudit.com,https://admin.publiau
 
 ## 7. MCP Server (mediadev-mcp)
 
-Permite a Claude Code / Codex consultar el estado del ecosistema en tiempo real. **Corre en AMBOS nodos** (14 jun 2026): un MCP en mediaCAP (observa captura) y otro en mediaAPP (observa publiaudit-api + Destroyer launcher). Los tools de DB/DO-API dan datos globales; los de host (`get_service_logs`, `get_host_resources`, `get_workers`, `get_stream_bandwidth`) son **por-nodo**.
+Permite a Claude Code / Codex consultar el estado del ecosistema en tiempo real. **Corre en AMBOS nodos** (14 jun 2026): un MCP en mediaCAP (observa captura) y otro en mediaAPP (observa media-app + Destroyer launcher). Los tools de DB/DO-API dan datos globales; los de host (`get_service_logs`, `get_host_resources`, `get_workers`, `get_stream_bandwidth`) son **por-nodo**.
 
 ### En el servidor (idéntico en ambos nodos)
 
@@ -513,11 +513,11 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 ├── server.py           ← servidor MCP (FastMCP, stdio)
 └── venv/
 
-/opt/publiaudit-api/
+/opt/media-app/
 ├── main.py             ← FastAPI app de PubliAudit
 └── ...
 
-/etc/publiaudit-api.env     ← credenciales publiaudit-api (chmod 600)
+/etc/media-app.env     ← credenciales media-app (chmod 600)
 /etc/systemd/system/        ← definiciones de servicios
 ```
 
@@ -573,7 +573,7 @@ C:\Users\Sedesol\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\
 
 **Sin "pauta esperada vs real":** el sistema solo publica lo **detectado**. Se descartó el módulo de `placements`.
 
-**API:** `publiaudit-api` expone CRUD de anunciantes (`/api/clients`), campañas con `client_name` + filtro `?client_id=`, `PATCH /api/campaigns/{id}` para reasignar anunciante. El evidence portal muestra el anunciante (`advertiser_name`) con el tenant como `provider_name`.
+**API:** `media-app` expone CRUD de anunciantes (`/api/clients`), campañas con `client_name` + filtro `?client_id=`, `PATCH /api/campaigns/{id}` para reasignar anunciante. El evidence portal muestra el anunciante (`advertiser_name`) con el tenant como `provider_name`.
 
 ---
 
@@ -587,9 +587,9 @@ C:\Users\Sedesol\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\
 
 ### EnvironmentFile en lugar de Environment= en systemd (13 jun 2026)
 
-**Decisión:** Las credenciales de `publiaudit-api` están en `/etc/publiaudit-api.env` (chmod 600) en lugar de inline como `Environment=` en el `.service`.
+**Decisión:** Las credenciales de `media-app` están en `/etc/media-app.env` (chmod 600) en lugar de inline como `Environment=` en el `.service`.
 
-**Por qué:** `systemctl show publiaudit-api` expone en texto plano todas las variables `Environment=`. Con `EnvironmentFile=` el archivo tiene permisos restringidos y `systemctl show` solo muestra la ruta del archivo, no el contenido.
+**Por qué:** `systemctl show media-app` expone en texto plano todas las variables `Environment=`. Con `EnvironmentFile=` el archivo tiene permisos restringidos y `systemctl show` solo muestra la ruta del archivo, no el contenido.
 
 ---
 

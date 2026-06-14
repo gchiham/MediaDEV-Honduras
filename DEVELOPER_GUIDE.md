@@ -375,7 +375,7 @@ curl http://localhost/api/summary
 | `51820/udp` | WireGuard VPN | Solo VPN |
 | `22` | SSH | Administración |
 
-> El puerto `8080` lo usa otro proyecto (publiaudit-api), NO los streams.
+> El puerto `8080` lo usa otro proyecto (media-app), NO los streams.
 
 ### IPs
 | Host | IP Pública | IP VPN | Rol |

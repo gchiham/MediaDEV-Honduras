@@ -7,7 +7,7 @@ hondureños (geo-restriction), los sirve como HLS, archiva audio (MP3) y video (
 dashboards + API REST, y alimenta el motor de detección de anuncios (Destroyer).
 
 ## Arquitectura — 2 nodos (split 14 jun 2026)
-Este repo es el código de **mediaCAP** (nodo de captura). El producto (`publiaudit-api`) y la
+Este repo es el código de **mediaCAP** (nodo de captura). El producto (`media-app`) y la
 orquestación del Destroyer viven en **mediaAPP** (nodo aparte, misma VPC nyc1).
 ```
 [Streams HN] → [Gateways SOCKS5] ──WireGuard──► mediaCAP (159.223.104.91 · 2vCPU/4GB)
@@ -17,7 +17,7 @@ orquestación del Destroyer viven en **mediaAPP** (nodo aparte, misma VPC nyc1).
                                                   └──────────► PostgreSQL media-db (DO Managed)
                                                                       ▲
    mediaAPP (137.184.53.234 · 2vCPU/2GB) ─────────────────────────────┘ (DB privada, misma VPC)
-     publiaudit-api + nginx (producto SaaS + evidence portal)
+     media-app + nginx (producto SaaS + evidence portal)
      Destroyer launcher + watchdog (cron) · MCP
 ```
 
@@ -51,7 +51,7 @@ aparte que SÍ usa el monitor — no confundir.
 ## API / Dashboard
 - **Dashboard viejo (`dashboard_v4.py`) ELIMINADO** el 14 jun 2026 (van a hacer uno nuevo). El
   código sigue en `dashboard/` como referencia; sus endpoints `/api/*` read-only ya no corren.
-- **`publiaudit-api`** (producto SaaS + evidence portal) corre en **mediaAPP** (`137.184.53.234`),
+- **`media-app`** (producto SaaS + evidence portal) corre en **mediaAPP** (`137.184.53.234`),
   NO en este repo — es código aparte, aún sin versionar.
 
 ## Servicios systemd
@@ -61,7 +61,7 @@ systemctl status stream-daemon mediadev-gateway-api mediadev-health-engine \
                  mediadev-monitor video-segment-uploader nginx privoxy wg-quick@wg0
 supervisorctl status   # 12 procesos ffmpeg
 ```
-**mediaAPP (app/control):** `publiaudit-api`, `nginx`, + cron del Destroyer (launcher + watchdog).
+**mediaAPP (app/control):** `media-app`, `nginx`, + cron del Destroyer (launcher + watchdog).
 
 ## Red y gateways
 - **WireGuard wg0**: MediaDEV `10.101.0.1/24`. Gateways en `config/stations.json`.
