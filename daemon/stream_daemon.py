@@ -28,6 +28,7 @@ STALE_SECS          = 60
 CB_FAIL_OPEN        = 5
 CB_RESET_SECS       = 1800
 RESTART_AFTER_FAILS = 3
+RESTART_GRACE_SECS  = int(os.environ.get("RESTART_GRACE_SECS", "35"))
 SEG_DURATION        = 4
 TGU = timezone(timedelta(hours=-6))
 RECORDING_NAMING_MODE = os.environ.get("RECORDING_NAMING_MODE", "utc").strip().lower()
@@ -150,6 +151,7 @@ def init_state():
             "last_down":     0,
             "last_up":       0,
             "restart_today": 0,
+            "restart_grace_until": 0,
         }
         for sid in STREAMS
     }
@@ -180,6 +182,7 @@ def restart_stream(state, sid):
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     state[sid]["restart_today"] += 1
+    state[sid]["restart_grace_until"] = utc_epoch() + RESTART_GRACE_SECS
 
 def do_health(state):
     now  = utc_epoch()
@@ -223,6 +226,8 @@ def do_health(state):
             s["status"] = "OK"
         else:
             s["status"] = "STALE" if m3u8.exists() else "NO_M3U8"
+            if s["restart_grace_until"] > now:
+                continue
             s["cb_fails"] += 1
             if prev == "OK":
                 log.warning(f"[{sid}] ↓ DOWN age={age}s cb_fails={s['cb_fails']} empty={empty_playlist}")

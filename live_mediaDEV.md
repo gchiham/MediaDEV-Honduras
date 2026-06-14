@@ -565,6 +565,19 @@ C:\Users\Sedesol\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\
 
 ---
 
+### Hardening de reconexión en mediaCAP (14 jun 2026)
+
+**Decisión:** endurecer la captura de streams `auto` con dos guardas:
+
+1. `stream_run.sh` agrega flags de reconexión de `ffmpeg` para fuentes HTTP no-Icecast (`-reconnect`, `-reconnect_streamed`, `-reconnect_at_eof`, `-reconnect_on_network_error`, `-reconnect_on_http_error`).
+2. `stream-daemon` aplica una ventana de gracia de `35s` después de un `supervisorctl restart` antes de volver a incrementar `cb_fails`.
+
+**Por qué:** el 14 jun 2026 `radio_el_patio` y `teleceiba` mostraron microcortes cortos. `radio_el_patio` incluso necesitó un segundo restart a los ~17s del primero, señal de que el daemon estaba reevaluando antes de que HLS terminara de levantar. El nodo no estaba saturado; el problema era de resiliencia y timing de recuperación.
+
+**Objetivo:** bajar reinicios redundantes y mejorar recuperación automática ante cortes breves del origen o de red, sin cambiar la topología ni el routing por estación.
+
+---
+
 ### Modelo tenant → client(anunciante) → campaign → ad (13 jun 2026)
 
 **Decisión:** Jerarquía multi-tenant con `tenant` como cliente que paga (agencia/central/radio/TV/gobierno) y `client` como anunciante (Pepsi, Molineros). Relación tenant↔anunciante **1:N** (cada tenant maneja su propia cartera). Se renombró la tabla `clients` original → `tenants` y `client_id` → `tenant_id` en 10 tablas; se creó `clients` nueva = anunciante con FK `tenant_id`.

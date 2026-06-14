@@ -86,6 +86,9 @@ else
   # Resto → ffmpeg directo o vía Privoxy (gateway)
   PROXY=()
   [ "$USE_GATEWAY" = 1 ] && PROXY=(-http_proxy http://127.0.0.1:3128)
-  exec ffmpeg -y -loglevel warning -fflags nobuffer "${PROXY[@]}" \
+  exec ffmpeg -y -loglevel warning -fflags nobuffer \
+    -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 \
+    -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx \
+    -reconnect_delay_max 10 "${PROXY[@]}" \
     -user_agent "MediaDEV/1.0" -i "$URL" "${OUT[@]}" "${HLS[@]}"
 fi
