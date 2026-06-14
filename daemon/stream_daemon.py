@@ -20,9 +20,9 @@ LOG_FILE     = os.environ.get("STREAMS_LOG",  "/var/log/streams/daemon.log")
 STREAMS = [
     "fm_941","hch_tv","radio_america","radio_choluteca","radio_el_patio",
     "radio_globo","radio_satelite","suave_fm","teleceiba",
-    "xy_hrn","xy_sps","xy_tgu",
+    "xy_hrn","xy_sps","xy_tgu","canal_11",
 ]
-TV_STREAMS = {"hch_tv", "teleceiba"}
+TV_STREAMS = {"hch_tv", "teleceiba", "canal_11"}
 
 STALE_SECS          = 60
 CB_FAIL_OPEN        = 5

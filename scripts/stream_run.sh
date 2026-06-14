@@ -36,9 +36,9 @@ import json,sys
 d=json.load(open('$STATIONS'))
 s=next((x for x in d['stations'] if x['id']=='$STREAM_ID'), None)
 if not s: sys.exit(1)
-print('|'.join([s['url'], s.get('type','radio'), s.get('route','gateway')]))
+print('|'.join([s['url'], s.get('type','radio'), s.get('route','gateway'), s.get('referer','')]))
 ") || { echo "[$STREAM_ID] no encontrado en stations.json"; exit 1; }
-IFS='|' read -r URL TYPE ROUTE <<< "$CFG"
+IFS='|' read -r URL TYPE ROUTE REFERER <<< "$CFG"
 
 # ¿Fuente Icecast? (requiere curl pipe, no ffmpeg)
 is_ice42=0
@@ -86,9 +86,12 @@ else
   # Resto → ffmpeg directo o vía Privoxy (gateway)
   PROXY=()
   [ "$USE_GATEWAY" = 1 ] && PROXY=(-http_proxy http://127.0.0.1:3128)
+  HDRS=()
+  [ -n "$REFERER" ] && HDRS=(-headers "Referer: $REFERER
+")
   exec ffmpeg -y -loglevel warning -fflags nobuffer \
     -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 \
     -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx \
-    -reconnect_delay_max 10 "${PROXY[@]}" \
+    -reconnect_delay_max 10 "${PROXY[@]}" "${HDRS[@]}" \
     -user_agent "MediaDEV/1.0" -i "$URL" "${OUT[@]}" "${HLS[@]}"
 fi

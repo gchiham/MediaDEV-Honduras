@@ -1,34 +1,36 @@
 #!/usr/bin/env python3
 """
 Video Segment Uploader — sube .ts de streams TV a S3 con nombre de epoch.
-Usa mtime del archivo para calcular el epoch (sin SQLite).
 
 S3 path: video_segments/{stream_id}/{YYYY}/{MM}/{DD}/{epoch_start}_{epoch_end}.ts
 
-Además extrae audio por hora para alimentar el Destroyer:
-  s3://{bucket}/{stream_id}/{YYYY}/{MM}/{YYYY-MM-DD_HHh}.mp3
+TV audio por hora para el Destroyer:
+  s3://{bucket}/{stream_id}/{YYYY}/{MM}/{YYYY-MM-DDT{HH}Z}.mp3
+
+Radio: sube MP3 por hora desde recordings/ a S3 y los elimina local.
+  s3://{bucket}/{stream_id}/{YYYY}/{MM}/{YYYY-MM-DDT{HH}Z}.mp3
 """
 import os, time, json, logging, shutil, subprocess, boto3
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
-STREAMS_ROOT   = Path(os.environ.get("STREAMS_ROOT", "/var/www/streams"))
-STATIONS       = Path("/opt/media-ai/config/stations.json")
-S3_BUCKET      = os.environ.get("S3_BUCKET",  "mediadev-recordings")
-S3_REGION      = os.environ.get("S3_REGION",  "us-east-1")
-S3_PREFIX      = "video_segments"
-AUDIO_DIR      = Path(os.environ.get("TV_AUDIO_DIR", "/var/www/streams/_tv_audio"))
-HLS_KEEP       = 12
-SCAN_INTERVAL  = 15
-SEGMENT_DUR    = 4
-TGU            = timezone(timedelta(hours=-6))
+STREAMS_ROOT    = Path(os.environ.get("STREAMS_ROOT", "/var/www/streams"))
+STATIONS        = Path("/opt/media-ai/config/stations.json")
+S3_BUCKET       = os.environ.get("S3_BUCKET",  "mediadev-recordings")
+S3_REGION       = os.environ.get("S3_REGION",  "us-east-1")
+S3_PREFIX       = "video_segments"
+AUDIO_DIR       = Path(os.environ.get("TV_AUDIO_DIR", "/var/www/streams/_tv_audio"))
+HLS_KEEP        = 12
+SCAN_INTERVAL   = 15
+SEGMENT_DUR     = 4
+TGU             = timezone(timedelta(hours=-6))
 MP3_NAMING_MODE = os.environ.get("MP3_NAMING_MODE", "utc").strip().lower()
 
-PG_HOST = os.environ.get("PG_HOST", "127.0.0.1")
-PG_PORT = int(os.environ.get("PG_PORT", "25060"))
-PG_DB   = os.environ.get("PG_DB", "destroyer_db")
-PG_USER = os.environ.get("PG_USER", "destroyer")
-PG_PASS = os.environ.get("PG_PASS", "")
+PG_HOST          = os.environ.get("PG_HOST", "127.0.0.1")
+PG_PORT          = int(os.environ.get("PG_PORT", "25060"))
+PG_DB            = os.environ.get("PG_DB", "destroyer_db")
+PG_USER          = os.environ.get("PG_USER", "destroyer")
+PG_PASS          = os.environ.get("PG_PASS", "")
 PIPELINE_VERSION = os.environ.get("PIPELINE_VERSION", "utc_v2")
 
 logging.basicConfig(
@@ -41,7 +43,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("video-uploader")
 
-# Per-stream audio accumulation state: {stream_id: {hour_epoch, segs_dir}}
 _audio_state: dict = {}
 _schema_cols: dict[str, set[str]] = {}
 
@@ -50,6 +51,11 @@ def get_tv_streams() -> list:
     data = json.load(open(STATIONS))
     return [s["id"] for s in data["stations"]
             if s.get("type") == "tv" and s.get("enabled", True)]
+
+def get_radio_streams() -> list:
+    data = json.load(open(STATIONS))
+    return [s["id"] for s in data["stations"]
+            if s.get("type") == "radio" and s.get("enabled", True)]
 
 def get_s3():
     return boto3.client("s3", region_name=S3_REGION)
@@ -62,12 +68,8 @@ def _hour_label(hour_epoch: int) -> str:
     if MP3_NAMING_MODE == "legacy_hn":
         dt = datetime.fromtimestamp(hour_epoch, tz=TGU)
         return dt.strftime("%Y-%m-%d_%Hh")
-
     dt = datetime.fromtimestamp(hour_epoch, tz=timezone.utc)
     return dt.strftime("%Y-%m-%dT%HZ")
-
-
-# ── Audio hourly accumulation ─────────────────────────────────────────────────
 
 def _audio_s3_key(stream_id: str, h_epoch: int) -> str:
     dt = datetime.fromtimestamp(h_epoch, tz=timezone.utc)
@@ -77,14 +79,10 @@ def _table_columns(conn, table: str) -> set[str]:
     cols = _schema_cols.get(table)
     if cols is not None:
         return cols
-
     with conn.cursor() as cur:
         cur.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = %s
-            """,
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = %s",
             (table,),
         )
         cols = {row[0] for row in cur.fetchall()}
@@ -99,9 +97,9 @@ def _db_register(mp3_key: str, stream_id: str, recorded_date: str, hour_start_ut
             dbname=PG_DB, user=PG_USER, password=PG_PASS
         )
         with conn.cursor() as cur:
-            cols = _table_columns(conn, "s3_scan_log")
+            cols        = _table_columns(conn, "s3_scan_log")
             insert_cols = ["s3_key", "stream", "recorded_date", "status", "updated_at"]
-            values = [mp3_key, stream_id, recorded_date, "pending", datetime.now(timezone.utc)]
+            values      = [mp3_key, stream_id, recorded_date, "pending", datetime.now(timezone.utc)]
 
             if "hour_start_utc" in cols:
                 insert_cols.append("hour_start_utc")
@@ -110,12 +108,10 @@ def _db_register(mp3_key: str, stream_id: str, recorded_date: str, hour_start_ut
                 insert_cols.append("pipeline_version")
                 values.append(PIPELINE_VERSION)
 
+            placeholders = ", ".join(["%s"] * len(values))
             cur.execute(
-                f"""
-                INSERT INTO s3_scan_log ({', '.join(insert_cols)})
-                VALUES ({', '.join(['%s'] * len(values))})
-                ON CONFLICT (s3_key) DO NOTHING
-                """,
+                f"INSERT INTO s3_scan_log ({', '.join(insert_cols)}) "
+                f"VALUES ({placeholders}) ON CONFLICT (s3_key) DO NOTHING",
                 values,
             )
             conn.commit()
@@ -123,8 +119,10 @@ def _db_register(mp3_key: str, stream_id: str, recorded_date: str, hour_start_ut
     except Exception as e:
         log.warning(f"[{stream_id}] DB register error: {e}")
 
+
+# ── TV audio hourly accumulation ──────────────────────────────────────────────
+
 def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path) -> None:
-    """Concatena mini-segs de audio acumulados, crea MP3, sube a S3, registra en DB."""
     segs    = sorted(segs_dir.glob("*.ts"))
     h_label = _hour_label(hour_epoch)
     rec_day = datetime.fromtimestamp(hour_epoch, tz=timezone.utc).strftime("%Y-%m-%d")
@@ -136,7 +134,8 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
 
     mp3_path   = segs_dir / f"{h_label}.mp3"
     concat_txt = segs_dir / "list.txt"
-    concat_txt.write_text("\n".join(f"file '{p}'" for p in segs) + "\n")
+    lines = "\n".join(f"file '{p}'" for p in segs) + "\n"
+    concat_txt.write_text(lines)
 
     r = subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error",
@@ -150,7 +149,7 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
         shutil.rmtree(segs_dir, ignore_errors=True)
         return
 
-    key = _audio_s3_key(stream_id, hour_epoch)
+    key            = _audio_s3_key(stream_id, hour_epoch)
     hour_start_utc = datetime.fromtimestamp(hour_epoch, tz=timezone.utc)
     try:
         s3_client.upload_file(str(mp3_path), S3_BUCKET, key)
@@ -165,16 +164,13 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
 
 
 def save_audio_seg(s3_client, stream_id: str, seg_path: Path, epoch_start: int) -> None:
-    """Extrae audio del segmento de video y lo acumula en el directorio de la hora actual."""
     hour_epoch = (epoch_start // 3600) * 3600
     state      = _audio_state.get(stream_id, {})
 
-    # Si cambió la hora, flush de la hora anterior
     if state.get("hour_epoch") is not None and state["hour_epoch"] != hour_epoch:
         flush_audio_hour(s3_client, stream_id, state["hour_epoch"], state["segs_dir"])
         state = {}
 
-    # Inicializar estado para la hora actual
     if state.get("hour_epoch") != hour_epoch:
         h_label  = _hour_label(hour_epoch)
         new_dir  = AUDIO_DIR / stream_id / h_label
@@ -182,7 +178,6 @@ def save_audio_seg(s3_client, stream_id: str, seg_path: Path, epoch_start: int) 
         state    = {"hour_epoch": hour_epoch, "segs_dir": new_dir}
         _audio_state[stream_id] = state
 
-    # Extraer audio como TS audio-only (AAC copy, rápido sin re-encode)
     audio_out = state["segs_dir"] / f"{epoch_start:010d}.ts"
     if audio_out.exists():
         return
@@ -194,15 +189,14 @@ def save_audio_seg(s3_client, stream_id: str, seg_path: Path, epoch_start: int) 
     )
 
 
-# ── Video upload ──────────────────────────────────────────────────────────────
+# ── TV video segment upload ───────────────────────────────────────────────────
 
 def upload_segment(s3_client, seg_path: Path, stream_id: str) -> bool:
     mtime       = int(seg_path.stat().st_mtime)
     epoch_start = mtime - SEGMENT_DUR
     epoch_end   = mtime
-    key = s3_key(stream_id, epoch_start, epoch_end)
+    key         = s3_key(stream_id, epoch_start, epoch_end)
     try:
-        # Extraer audio ANTES de borrar el .ts de video
         save_audio_seg(s3_client, stream_id, seg_path, epoch_start)
         s3_client.upload_file(str(seg_path), S3_BUCKET, key,
                               ExtraArgs={"ContentType": "video/mp2t"})
@@ -212,7 +206,7 @@ def upload_segment(s3_client, seg_path: Path, stream_id: str) -> bool:
         log.error(f"[{stream_id}] Error subiendo {seg_path.name}: {e}")
         return False
 
-def process_stream(s3_client, stream_id: str):
+def process_stream(s3_client, stream_id: str) -> int:
     stream_dir = STREAMS_ROOT / stream_id
     if not stream_dir.exists():
         return 0
@@ -222,7 +216,7 @@ def process_stream(s3_client, stream_id: str):
         return 0
 
     to_upload = segs[:-HLS_KEEP]
-    uploaded = 0
+    uploaded  = 0
     for seg in to_upload:
         if upload_segment(s3_client, seg, stream_id):
             uploaded += 1
@@ -232,10 +226,58 @@ def process_stream(s3_client, stream_id: str):
     return uploaded
 
 
+# ── Radio MP3 upload ──────────────────────────────────────────────────────────
+
+def _parse_mp3_hour(stem: str) -> datetime | None:
+    for fmt in ("%Y-%m-%dT%HZ", "%Y-%m-%d_%Hh"):
+        try:
+            return datetime.strptime(stem, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+def process_radio_stream(s3_client, stream_id: str) -> int:
+    """Sube MP3 de horas completadas a S3 y los elimina del disco local."""
+    rec_dir = STREAMS_ROOT / stream_id / "recordings"
+    if not rec_dir.exists():
+        return 0
+
+    now_utc            = datetime.now(timezone.utc)
+    current_hour_epoch = int(now_utc.replace(minute=0, second=0, microsecond=0).timestamp())
+
+    uploaded = 0
+    for mp3_path in sorted(rec_dir.glob("*.mp3")):
+        dt = _parse_mp3_hour(mp3_path.stem)
+        if dt is None:
+            log.warning(f"[{stream_id}] nombre desconocido: {mp3_path.name} — saltando")
+            continue
+
+        # Nunca tocar el archivo de la hora actual (aun se esta escribiendo)
+        if int(dt.timestamp()) >= current_hour_epoch:
+            continue
+
+        key     = _audio_s3_key(stream_id, int(dt.timestamp()))
+        rec_day = dt.strftime("%Y-%m-%d")
+        try:
+            s3_client.upload_file(str(mp3_path), S3_BUCKET, key,
+                                  ExtraArgs={"ContentType": "audio/mpeg"})
+            _db_register(key, stream_id, rec_day, dt)
+            mp3_path.unlink()
+            uploaded += 1
+            log.info(f"[{stream_id}] {mp3_path.name} → s3://{S3_BUCKET}/{key}")
+        except Exception as e:
+            log.error(f"[{stream_id}] Error subiendo {mp3_path.name}: {e}")
+
+    return uploaded
+
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+
 def run():
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-    tv_streams = get_tv_streams()
-    log.info(f"Video uploader iniciado — TV streams: {tv_streams}")
+    tv_streams    = get_tv_streams()
+    radio_streams = get_radio_streams()
+    log.info(f"Video uploader iniciado — TV: {tv_streams} | Radio: {radio_streams}")
     s3_client = get_s3()
 
     while True:
@@ -244,6 +286,13 @@ def run():
                 process_stream(s3_client, stream_id)
             except Exception as e:
                 log.error(f"[{stream_id}] {e}")
+
+        for stream_id in radio_streams:
+            try:
+                process_radio_stream(s3_client, stream_id)
+            except Exception as e:
+                log.error(f"[{stream_id}] {e}")
+
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":

@@ -129,10 +129,11 @@
       "id": "teleceiba",
       "name": "Teleceiba",
       "type": "tv",
-      "route": "auto",
+      "route": "gateway",
       "gateway": "hn02",
-      "url": "https://teleceiba.com/stream/tlcb720.m3u8",
-      "enabled": true
+      "url": "http://190.11.224.14:8200/tlcb720.m3u8",
+      "enabled": true,
+      "referer": "http://190.11.224.14:8200/"
     },
     {
       "id": "radio_choluteca",
@@ -141,6 +142,15 @@
       "route": "gateway",
       "gateway": "hn02",
       "url": "https://ice42.securenetsystems.net/CHOLUTEC",
+      "enabled": true
+    },
+    {
+      "id": "canal_11",
+      "name": "Canal 11",
+      "type": "tv",
+      "route": "auto",
+      "gateway": "hn02",
+      "url": "https://redirector.rudo.video/hls-video/c54ac2799874375c81c1672abb700870537c5223/canal11hn/canal11hn.smil/playlist.m3u8",
       "enabled": true
     }
   ]
