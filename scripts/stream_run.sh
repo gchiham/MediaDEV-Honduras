@@ -89,9 +89,16 @@ else
   HDRS=()
   [ -n "$REFERER" ] && HDRS=(-headers "Referer: $REFERER
 ")
+  # Reconnect: fuentes continuas conservan reconnect_at_eof + reintento en 5xx.
+  # HLS .m3u8 (ventana corta, origen a veces 502): SIN reconnect_at_eof (no bucle en el
+  # fin normal del playlist) y SIN reconnect_on_http_error 5xx (no se atasca reintentando
+  # un segmento ya expirado; deja que el demuxer HLS avance al siguiente).
+  RECONN=(-reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx)
+  if [[ "$URL" == *.m3u8* ]]; then
+    RECONN=(-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1)
+  fi
   exec ffmpeg -y -loglevel warning -fflags nobuffer \
-    -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 \
-    -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx \
+    "${RECONN[@]}" \
     -reconnect_delay_max 10 "${PROXY[@]}" "${HDRS[@]}" \
     -user_agent "MediaDEV/1.0" -i "$URL" "${OUT[@]}" "${HLS[@]}"
 fi

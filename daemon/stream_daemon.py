@@ -287,48 +287,166 @@ def do_metrics(state):
         rows, many=True,
     )
 
-# ── HOURLY RECORDINGS ─────────────────────────────────────────────────────────
-def do_record(state):
-    now = utc_epoch()
-    if (now % 3600) // 60 > 3:
+# ── TELEGRAM (alertas de grabación) ───────────────────────────────────────────
+# Las credenciales viven en /opt/destroyer/.env (no en el env del daemon).
+TG_ENV_FILE         = "/opt/destroyer/.env"
+TG_ALERT_COOLDOWN_S = 3 * 3600     # no repetir alerta del mismo stream antes de 3h
+_tg_creds           = None
+_tg_last_alert: dict = {}
+
+def _tg_get_creds():
+    global _tg_creds
+    if _tg_creds is not None:
+        return _tg_creds
+    tok = os.environ.get("TG_TOKEN"); chat = os.environ.get("TG_CHAT")
+    if not (tok and chat):
+        try:
+            for line in Path(TG_ENV_FILE).read_text().splitlines():
+                line = line.strip()
+                if line.startswith("TG_TOKEN=") and not tok:
+                    tok = line.split("=", 1)[1].strip().strip('"').strip("'")
+                elif line.startswith("TG_CHAT=") and not chat:
+                    chat = line.split("=", 1)[1].strip().strip('"').strip("'")
+        except Exception:
+            pass
+    _tg_creds = (tok, chat)
+    return _tg_creds
+
+def tg_send(text: str) -> None:
+    tok, chat = _tg_get_creds()
+    if not (tok and chat):
         return
-    h_start = now - now % 3600 - 3600
-    h_end   = h_start + 3600
-    h_label = recording_hour_label(h_start)
+    try:
+        import requests
+        requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                      json={"chat_id": chat, "text": text}, timeout=10)
+    except Exception as e:
+        log.warning(f"tg_send error: {e}")
 
-    for sid in STREAMS:
-        rec_dir = STREAMS_ROOT / sid / "recordings"
-        rec_dir.mkdir(parents=True, exist_ok=True)
-        out = rec_dir / f"{h_label}.mp3"
-        if out.exists():
-            continue
 
-        segs = sorted(
-            [f for f in (STREAMS_ROOT / sid).glob("seg_*.ts")
-             if f.exists() and h_start <= f.stat().st_mtime < h_end],
-            key=lambda f: f.stat().st_mtime
-        )
-        if len(segs) < 10:
-            continue
+# ── Dedupe contra S3 (fuente de verdad, cacheada en memoria) ──────────────────
+# Evita re-encodear horas que ya están en S3 (aunque su .mp3 local fue rotado) y
+# evita falsas alertas de "captura caída" para horas que sí se grabaron.
+_s3_have: set = set()
+_s3_client_cached = None
 
-        log.info(f"[{sid}] Grabando {h_label} ({len(segs)} segs)")
+def _s3c():
+    global _s3_client_cached
+    if _s3_client_cached is None:
+        _s3_client_cached = boto3.client("s3", region_name=S3_REGION)
+    return _s3_client_cached
+
+def _canon_key(sid: str, h_label: str) -> str:
+    y, m = h_label[:4], h_label[5:7]
+    key = f"{sid}/{y}/{m}/{h_label}.mp3"
+    return f"{BACKUP_PFX}/{key}" if PEER_ROLE == "backup" else key
+
+def _in_s3(key: str) -> bool:
+    if key in _s3_have:
+        return True
+    try:
+        _s3c().head_object(Bucket=S3_BUCKET, Key=key)
+        _s3_have.add(key)
+        return True
+    except Exception:
+        return False
+
+
+# ── HOURLY RECORDINGS ─────────────────────────────────────────────────────────
+AUTO_BACKFILL_HOURS = 3   # graba/recupera las últimas N horas completas que falten
+ALERT_MISSED_HOURS  = 2   # alerta si las últimas N horas no se pudieron grabar
+
+def _encode_and_store(sid, h_label, segs, rec_dir, out) -> bool:
+    """Concatena los .ts → MP3, sube (radio) y rota. Aislado: nunca lanza."""
+    try:
         result = subprocess.run(
             ["ffmpeg","-y","-loglevel","error","-i","pipe:0",
              "-c:a","libmp3lame","-b:a","64k","-ac","1","-ar","22050",str(out)],
             input=b"".join(f.read_bytes() for f in segs),
             capture_output=True
         )
-        if result.returncode == 0:
+        if result.returncode == 0 and out.exists():
             log.info(f"[{sid}] {h_label}.mp3 OK ({out.stat().st_size//1024}KB)")
             if sid in TV_STREAMS:
                 log.info(f"[{sid}] MP3 horario local OK — S3 lo publica video_segment_uploader para mantener sincronia con video")
             else:
                 s3_upload(out, sid)
             for old in sorted(rec_dir.glob("*.mp3"), key=lambda f: f.name, reverse=True)[KEEP_MP3_COUNT:]:
-                old.unlink()
-        else:
-            out.unlink(missing_ok=True)
-            log.error(f"[{sid}] Fallo grabando {h_label}")
+                old.unlink(missing_ok=True)
+            return True
+        out.unlink(missing_ok=True)
+        log.error(f"[{sid}] Fallo grabando {h_label} (rc={result.returncode}, existe={out.exists()})")
+        return False
+    except Exception as e:
+        log.error(f"[{sid}] Excepción grabando {h_label}: {e}")
+        return False
+
+def _recording_alert(sid, cur_h, status, now):
+    """#2 — alerta Telegram si la captura de un stream está caída.
+
+    Señal: la hora recién cerrada no tuvo material (<10 segs) ni quedó en S3 →
+    el HLS de ese stream no está produciendo segmentos = captura caída. (Las horas
+    viejas con material ya rotado NO disparan: el dedupe contra S3 las marca 'exists'.)
+    """
+    last_h = cur_h - 3600
+    if status.get(last_h) not in ("no_material", "failed"):
+        return
+    if now - _tg_last_alert.get(sid, 0) < TG_ALERT_COOLDOWN_S:
+        return
+    _tg_last_alert[sid] = now
+    lbl = recording_hour_label(last_h)
+    log.warning(f"[{sid}] ALERTA: hora {lbl} sin grabar (captura caída)")
+    tg_send(f"⚠️ GRABACIÓN CAÍDA — {sid}\n"
+            f"La hora {lbl} no se grabó (sin segmentos / HLS caído).\n"
+            f"Revisar la captura de {sid} en mediaCAP.")
+
+def do_record(state):
+    now   = utc_epoch()
+    cur_h = now - now % 3600
+    # #3 auto-backfill: intenta las últimas N horas COMPLETAS que falten. Como los
+    # .ts viven 8h, un fallo puntual (o un ciclo perdido) se recupera solo en el
+    # siguiente ciclo, sin intervención manual. Barato: si el .mp3 ya existe local
+    # (se guardan KEEP_MP3_COUNT), solo hace un stat() y sigue — no re-encodea.
+    target = [cur_h - 3600 * k for k in range(1, AUTO_BACKFILL_HOURS + 1)]
+
+    for sid in STREAMS:
+        # La grabación MP3 desde .ts es solo para RADIO. Los .ts de TV los sube y
+        # BORRA el video_segment_uploader (que además genera su audio horario), así
+        # que do_record no puede juzgarlos — saltarlos evita falsas alertas.
+        if sid in TV_STREAMS:
+            continue
+        rec_dir = STREAMS_ROOT / sid / "recordings"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        seg_mtimes = None
+        status = {}
+        for h in target:
+            h_label = recording_hour_label(h)
+            out = rec_dir / f"{h_label}.mp3"
+            key = _canon_key(sid, h_label)
+            # Dedupe: ya grabada localmente, o ya en S3 (aunque el .mp3 local rotó)
+            if out.exists() or _in_s3(key):
+                status[h] = "exists"
+                continue
+            if seg_mtimes is None:   # glob una sola vez por stream, y solo si falta algo
+                seg_mtimes = []
+                for f in (STREAMS_ROOT / sid).glob("seg_*.ts"):
+                    try:
+                        seg_mtimes.append((f, f.stat().st_mtime))
+                    except OSError:
+                        pass
+            segs = [f for f, mt in sorted(seg_mtimes, key=lambda x: x[1])
+                    if h <= mt < h + 3600]
+            if len(segs) < 10:
+                status[h] = "no_material"
+                continue
+            log.info(f"[{sid}] Grabando {h_label} ({len(segs)} segs)")
+            if _encode_and_store(sid, h_label, segs, rec_dir, out):
+                status[h] = "recorded"
+                _s3_have.add(key)
+            else:
+                status[h] = "failed"
+
+        _recording_alert(sid, cur_h, status, now)
 
 # ── CLEANUP ───────────────────────────────────────────────────────────────────
 def do_cleanup(state):

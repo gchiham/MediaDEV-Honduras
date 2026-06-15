@@ -45,6 +45,7 @@ log = logging.getLogger("video-uploader")
 
 _audio_state: dict = {}
 _schema_cols: dict[str, set[str]] = {}
+_video_state: dict = {}   # {stream_id: {"hour_epoch", "segs", "bytes"}} — marcador de video real
 
 
 def get_tv_streams() -> list:
@@ -118,6 +119,52 @@ def _db_register(mp3_key: str, stream_id: str, recorded_date: str, hour_start_ut
         conn.close()
     except Exception as e:
         log.warning(f"[{stream_id}] DB register error: {e}")
+
+
+# ── Marcador horario de VIDEO real (medición, no inferencia) ──────────────────
+# El dashboard contaba "video grabado" infiriéndolo del audio + type=tv. Aquí
+# registramos los .ts de video efectivamente subidos a S3, agregados por hora,
+# en mediadev_video_coverage. Así el panel mide el video real (y delata casos
+# como un canal con audio OK pero sin video, ej. un origen TV caído).
+
+def _db_register_video(stream_id: str, hour_epoch: int, segs: int, byts: int) -> None:
+    if segs <= 0:
+        return
+    try:
+        import psycopg2
+        conn = psycopg2.connect(
+            host=PG_HOST, port=PG_PORT,
+            dbname=PG_DB, user=PG_USER, password=PG_PASS
+        )
+        with conn.cursor() as cur:
+            hour_utc = datetime.fromtimestamp(hour_epoch, tz=timezone.utc)
+            cur.execute("""
+                INSERT INTO mediadev_video_coverage (stream, hour_utc, segs, bytes, updated_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (stream, hour_utc) DO UPDATE SET
+                    segs       = mediadev_video_coverage.segs + EXCLUDED.segs,
+                    bytes      = mediadev_video_coverage.bytes + EXCLUDED.bytes,
+                    updated_at = EXCLUDED.updated_at
+            """, (stream_id, hour_utc, segs, byts, datetime.now(timezone.utc)))
+            conn.commit()
+        conn.close()
+        log.info(f"[{stream_id}] video coverage {hour_utc:%Y-%m-%dT%HZ}: {segs} segs, {byts/1e6:.1f} MB")
+    except Exception as e:
+        log.warning(f"[{stream_id}] video coverage register error: {e}")
+
+
+def note_video_seg(stream_id: str, epoch_start: int, nbytes: int) -> None:
+    """Acumula en memoria por (stream, hora) y descarga a la DB al cambiar de hora."""
+    hour_epoch = (epoch_start // 3600) * 3600
+    st = _video_state.get(stream_id)
+    if st is not None and st["hour_epoch"] != hour_epoch:
+        _db_register_video(stream_id, st["hour_epoch"], st["segs"], st["bytes"])
+        st = None
+    if st is None:
+        st = {"hour_epoch": hour_epoch, "segs": 0, "bytes": 0}
+        _video_state[stream_id] = st
+    st["segs"]  += 1
+    st["bytes"] += nbytes
 
 
 # ── TV audio hourly accumulation ──────────────────────────────────────────────
@@ -197,9 +244,11 @@ def upload_segment(s3_client, seg_path: Path, stream_id: str) -> bool:
     epoch_end   = mtime
     key         = s3_key(stream_id, epoch_start, epoch_end)
     try:
+        nbytes = seg_path.stat().st_size
         save_audio_seg(s3_client, stream_id, seg_path, epoch_start)
         s3_client.upload_file(str(seg_path), S3_BUCKET, key,
                               ExtraArgs={"ContentType": "video/mp2t"})
+        note_video_seg(stream_id, epoch_start, nbytes)
         seg_path.unlink()
         return True
     except Exception as e:

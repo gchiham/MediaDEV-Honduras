@@ -8,7 +8,7 @@
       "vpn_ip": "10.101.0.2",
       "socks5": "socks5://10.101.0.2:1080",
       "enabled": false,
-      "note": "Inactivo desde 2026-06-11 15:38:10 -- cambiado por gateway_switch.sh",
+      "note": "Inactivo desde 2026-06-14 23:08:34 -- cambiado por gateway_switch.sh",
       "priority": 2,
       "role": "failover-1"
     },
@@ -18,7 +18,7 @@
       "vpn_ip": "10.101.0.5",
       "socks5": "socks5://10.101.0.5:1080",
       "enabled": true,
-      "note": "Activo desde 2026-06-11 15:38:10 -- cambiado por gateway_switch.sh",
+      "note": "Activo desde 2026-06-14 23:08:34 -- cambiado por gateway_switch.sh",
       "priority": 1,
       "role": "primary"
     },
