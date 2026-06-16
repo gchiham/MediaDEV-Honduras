@@ -38,7 +38,7 @@ LOOP_SLEEP       = 2s
 
 ## Optimizaciones
 1. `m3u8_seg_count()` lee el m3u8 como texto — NO hace glob en disco.
-2. `sup_statuses()` hace UNA sola llamada a supervisorctl para los 12 streams.
+2. `sup_statuses()` hace UNA sola llamada a supervisorctl para los 13 streams.
 3. `do_metrics()` es la única tarea que hace glob (1×/min) para medir bytes.
 
 ## Pitfalls

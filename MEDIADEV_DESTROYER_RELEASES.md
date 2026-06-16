@@ -1,175 +1,120 @@
 # Destroyer — Sistema de Releases Versionadas
 
-**Fecha de implementación:** 13 junio 2026  
-**Última actualización:** 14 junio 2026  
-**Motivación:** Separar las dependencias del sistema (snapshot) del código de la aplicación (S3), eliminando la necesidad de recrear el snapshot por cada cambio de código.
+**Fecha de implementación:** 13 junio 2026 (DigitalOcean) · **Migrado a AWS:** 14 junio 2026  
+**Última actualización:** 15 junio 2026  
+**Motivación:** Separar las dependencias del sistema (AMI base) del código de la aplicación (S3), eliminando la necesidad de recrear la imagen base por cada cambio de código.
+
+> **Cambio de plataforma (14 jun 2026):** el Destroyer migró de droplets DigitalOcean c-16 a
+> **AWS EC2 Spot c5.4xlarge**, orquestado por EventBridge + Lambda (100% serverless). El sistema
+> de releases S3 sobrevive intacto; lo que cambió es la base (snapshot DO → **AMI AWS**) y el
+> lanzador (cron/launcher en mediaAPP → **Lambda `destroyer-launcher`**). Ver `live_mediaDEV.md` §4.
 
 ---
 
-## El problema anterior
+## El problema que resuelve
 
-El snapshot del Destroyer mezclaba dos responsabilidades:
+La imagen base del Destroyer mezclaba dos responsabilidades:
 
-| Qué contenía | Frecuencia de cambio |
+| Qué contiene | Frecuencia de cambio |
 |---|---|
-| Ubuntu 22.04 + ffmpeg + Python + venv + librerías | Raro (meses) |
+| Ubuntu 22.04 + ffmpeg + Python 3.12 + venv (boto3, psycopg2, scipy, numpy, pydub…) | Raro (meses) |
 | `worker.py` + `fingerprint.py` | Frecuente (cada fix) |
 
-Consecuencias:
-- Cada fix de código requería crear un nuevo snapshot (~10 minutos)
-- No había auditoría de qué versión del código corrió cada run
-- Rollback = cambiar `SNAPSHOT_ID` y esperar que el snapshot exista
+Antes (snapshot por código): cada fix requería recrear la imagen (~10 min), sin auditoría de qué
+código corrió cada run. **Ahora:** la base es estable y el código se versiona en S3 (y en GitHub
+`gchiham/destroyer`), se descarga al arrancar la instancia. Deploy instantáneo, rollback en 1 línea,
+columna `release_version` en `destroyer_runs` para auditoría.
 
 ---
 
-## Arquitectura nueva
+## Arquitectura (AWS)
 
 ```
-Snapshot base (estable)          S3 releases (versionadas)
+AMI base (estable)               S3 releases (versionadas)
 ─────────────────────────        ────────────────────────────────
-Ubuntu 22.04                     destroyer/releases/
-ffmpeg                             destroyer-v10.tar.gz
-Python 3.11                        destroyer-v11.tar.gz
-venv con:                          destroyer-v14.tar.gz
-  boto3, psycopg2, scipy,          destroyer-v15.tar.gz
-  numpy, requests, etc.            destroyer-v16.tar.gz  ← worker.py + fingerprint.py
-                                   latest.tar.gz         ← apunta a la más reciente
+ami-065708bbb25ab56ad            s3://mediadev-recordings/destroyer/releases/
+(destroyer-v3-ubuntu22-pydub)      destroyer-v20.tar.gz
+Ubuntu 22.04                       destroyer-v21.tar.gz
+ffmpeg 4.4.2                       destroyer-v22.tar.gz  ← worker.py + fingerprint.py (ACTIVA)
+Python 3.12 + venv (con pydub)     latest.tar.gz         ← apunta a la más reciente
 ```
 
-**Flujo al arrancar el droplet:**
-
+**Flujo al arrancar (cloud-init de la instancia Spot):**
 ```
-launcher.py
-    │
-    ├─ Lee DESTROYER_RELEASE del .env  (ej: "destroyer-v16")
-    │
-    ├─ Crea droplet desde snapshot base
-    │
-    └─ cloud-init ejecuta:
-           1. Exporta credenciales y env vars
-           2. aws s3 cp s3://mediadev-recordings/destroyer/releases/destroyer-v16.tar.gz /tmp/release.tar.gz
-           3. tar -xzf /tmp/release.tar.gz -C /opt/destroyer/
-           4. python worker.py
+EventBridge `destroyer-hourly` → Lambda `destroyer-launcher`
+    ├─ lee DESTROYER_RELEASE (ej "destroyer-v22") + DESTROYER_AMI_ID
+    ├─ lanza EC2 Spot c5.4xlarge desde el AMI
+    └─ user_data:
+         1. exporta credenciales/env (keys IAM mediadev-s3 horneadas)
+         2. aws s3 cp s3://mediadev-recordings/destroyer/releases/destroyer-v22.tar.gz /tmp/release.tar.gz
+         3. tar -xzf /tmp/release.tar.gz -C /opt/destroyer/
+         4. python worker.py
+         5. al terminar: aws ec2 terminate-instances (auto-destrucción)
 ```
 
-**Velocidad de arranque:** idéntica. El tiempo dominante es la provisión del droplet por DigitalOcean (~70-90s). La descarga del tar.gz desde S3 agrega <1 segundo (nyc1 → us-east-1, archivo ~14KB).
+Boot ~53-96s + scan ~30s. La descarga del tar.gz (~14KB) agrega <1s.
 
----
-
-## Estructura en S3
-
-```
-s3://mediadev-recordings/
-└── destroyer/
-    └── releases/
-        ├── destroyer-v10.tar.gz
-        ├── destroyer-v11.tar.gz
-        ├── destroyer-v14.tar.gz
-        ├── destroyer-v15.tar.gz
-        ├── destroyer-v16.tar.gz    ← código de producción actual
-        └── latest.tar.gz           ← siempre = la última publicada
-```
-
-Contenido de cada tar.gz:
-```
-worker.py
-fingerprint.py
-```
+Contenido de cada tar.gz: `worker.py`, `fingerprint.py`.
 
 ---
 
 ## Publicar una nueva release
 
 ```bash
-# En el servidor mediaAPP (137.184.53.234):
+# En mediaAPP (137.184.53.234), /opt/destroyer:
 cd /opt/destroyer
-./release.sh v16
+./release.sh v22
 ```
+El script: `tar -czf destroyer-v22.tar.gz worker.py fingerprint.py` → sube a S3 → actualiza
+`latest.tar.gz` → muestra instrucción para activar.
 
-El script hace:
-1. `tar -czf /tmp/destroyer-v16.tar.gz worker.py fingerprint.py`
-2. Sube `destroyer-v16.tar.gz` a S3
-3. Actualiza `latest.tar.gz` en S3
-4. Muestra instrucción para activarla
+**Activar:** editar `/opt/destroyer/.env` → `DESTROYER_RELEASE=destroyer-v22`. La próxima corrida
+(EventBridge horario o invocación manual de la Lambda) usa el nuevo código.
 
-**Activar la release:**
-```bash
-# Editar /opt/destroyer/.env
-DESTROYER_RELEASE=destroyer-v16
-```
-
-El próximo cron del Destroyer (o lanzamiento manual) usará la nueva release.
+**Rollback:** `DESTROYER_RELEASE=destroyer-v21` en `.env`. Instantáneo, sin recrear AMI.
 
 ---
 
-## Rollback
-
-```bash
-# Volver a la versión anterior:
-# Editar /opt/destroyer/.env
-DESTROYER_RELEASE=destroyer-v15
-```
-
-Instantáneo. No requiere recrear snapshots ni reiniciar servicios.
-
----
-
-## Auditoría por run
-
-La tabla `destroyer_runs` tiene la columna `release_version`:
-
-```sql
-SELECT id, status, files_done, total_detections, release_version, t2_started
-FROM destroyer_runs
-ORDER BY id DESC
-LIMIT 10;
-```
-
-Ejemplo de resultado:
-```
-id | status | files_done | total_detections | release_version  | t2_started
-27 | destroyed |   199    |      24          | destroyer-v13    | 2026-06-14 01:32
-24 | timeout   |    93    |       0          | destroyer-v10    | 2026-06-13 18:34
-```
-
-Los runs anteriores a esta migración tienen `release_version = NULL` (usaban código baked en snapshot).
-
----
-
-## Cuándo recrear el snapshot
+## Cuándo recrear el AMI base
 
 Solo cuando cambien **dependencias del sistema**, no el código:
 
-| Cambio | ¿Nuevo snapshot? |
+| Cambio | ¿Nuevo AMI? |
 |---|---|
-| Fix en `worker.py` o `fingerprint.py` | ❌ Solo `./release.sh vX` |
+| Fix en `worker.py` / `fingerprint.py` | ❌ Solo `./release.sh vX` |
 | Nueva librería Python en el venv | ✅ Sí |
-| Actualización de ffmpeg | ✅ Sí |
-| Cambio de versión de Python | ✅ Sí |
+| Actualización de ffmpeg / Python | ✅ Sí |
 | Nuevo archivo `.py` en el Destroyer | ❌ Solo `./release.sh vX` (agregar al tar.gz) |
 
-### Proceso para nuevo snapshot base
-
-```bash
-# 1. Hacer los cambios de sistema en el droplet base o en mediaDEV
-# 2. Crear snapshot desde DO dashboard o API
-# 3. Actualizar /opt/destroyer/.env:
-SNAPSHOT_ID=232XXXXXX
-```
+**Proceso para nuevo AMI** (así se horneó pydub en el v3): instancia plana desde el AMI previo →
+instalar la dependencia por SSH → verificar import + ffmpeg → `aws ec2 create-image` →
+`update_function_configuration` de la Lambda `destroyer-launcher` con el nuevo `DESTROYER_AMI_ID`.
 
 ---
 
 ## Variables de entorno relevantes
 
-En `/opt/destroyer/.env`:
-
+En `/opt/destroyer/.env` (NO en git):
 ```bash
-SNAPSHOT_ID=232701378            # ID del snapshot base en DigitalOcean
-DESTROYER_RELEASE=destroyer-v16  # Release del código a descargar desde S3
-DESTROYER_WORKERS=32             # Número de workers paralelos (default: 32)
-DESTROYER_SCAN_FILE_TIMEOUT=300  # Cap por archivo "veneno"
-DESTROYER_WTA_WINDOW_SEC=8       # Ventana cross-ad para WTA
+DESTROYER_AMI_ID=ami-065708bbb25ab56ad   # AMI base AWS (reemplazó SNAPSHOT_ID de DO)
+DESTROYER_RELEASE=destroyer-v22          # release del código a descargar de S3
+DESTROYER_WORKERS=32                       # workers paralelos
+DESTROYER_SCAN_FILE_TIMEOUT=300            # cap por archivo "veneno"
+DESTROYER_WTA_WINDOW_SEC=8                 # ventana cross-ad para Winner Takes All
+DESTROYER_HOURLY_USD=0.25                  # fallback costo spot
+# AWS_*, TG_*, S3_BUCKET, PG_*  → credenciales (ver INVENTORY.md)
 ```
+
+---
+
+## Auditoría por run
+
+`destroyer_runs.release_version` registra qué código corrió:
+```sql
+SELECT id, status, files_done, total_detections, release_version, t2_started
+FROM destroyer_runs ORDER BY id DESC LIMIT 10;
+```
+Runs pre-migración tienen `release_version = NULL` (código baked en snapshot).
 
 ---
 
@@ -177,34 +122,32 @@ DESTROYER_WTA_WINDOW_SEC=8       # Ventana cross-ad para WTA
 
 | Release | Fecha | Cambios |
 |---|---|---|
-| `destroyer-v10` | 13 jun 2026 | Primera release S3. Incluye fix libx264 ultrafast para clips TV + migración UTC (pipeline_version=utc_v2) |
-| `destroyer-v11` | 13 jun 2026 | Launcher con releases S3 en producción. |
-| `destroyer-v14` | 14 jun 2026 | `fingerprint.py` colapsa offsets vecinos, `worker.py` aplica dedup por ventana real y Winner Takes All, sube debug logs a S3 y usa timeout por archivo configurable. |
-| `destroyer-v15` | 14 jun 2026 | Inserción idempotente en DB con `ON CONFLICT DO NOTHING`, evita generar clips/Telegram en duplicados exactos y acompaña la migración de deduplicación en `fingerprint_detections`. Introdujo una regresión en el loop del pool: el timeout empezó a contarse desde `submitted_at`, incluyendo espera en cola. |
-| `destroyer-v16` | 14 jun 2026 | Hotfix del incidente `Destroyer0000`/run `28`: vuelve el timeout efectivo por `ar.get(timeout=...)` y restaura el default a `300s`, evitando que archivos queued expiren antes de ejecutarse. Release activa actual. |
+| `destroyer-v10` | 13 jun 2026 | Primera release S3 (DO). Fix libx264 ultrafast para clips TV + migración UTC (`utc_v2`). |
+| `destroyer-v11` | 13 jun 2026 | Launcher con releases S3 en producción (DO). |
+| `destroyer-v14` | 14 jun 2026 | `fingerprint.py` colapsa offsets vecinos; `worker.py` dedup por ventana real + Winner Takes All; debug logs a S3; timeout por archivo configurable. |
+| `destroyer-v15` | 14 jun 2026 | Idempotencia DB (`ON CONFLICT DO NOTHING`); no genera clip/Telegram en duplicados. Regresión: timeout desde `submitted_at` (incluía espera en cola). |
+| `destroyer-v16` | 14 jun 2026 | Hotfix run 28: timeout efectivo por `ar.get(timeout=...)`, default `300s`. Última release en DigitalOcean. |
+| `destroyer-v20` | 14 jun 2026 | Primera sobre **EC2/AWS**: `DO_TOKEN` opcional, `get_droplet_id()` usa metadata EC2, `self_destruct()` salta API DO. |
+| `destroyer-v21` | 14 jun 2026 | Costo real spot (`describe_spot_price_history`); Telegram "💸 Costo de este deploy" ($/run, $/hr). |
+| `destroyer-v22` | 14 jun 2026 | **Release activa.** Fix cosmético del nombre del clip (`name_stem`=filename real en vez del tmp). |
 
 ---
 
 ## Incidente Destroyer0000 / run 28 (14 jun 2026)
 
-**Síntoma:** run `28` (`Destroyer0000`) quedó en `timeout` con `18/48` archivos procesados, `18` en `error` (`scan timeout 240s`) y `30` atascados en `scanning`.
+**Síntoma:** run `28` quedó en `timeout` con `18/48` archivos procesados, `18` en `error` (`scan timeout 240s`) y `30` atascados en `scanning`.
 
-**Causa raíz:** `destroyer-v15` cambió el pool para medir timeout desde `submitted_at` en vez de desde la espera real del resultado. Con `48` archivos y `28` workers, varios archivos acumulaban tiempo mientras solo esperaban turno en cola. Eso produjo timeouts falsos. Tras varios recreados del pool, la corrida quedó viva pero sin más heartbeats.
+**Causa raíz:** `destroyer-v15` midió el timeout desde `submitted_at` (entrada al pool) en vez de desde la espera real. Con `48` archivos y `28` workers, archivos en cola acumulaban tiempo sin ejecutarse → timeouts falsos.
 
-**Corrección aplicada:** se publicó `destroyer-v16`, se activó en `mediaAPP`, se dejó explícito `DESTROYER_SCAN_FILE_TIMEOUT=300` y se resetearon `30` rows de `s3_scan_log` de `scanning` a `pending`. El `run 28` quedó corregido en DB con `files_error=18`.
+**Corrección:** `destroyer-v16` (vuelve `ar.get(timeout=...)`, default `300s`); se resetearon `30` rows de `s3_scan_log` de `scanning` a `pending`; `run 28` corregido con `files_error=18`.
 
 ---
 
 ## Migración de deduplicación en DB (14 jun 2026)
 
-Se aplicó la migración `fingerprint_detection_dedup_migration.sql` desde `mediaDEV` contra la DB privada de DO Managed PostgreSQL.
-
-Resultado verificado:
-- `58` grupos duplicados activos detectados antes de migrar
-- `95` filas extra desactivadas por soft-delete
-- `0` grupos duplicados activos después de migrar
-- Índice creado:
-
+Aplicada contra la DB privada de DO Managed PostgreSQL. Resultado verificado: `58` grupos
+duplicados detectados, `95` filas desactivadas por soft-delete, `0` duplicados activos después.
+Índice creado:
 ```sql
 CREATE UNIQUE INDEX ux_fingerprint_detections_source_match_active
 ON fingerprint_detections (tenant_id, campaign_id, ad_id, stream_id, s3_key, ts_seconds)
@@ -216,17 +159,15 @@ WHERE deleted_at IS NULL;
 ## Verificar que una release existe en S3
 
 ```bash
-cd /opt/destroyer
-set -a && source .env && set +a
+cd /opt/destroyer && set -a && source .env && set +a
 /opt/destroyer/venv/bin/python3 -c "
 import boto3, os
 s3 = boto3.client('s3', region_name='us-east-1')
-r = s3.list_objects_v2(Bucket=os.environ['S3_BUCKET'], Prefix='destroyer/releases/')
-for o in r.get('Contents', []):
+for o in s3.list_objects_v2(Bucket=os.environ['S3_BUCKET'], Prefix='destroyer/releases/').get('Contents', []):
     print(o['Key'], f\"{o['Size']/1024:.1f}KB\")
 "
 ```
 
 ---
 
-*Sistema: Destroyer / mediaAPP · Servidor: 137.184.53.234 · Actualizado: 14 junio 2026*
+*Sistema: Destroyer / AWS EC2 Spot (us-east-1) · Lanzado desde Lambda en cuenta 050871635829 · Actualizado: 15 junio 2026*

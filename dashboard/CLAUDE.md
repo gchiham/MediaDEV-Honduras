@@ -1,7 +1,13 @@
 # Dashboard — CLAUDE.md
 
-## Propósito
-Aplicación Flask que sirve el dashboard de salud y la API JSON. Lee de **PostgreSQL
+> ⚠️ **REFERENCIA HISTÓRICA — este dashboard NO corre.** `dashboard_v4.py` fue eliminado del
+> servicio el 14 jun 2026; `dashboard_mediadev.service` está **inactivo** y sus endpoints
+> `/api/*` ya no responden. El código sigue en `dashboard/` solo como referencia. El producto
+> y su API viven en **mediaAPP** (`media-app`, FastAPI, repo `gchiham/media-app`). Lo de abajo
+> describe cómo funcionaba el dashboard de captura.
+
+## Propósito (histórico)
+Aplicación Flask que servía el dashboard de salud y la API JSON. Lee de **PostgreSQL
 (media-db)** vía psycopg2. Gunicorn con 1 worker (constraint 2 vCPU) detrás de nginx en :80.
 
 ## Archivos clave

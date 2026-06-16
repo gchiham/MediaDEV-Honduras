@@ -1,7 +1,7 @@
 # Scripts de Stream — CLAUDE.md
 
 ## Propósito
-La captura de los 12 streams la hace un **runner unificado** `stream_run.sh <stream_id>`,
+La captura de los 13 streams la hace un **runner unificado** `stream_run.sh <stream_id>`,
 gestionado por supervisord (un `[program:stream_{id}]` por estación, todos invocan el runner).
 Captura el stream origen y lo recodifica a HLS: audio para radios, video preservado para TV.
 
@@ -23,10 +23,13 @@ Lee `url`, `type` y `route` de `config/stations.json` y resuelve tres ejes:
 > muchos Icecast ignoran `-r` y mandan stream continuo → el range daba falsos negativos.
 
 ## route por estación (config/stations.json)
-- `gateway` (7): las de `ice42.securenetsystems.net` (geo-bloqueadas) — fm_941, suave_fm,
-  radio_satelite, radio_choluteca, xy_hrn, xy_sps, xy_tgu.
-- `auto` (5): radio_america, radio_globo, radio_el_patio, hch_tv, teleceiba — van directo
+- `gateway` (8): geo-bloqueadas (`ice42.securenetsystems.net`) o sin throughput directo —
+  xy_hrn, xy_tgu, xy_sps, radio_satelite, fm_941, suave_fm, radio_choluteca, **teleceiba**.
+- `auto` (5): radio_america, radio_globo, radio_el_patio, hch_tv, canal_11 — van directo
   mientras puedan, con fallback automático a gateway.
+
+> `teleceiba` pasó a `gateway` fijo (su origen no entregaba throughput de segmentos por la
+> ruta directa). Los 3 TV son hch_tv, teleceiba y canal_11.
 
 ## Parámetros ffmpeg
 ```bash
@@ -63,13 +66,13 @@ No se crea ningún script nuevo — el runner es compartido.
 
 ## Supervisord
 ```bash
-supervisorctl status                      # 12 streams
+supervisorctl status                      # 13 streams
 supervisorctl restart all
 supervisorctl tail stream_fm_941 stdout   # ver decisión de routing (use_gateway=...)
 # Config: /etc/supervisor/conf.d/mediadev_streams.conf
 ```
 
 ## Pitfalls
-- NO poner `-vn` en hch_tv/teleceiba — perdería el video que necesita Destroyer.
+- NO poner `-vn` en los TV (hch_tv/teleceiba/canal_11) — perdería el video que necesita Destroyer.
 - `route=auto` agrega ~5s al arranque (el probe espera respuesta). Es aceptable.
 - Si la fuente está caída, el Circuit Breaker (stream-daemon) la deshabilita tras 5 fallos.

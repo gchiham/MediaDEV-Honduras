@@ -1,7 +1,12 @@
 # MediaDEV — Stream Relay Stack
 ## Guía de Operación para Desarrolladores
 
-**Versión:** 2.0 | **Actualizado:** 2026-06-11
+**Versión:** 3.0 | **Actualizado:** 2026-06-15
+
+> **Topología — 2 nodos (split 14 jun 2026):** esta guía cubre **mediaCAP** (`159.223.104.91`),
+> el nodo de **captura**. El producto SaaS + evidence portal (`media-app`) y la orquestación del
+> **Destroyer** (ahora en **AWS**: EventBridge + Lambda + EC2 Spot) viven en **mediaAPP**
+> (`137.184.53.234`). Ver `live_mediaDEV.md` para el ecosistema completo.
 
 ---
 
@@ -10,7 +15,7 @@
 1. [Arquitectura del sistema](#1-arquitectura-del-sistema)
 2. [Acceso a los servidores](#2-acceso-a-los-servidores)
 3. [Cómo escuchar / reproducir un stream](#3-cómo-escuchar--reproducir-un-stream)
-4. [API REST](#4-api-rest)
+4. [API y dashboards](#4-api-y-dashboards)
 5. [Estructura de archivos](#5-estructura-de-archivos)
 6. [Cómo agregar una nueva radio o TV](#6-cómo-agregar-una-nueva-radio-o-tv)
 7. [Cómo eliminar o deshabilitar una estación](#7-cómo-eliminar-o-deshabilitar-una-estación)
@@ -30,21 +35,28 @@
               | HTTP/HTTPS (geobloqueado para radios)
               v
 [Gateways Honduras — RPi / PC con IP residencial]
-  hn01 10.101.0.2 · hn02 10.101.0.5 (activo) · hn03 10.101.0.6
+  hn01 10.101.0.2 · hn02 10.101.0.5 · hn03 10.101.0.6
   microsocks : <ip>:1080 (SOCKS5) + agente heartbeat
               |
               | WireGuard VPN wg0 (cifrado)
               v
-[MediaDEV — DigitalOcean — 159.223.104.91 — 2 vCPU / 4 GB]
+[mediaCAP — DigitalOcean — 159.223.104.91 — 2 vCPU / 4 GB]
   privoxy        127.0.0.1:3128   HTTP proxy → SOCKS5
-  12x ffmpeg     /var/www/streams/{id}/  (HLS; radio audio, TV video)
-  supervisord    auto-restart de los 12 procesos ffmpeg
+  13x ffmpeg     /var/www/streams/{id}/  (HLS; radio audio, TV video)
+  supervisord    auto-restart de los 13 procesos ffmpeg
   stream-daemon  health + grabación MP3 + espejo de estado a PostgreSQL
   gateway-api +  recibe heartbeats, calcula health score, failover automático
    health-engine
   video-uploader segmentos .ts de TV → S3 (insumo de Destroyer)
-  nginx :80      dashboard, catálogo /estaciones/, HLS /streams/
-  PostgreSQL     media-db (DO Managed) — estado, métricas, catálogo, detecciones
+  mediadev-monitor  vigila WireGuard, alertas Telegram
+  nginx :80      HLS /streams/, catálogo /estaciones/
+  MCP            observabilidad para Claude Code (vía SSH)
+              |
+              | VPC privada nyc1 + DB privada
+              v
+[mediaAPP — 137.184.53.234 — 2 vCPU / 2 GB]   media-app (SaaS + evidence portal) · chihambot · MCP
+[AWS us-east-1]                                Destroyer: EventBridge → Lambda → EC2 Spot c5.4xlarge
+[PostgreSQL media-db — DO Managed]            estado, métricas, catálogo, detecciones (compartida)
 ```
 
 ### Por qué esta arquitectura
@@ -55,33 +67,34 @@
 | ffmpeg no soporta SOCKS5+HTTPS con cabeceras Icecast | curl pipe (ice42) o privoxy (HTTP→SOCKS5) |
 | Un gateway puede caer | 3 gateways + failover automático (health-engine) |
 | Streams que se cortan | supervisord reinicia ffmpeg; Circuit Breaker evita storms |
-| Auditoría y detección de anuncios | segmentos persisten 8h; video de TV se archiva en S3 |
-| Estado consultable sin exponer el servidor | dashboard + API REST en nginx :80 |
+| Auditoría y detección de anuncios | segmentos persisten ~8h; video de TV se archiva en S3 |
+| mediaCAP debe quedar liviano (2 vCPU) | el producto y el Destroyer (cómputo pesado) corren fuera del nodo de captura |
 
 ---
 
 ## 2. Acceso a los servidores
 
-### MediaDEV (servidor principal)
 ```bash
+# mediaCAP (captura)
 ssh -i ~/.ssh/keySED root@159.223.104.91
+# mediaAPP (app/control)
+ssh -i ~/.ssh/keySED root@137.184.53.234
 # Windows: C:\Users\Sedesol\.ssh\keySED
 ```
 
-### Gateways Honduras
-Definidos en `config/stations.json`. El acceso varía por nodo (RPi vía SSH local, etc.).
-El gateway **activo** está en `/etc/mediadev/gateway.conf` y se cambia con `gateway_switch.sh`.
+Gateways Honduras: definidos en `config/stations.json`. El gateway **activo** está en
+`/etc/mediadev/gateway.conf` y se cambia con `gateway_switch.sh`.
 
 ---
 
 ## 3. Cómo escuchar / reproducir un stream
 
-Todos los streams están disponibles como **HLS en vivo** en:
+Todos los streams están disponibles como **HLS en vivo** en mediaCAP:
 ```
 http://159.223.104.91/streams/{id}/index.m3u8
 ```
 
-### Streams disponibles (12)
+### Streams disponibles (13: 10 radio + 3 TV)
 
 | ID | Nombre | Tipo |
 |---|---|---|
@@ -97,64 +110,50 @@ http://159.223.104.91/streams/{id}/index.m3u8
 | `xy_tgu` | XY TGU | Radio |
 | `hch_tv` | HCH TV | TV (video) |
 | `teleceiba` | Teleceiba | TV (video) |
+| `canal_11` | Canal 11 | TV (video) |
 
 ### Reproducir
 ```bash
-vlc   http://159.223.104.91/streams/xy_hrn/index.m3u8
+vlc    http://159.223.104.91/streams/xy_hrn/index.m3u8
 ffplay http://159.223.104.91/streams/hch_tv/index.m3u8
-# Grabar 60s:
-ffmpeg -i http://159.223.104.91/streams/fm_941/index.m3u8 -t 60 -c copy salida.mp3
+ffmpeg -i http://159.223.104.91/streams/fm_941/index.m3u8 -t 60 -c copy salida.mp3   # grabar 60s
 ```
-
-### Dashboards web
-- `http://159.223.104.91/` — panel de salud (KPIs + 12 streams).
-- `http://159.223.104.91/estaciones/` — catálogo de 195 estaciones con reproductor.
 
 ---
 
-## 4. API REST
+## 4. API y dashboards
 
-Endpoints JSON read-only servidos por `dashboard_v4.py` (nginx :80). Sin autenticación.
+> **El dashboard viejo (`dashboard_v4.py`) fue eliminado** (14 jun 2026). El servicio
+> `dashboard_mediadev` existe pero está **inactivo**; sus endpoints `/api/*` read-only en
+> mediaCAP **ya no corren**. El código sigue en `dashboard/` solo como referencia histórica.
 
-| Endpoint | Descripción |
-|---|---|
-| `GET /api/summary` | KPIs globales (streams en vivo, catálogo, detecciones hoy/total) |
-| `GET /api/streams` (=`/api/status`) | Estado de salud en vivo de los 12 streams |
-| `GET /api/stations` | Catálogo. Filtros `?status=active\|inactive`, `?type=radio\|tv` |
-| `GET /api/detections` | Detecciones de anuncios recientes (`?limit=N`, máx 500) |
+- **Producto / API del cliente:** corre en **mediaAPP** (`media-app`, FastAPI) — repo `gchiham/media-app`. Auth JWT, CRUD de anunciantes/campañas/ads, evidence portal.
+- **HLS en vivo:** `http://159.223.104.91/streams/{id}/index.m3u8` (nginx, sigue activo).
+- **Observabilidad de captura:** vía MCP (`mcp/server.py`, 17 tools) desde Claude Code, no por HTTP.
 
-```bash
-curl http://159.223.104.91/api/summary
-curl 'http://159.223.104.91/api/stations?type=tv'
-curl 'http://159.223.104.91/api/detections?limit=20'
-```
-
-Campos de `/api/streams`: `status` (OK/STALE/NO_M3U8/DISABLED), `sup` (estado supervisord),
-`segs` (segmentos .ts activos), `age` (seg desde última actualización del m3u8, debe ser < 60),
-`cb_state` (CLOSED/OPEN), `restart_today`.
+Para estado de los streams sin HTTP: `supervisorctl status`, `journalctl -u stream-daemon`, o el
+MCP (`get_system_status`, `get_workers`, `get_service_health`).
 
 ---
 
 ## 5. Estructura de archivos
 
 ```
-/opt/media-ai/
+/opt/media-ai/                    ← repo git gchiham/MediaDEV-Honduras (working tree real)
 ├── config/stations.json          ← Estaciones activas + definición de gateways
 ├── daemon/stream_daemon.py       ← Health + grabación MP3 + espejo a PostgreSQL
-├── dashboard/dashboard_v4.py     ← Dashboard web + API JSON (lee de PostgreSQL)
+├── dashboard/dashboard_v4.py     ← referencia histórica (NO corre)
 ├── monitor/monitor.py            ← Monitoreo WireGuard + alertas Telegram
+├── mcp/server.py                 ← MCP de observabilidad (17 tools)
 └── scripts/
-    ├── stream_run.sh            ← Runner unificado (lee url/type/route de stations.json)
+    ├── stream_run.sh             ← Runner unificado (lee url/type/route de stations.json)
     ├── video_segment_uploader.py ← TV .ts → S3
-    ├── gateway_switch.sh         ← Cambia el gateway activo
-    └── gateway_watchdog.py       ← Watchdog del gateway (cron cada minuto)
+    └── gateway_switch.sh         ← Cambia el gateway activo
 
 /var/www/streams/{id}/
 ├── index.m3u8                    ← Playlist HLS activa (nginx la sirve)
-├── seg_NNNNN.ts                  ← Segmentos de 4s (se acumulan 8h para auditoría)
-└── recordings/YYYY-MM-DD_HHh.mp3 ← Grabación horaria de audio (GMT-6)
-
-/var/www/html/estaciones/index.html  ← Dashboard de catálogo
+├── seg_NNNNN.ts                  ← Segmentos de 4s (se acumulan ~8h para auditoría)
+└── recordings/YYYY-MM-DD_HHh.mp3 ← Grabación horaria de audio
 
 /etc/
 ├── wireguard/wg0.conf            ← Túnel VPN a los gateways
@@ -163,12 +162,13 @@ Campos de `/api/streams`: `status` (OK/STALE/NO_M3U8/DISABLED), `sup` (estado su
 ├── mediadev-db.env               ← Credenciales PostgreSQL (chmod 600)
 ├── privoxy/config                ← HTTP proxy → SOCKS5
 ├── nginx/sites-enabled/default   ← Config nginx :80
-└── supervisor/conf.d/            ← Config de los 12 procesos ffmpeg
+└── supervisor/conf.d/            ← Config de los 13 procesos ffmpeg
 ```
 
-> **Persistencia:** ya no se usa SQLite. El estado vive en PostgreSQL (media-db).
-> **Segmentos:** se acumulan ~8h (no se borran por ffmpeg) para auditoría y para el
-> uploader de video; el daemon los limpia en el cleanup de 30 min.
+> **Persistencia:** ya no se usa SQLite; el estado vive en PostgreSQL (media-db).
+> **Segmentos:** se acumulan ~8h para auditoría y para el uploader de video; un cron
+> (`*/30`) limpia los `.ts` de radio con más de 120 min (los de TV los conserva más para el uploader).
+> **Config operativa** (systemd, supervisor, nginx, wireguard) versionada en `gchiham/mediadev-infra`.
 
 ---
 
@@ -178,7 +178,6 @@ Campos de `/api/streams`: `status` (OK/STALE/NO_M3U8/DISABLED), `sup` (estado su
 ```bash
 source /etc/mediadev/gateway.conf   # carga GW_SOCKS5 del gateway activo
 curl -I --max-time 10 --socks5-hostname $GW_SOCKS5 https://URL_DEL_STREAM
-# Grabar 10s de prueba:
 curl -s --max-time 15 --socks5-hostname $GW_SOCKS5 https://URL_DEL_STREAM \
   | ffmpeg -i pipe:0 -t 10 -c copy /tmp/test.ts && ls -lh /tmp/test.ts
 ```
@@ -195,18 +194,16 @@ curl -s --max-time 15 --socks5-hostname $GW_SOCKS5 https://URL_DEL_STREAM \
   "enabled": true
 }
 ```
-Campos clave:
 - `"type"`: `radio` (audio) o `tv` (video).
-- `"route"`: cómo sale el stream — lo aplica el **runner unificado** (`stream_run.sh`):
+- `"route"`: lo aplica el runner unificado (`stream_run.sh`):
   | valor | comportamiento |
   |---|---|
-  | `auto` | prueba directo; si falla usa gateway. **Recomendado** — re-evalúa en cada arranque, así que si bloquean la fuente, cae solo al gateway |
-  | `gateway` | siempre por gateway (úsalo para fuentes geo-bloqueadas fijas como `ice42.securenetsystems.net`) |
+  | `auto` | prueba directo; si falla usa gateway. **Recomendado** — re-evalúa en cada arranque |
+  | `gateway` | siempre por gateway (fuentes geo-bloqueadas fijas como `ice42.securenetsystems.net`) |
   | `direct` | siempre directo (sin gateway, sin fallback) |
 
-> No hay que crear un script por estación: el **runner único** `stream_run.sh` lee la URL,
-> el tipo y el route desde `stations.json` y decide captura (curl-pipe para Icecast, ffmpeg
-> para el resto), transporte (directo/gateway) y salida (audio/video) automáticamente.
+> No hay un script por estación: el runner único `stream_run.sh` lee URL, tipo y route de
+> `stations.json` y decide captura (curl-pipe para Icecast, ffmpeg para el resto), transporte y salida.
 
 ### Paso 3 — Registrar en supervisord
 ```bash
@@ -229,11 +226,12 @@ CONF
 ```bash
 supervisorctl reread && supervisorctl update
 supervisorctl status stream_nueva_radio
-# Ver qué transporte eligió (directo o gateway):
-supervisorctl tail stream_nueva_radio stdout | grep use_gateway
 sleep 20
 curl -s http://localhost/streams/nueva_radio/index.m3u8 | head -5
 ```
+
+> Atajo: el MCP expone `add_stream(...)` que hace los 3 pasos (stations.json + supervisor + daemon).
+> Si agregás un canal de TV, recordá excluir sus segmentos del cron de limpieza si querés retención larga.
 
 ---
 
@@ -249,7 +247,6 @@ nano /etc/supervisor/conf.d/mediadev_streams.conf   # borrar bloque [program:str
 supervisorctl reread && supervisorctl update
 rm -rf /var/www/streams/{id}/
 nano /opt/media-ai/config/stations.json             # quitar la entrada
-# (no hay script por estación que borrar — el runner es compartido)
 ```
 
 ---
@@ -257,12 +254,11 @@ nano /opt/media-ai/config/stations.json             # quitar la entrada
 ## 8. Operación diaria — comandos esenciales
 
 ```bash
-supervisorctl status                       # estado de los 12 streams
+supervisorctl status                       # estado de los 13 streams
 supervisorctl restart stream_xy_hrn        # reiniciar uno
 supervisorctl restart all                  # reiniciar todos
 tail -f /var/log/streams/xy_hrn.err        # errores de una estación
 journalctl -u stream-daemon -f             # health checks, CB, grabaciones
-curl http://localhost/api/streams          # estado JSON en vivo
 
 # Segmentos y espacio:
 for d in /var/www/streams/*/; do echo "$(basename $d): $(ls $d*.ts 2>/dev/null|wc -l) segs"; done
@@ -295,9 +291,13 @@ Gateways (en `config/stations.json`):
 
 | ID | VPN IP | Rol |
 |---|---|---|
-| `hn01` | 10.101.0.2 | failover-1 (RPi Honduras 01) |
-| `hn02` | 10.101.0.5 | **primary** (PC-LCE) |
-| `hn03` | 10.101.0.6 | failover-2 (RPi-Levi) |
+| `hn01` | 10.101.0.2 | failover (RPi Honduras 01) |
+| `hn02` | 10.101.0.5 | PC-LCE |
+| `hn03` | 10.101.0.6 | failover (RPi-Levi) |
+
+> El health check del failover mide alcanzabilidad del m3u8, **no throughput de segmentos** — un
+> gateway puede pasar el m3u8 (texto) pero no los `.ts` (video pesado). Si TV no graba pero el m3u8
+> responde, sospechá throughput del gateway (ver el caso Teleceiba en el historial).
 
 ---
 
@@ -309,7 +309,7 @@ tail -20 /var/log/streams/{id}.err
 source /etc/mediadev/gateway.conf
 curl -I --max-time 10 --socks5-hostname $GW_SOCKS5 URL_DEL_STREAM
 supervisorctl restart stream_{id}
-# El stream-daemon también reinicia automáticamente tras varios fallos (Circuit Breaker).
+# El stream-daemon también reinicia tras varios fallos (Circuit Breaker, con ventana de gracia 35s).
 ```
 
 ### Todos los streams caen al mismo tiempo
@@ -317,14 +317,13 @@ Casi siempre es el gateway / WireGuard:
 ```bash
 wg show wg0
 curl -s --proxy http://127.0.0.1:3128 https://api.ipify.org   # ¿sale por Honduras?
-# El health_engine debería hacer failover solo. Forzar si hace falta:
 sudo /opt/media-ai/scripts/gateway_switch.sh <otro_gateway>
 ```
 
 ### Circuit Breaker abierto (stream DISABLED)
 ```bash
 # Espera 30 min (reset automático) o resetea en PG:
-#   UPDATE mediadev_stream_status SET cb_state='CLOSED', cb_fails=0;
+#   UPDATE mediadev_stream_status SET cb_state='CLOSED', cb_fails=0 WHERE stream_id='{id}';
 ```
 
 ### nginx 404 en un stream
@@ -333,83 +332,78 @@ ls /var/www/streams/{id}/        # ¿existe el directorio + index.m3u8?
 nginx -t && systemctl reload nginx
 ```
 
-### El dashboard da error
-```bash
-journalctl -u dashboard-mediadev -n 50
-# Verificar que /etc/mediadev-db.env tiene las credenciales PG y que media-db responde.
-```
-
 ---
 
-## 11. Reinicio completo del stack
+## 11. Reinicio completo del stack (mediaCAP)
 
 ```bash
-# Todos los servicios tienen systemctl enable. Orden manual si hace falta:
 systemctl start wg-quick@wg0           # 1. VPN
 systemctl start privoxy                # 2. Bridge HTTP→SOCKS5
-systemctl start supervisor             # 3. 12x ffmpeg
+systemctl start supervisor             # 3. 13x ffmpeg
 systemctl start stream-daemon          # 4. Daemon
 systemctl start mediadev-gateway-api   # 5. API heartbeats
 systemctl start mediadev-health-engine # 6. Failover
 systemctl start mediadev-monitor       # 7. Monitoreo WireGuard
 systemctl start video-segment-uploader # 8. Uploader TV→S3
-systemctl start dashboard-mediadev     # 9. Dashboard
-systemctl start nginx                  # 10. Reverse proxy
+systemctl start nginx                  # 9. Reverse proxy / HLS
 
 # Verificar:
 supervisorctl status
-systemctl is-active stream-daemon dashboard-mediadev nginx mediadev-health-engine
-curl http://localhost/api/summary
+systemctl is-active stream-daemon nginx mediadev-health-engine
 ```
+
+> `dashboard_mediadev` NO se arranca (está inactivo a propósito). El producto corre en mediaAPP
+> (`systemctl status media-app` en `137.184.53.234`).
 
 ---
 
 ## 12. Referencia rápida
 
-### Puertos
+### Puertos (mediaCAP)
 | Puerto | Servicio | Acceso |
 |---|---|---|
-| `80` | nginx — dashboards, API, HLS | Público |
+| `80` | nginx — HLS, catálogo | Público |
 | `3128` | privoxy — HTTP→SOCKS5 | Solo localhost |
-| `9000` | gunicorn — dashboard_v4 (tras nginx) | Solo localhost |
+| `9000` | gunicorn — dashboard_v4 (**inactivo**) | — |
 | `51820/udp` | WireGuard VPN | Solo VPN |
 | `22` | SSH | Administración |
-
-> El puerto `8080` lo usa otro proyecto (media-app), NO los streams.
 
 ### IPs
 | Host | IP Pública | IP VPN | Rol |
 |---|---|---|---|
-| MediaDEV | `159.223.104.91` | `10.101.0.1` | Servidor DigitalOcean (2 vCPU/4GB) |
+| mediaCAP | `159.223.104.91` | `10.101.0.1` | Captura (DO, 2 vCPU/4GB) |
+| mediaAPP | `137.184.53.234` | — | App/control (DO, 2 vCPU/2GB) |
 | Gateway hn01 | residencial HN | `10.101.0.2` | Salida Honduras (failover) |
-| Gateway hn02 | residencial HN | `10.101.0.5` | Salida Honduras (activo) |
+| Gateway hn02 | residencial HN | `10.101.0.5` | Salida Honduras (PC-LCE) |
 | Gateway hn03 | residencial HN | `10.101.0.6` | Salida Honduras (failover) |
 
-### Servicios systemd
+### Servicios systemd (mediaCAP)
 ```bash
 systemctl status stream-daemon mediadev-gateway-api mediadev-health-engine \
-                 mediadev-monitor video-segment-uploader dashboard-mediadev \
-                 nginx privoxy wg-quick@wg0
-supervisorctl status   # 12 procesos ffmpeg
+                 mediadev-monitor video-segment-uploader nginx privoxy wg-quick@wg0
+supervisorctl status   # 13 procesos ffmpeg
 ```
 
-### Cron
+### Cron (mediaCAP)
 ```bash
-* * * * *           gateway_watchdog.py          # vigila el gateway
-0 0,6,12,18 * * *   /opt/destroyer/launcher.py    # Destroyer (detección de anuncios)
+# Único cron operativo — limpieza de segmentos de radio viejos (TV se conserva para el uploader):
+*/30 * * * * find /var/www/streams/ -maxdepth 2 -name "seg_*.ts" \
+  -not -path "*/hch_tv/*" -not -path "*/teleceiba/*" -not -path "*/canal_11/*" -mmin +120 -delete
 ```
+> El Destroyer ya **no** se dispara por cron local — corre en AWS (EventBridge horario). El launcher
+> viejo de DigitalOcean quedó desmantelado (`/opt/destroyer/launcher.py.do-legacy.DISABLED`).
 
 ### Rutas clave
 | Ruta | Descripción |
 |---|---|
 | `/opt/media-ai/config/stations.json` | Estaciones + gateways |
-| `/opt/media-ai/scripts/stream_run.sh` | Runner unificado de streams (todos) |
+| `/opt/media-ai/scripts/stream_run.sh` | Runner unificado de streams |
 | `/etc/mediadev/gateway.conf` | Gateway activo (vía gateway_switch.sh) |
 | `/etc/mediadev-{s3,db}.env` | Credenciales (chmod 600) |
 | `/var/www/streams/{id}/index.m3u8` | Playlist HLS activa |
 | `/var/www/streams/{id}/recordings/` | Grabaciones MP3 horarias |
-| `/etc/supervisor/conf.d/` | Config de supervisord |
+| `/etc/supervisor/conf.d/` | Config de supervisord (13 ffmpeg) |
 
 ---
 
-*MediaDEV — Sistema de monitoreo, grabación y auditoría de medios Honduras 24/7*
+*MediaDEV — Sistema de monitoreo, grabación y auditoría de medios Honduras 24/7 · 2 nodos + Destroyer en AWS*
