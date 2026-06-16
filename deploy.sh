@@ -29,8 +29,12 @@ if echo "$CHANGED" | grep -qE "^(daemon|dashboard|scripts)/"; then
         systemctl restart dashboard-mediadev
     fi
     
-    if echo "$CHANGED" | grep -q "^scripts/"; then
+    if echo "$CHANGED" | grep -q "^scripts/stream_run.sh"; then
         supervisorctl restart all
+    fi
+
+    if echo "$CHANGED" | grep -q "^scripts/video_segment_uploader.py"; then
+        systemctl restart video-segment-uploader
     fi
 fi
 

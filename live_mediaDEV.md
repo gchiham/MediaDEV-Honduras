@@ -1,40 +1,19 @@
 # live_mediaDEV.md — Ecosistema MediaDEV: Referencia Viva
 
-**Última actualización:** 15 junio 2026  
-**Versión del documento:** 2.0  
+**Última actualización:** 16 junio 2026
+**Versión del documento:** 1.4  
 **Servidores:** mediaCAP `159.223.104.91` (captura) · mediaAPP `137.184.53.234` (app/control)  
 **Mantenido por:** equipo MediaDEV — actualizar cada vez que cambie arquitectura, schema, servicios, o decisiones de diseño
 
-> Este documento es la fuente de verdad del ecosistema MediaDEV. Cualquier dev o AI que lo lea debe poder entender el sistema completo sin necesidad de preguntas adicionales. Vive en el repo de GitHub `gchiham/MediaDEV-Honduras`.
-
----
-
-## 0. Versionado en GitHub
-
-Todo el código y la config operativa está espejado en GitHub. **La verdad es lo desplegado
-en los servidores; los repos son el espejo versionado.** Secretos nunca en git.
-
-| Repo | Contenido | Vis. |
-|---|---|---|
-| `gchiham/MediaDEV-Honduras` | mediaCAP `/opt/media-ai` (captura: daemon, scripts, monitor, mcp, dashboard, config) | público |
-| `gchiham/media-app` | mediaAPP `/opt/media-app` (producto SaaS + evidence portal, FastAPI) | privado |
-| `gchiham/destroyer` | `/opt/destroyer` de ambos nodos (`app/`=mediaAPP orquestación, `cap/`=mediaCAP gateway engine) | privado |
-| `gchiham/mediadev-infra` | config operativa (systemd, supervisor, nginx, privoxy, wireguard redactado) + bot + mcp mediaAPP + `INVENTORY.md` | privado |
-
-`mediaCAP:/opt/media-ai` es un working tree git real (pushea con llave SSH autorizada). Los
-otros son espejos: si cambiás algo en producción, hay que re-capturarlo y commitear (clones
-locales en `C:\GusHD\destroyer_sync` y `C:\GusHD\infra_sync`). Mapa servicio→código→repo
-completo en `mediadev-infra/INVENTORY.md`.
+> Este documento es la fuente de verdad del ecosistema MediaDEV. Cualquier dev o AI que lo lea debe poder entender el sistema completo sin necesidad de preguntas adicionales. Vive en el repo de GitHub.
 
 ---
 
 ## 1. Infraestructura
 
-### Topología — 2 nodos DO (split 14 jun 2026) + Destroyer en AWS
+### Topología — 2 nodos (split 14 jun 2026)
 
-El ecosistema de captura/app corre en **2 droplets** DigitalOcean en `nyc1`, **misma VPC**
-(`b9207f9e-dc84-11e8-8650-3cfdfea9f8c8`) → red privada + DB privada entre ellos. La DB managed
-y S3 son compartidos. **El Destroyer ya NO corre en DigitalOcean** — migró a **AWS** (ver §4).
+El ecosistema corre en **2 droplets** DigitalOcean en `nyc1`, **misma VPC** (`b9207f9e-dc84-11e8-8650-3cfdfea9f8c8`) → red privada + DB privada entre ellos. La DB managed y S3 son compartidos.
 
 **mediaCAP** — nodo de CAPTURA (antes "mediaDEV", droplet `575328180`)
 | Campo | Valor |
@@ -42,7 +21,7 @@ y S3 son compartidos. **El Destroyer ya NO corre en DigitalOcean** — migró a 
 | IP pública / privada | `159.223.104.91` / `10.136.0.7` |
 | Tamaño | 2 vCPU / 4 GB · Ubuntu 24.04 |
 | Acceso | `ssh -i ~/.ssh/keySED root@159.223.104.91` |
-| Corre | 13× ffmpeg (supervisord), stream-daemon, video-segment-uploader, wireguard, privoxy, gateway-api, health-engine, mediadev-monitor, MCP (captura) |
+| Corre | 12× ffmpeg (supervisord), stream-daemon, video-segment-uploader, wireguard, privoxy, gateway-api, health-engine, mediadev-monitor, MCP (captura) |
 
 **mediaAPP** — nodo de APP/CONTROL (droplet `577521810`)
 | Campo | Valor |
@@ -50,9 +29,9 @@ y S3 son compartidos. **El Destroyer ya NO corre en DigitalOcean** — migró a 
 | IP pública / privada | `137.184.53.234` / `10.136.0.6` |
 | Tamaño | 2 vCPU / 2 GB · Ubuntu 24.04 |
 | Acceso | `ssh -i ~/.ssh/keySED root@137.184.53.234` |
-| Corre | media-app + nginx (producto SaaS + evidence portal), chihambot (bot Telegram), MCP (app). El código del Destroyer (`launcher.py`/`watchdog.py`) vive en `/opt/destroyer` pero la orquestación corre en AWS, NO por cron local. |
+| Corre | media-app + nginx (producto SaaS + evidence portal), Destroyer launcher + watchdog (cron), MCP (app) |
 
-> **Regla:** mediaCAP solo captura (máximo recurso para grabar); mediaAPP el producto + apps de control. Servicios que leen estado local de captura (ffmpeg, segmentos en disco) se quedan en mediaCAP. `medio-orchestrator` (legacy mvp-medios) y el dashboard viejo (`dashboard_v4.py`) fueron eliminados — `dashboard_mediadev.service` existe pero está **inactivo**, no corre ningún dashboard.
+> **Regla:** mediaCAP solo captura (máximo recurso para grabar); mediaAPP el producto + orquestación. Servicios que leen estado local de captura (ffmpeg, segmentos en disco) se quedan en mediaCAP. El **`worker.py` del Destroyer se edita en mediaAPP** (donde vive el launcher). `medio-orchestrator` (legacy mvp-medios) y el dashboard viejo fueron eliminados.
 
 ### Base de datos — PostgreSQL Managed (DigitalOcean)
 
@@ -83,33 +62,38 @@ psql -h localhost -p 5433 -U destroyer -d destroyer_db
 |---|---|
 | Bucket | `mediadev-recordings` |
 | Región | `us-east-1` |
-| Rutas clave | `{stream_id}/YYYY/MM/*.mp3` (MP3s horarios), `video_segments/` (TS TV, lifecycle 30 días), `clips/` (evidencia), `destroyer/releases/` (código Destroyer) |
-
-> **Lifecycle de `video_segments/`** subido a 30 días (14 jun 2026): el clip de evidencia de
-> VIDEO se arma bajando los `.ts` de S3; con 1 día de retención, reprocesar TV viejo daba
-> `clip=None`. 30 días cubre demos y backfills (~1 mes). Ojo: video pesa, 30d ≈ 30× el storage.
+| Rutas clave | `{stream_id}/YYYY/MM/*.mp3` (MP3s horarios), `video_segments/` (TS TV), `clips/` (evidencia), `destroyer/releases/` (código Destroyer) |
 
 ### VPN y Gateways Honduras
 
 ```
 mediaDEV (nyc1)
     │
-    └── WireGuard VPN (wg0, 10.101.0.1/24)
+    └── WireGuard VPN
          ├── hn01 (gateway Honduras 1)
-         ├── hn02 (gateway Honduras 2 · PC-LCE)
+         ├── hn02 (gateway Honduras 2) ← primary (PC-LCE)
          └── hn03 (gateway Honduras 3)
 ```
 
-- **Fuente de verdad del gateway activo:** `/etc/mediadev/gateway.conf` (cambiar SOLO con `gateway_switch.sh <id>`; los scripts hacen `source`).
-- **Failover:** automático por health score (`health_engine.py`). Ojo: el health check mide alcanzabilidad del m3u8, NO throughput de segmentos.
-- Streams geo-restringidos usan SOCKS5; los de CDN global (streamtheworld, etc.) van directos.
+- **Gateway primario:** PC-LCE vía `hn02`
+- **Failover:** automático si el gateway primario cae
+- **Propósito:** captura de streams de radio/TV hondureños via gateways locales
+
+### Droplet Destroyer (efímero)
+
+| Campo | Valor |
+|---|---|
+| Tipo | DigitalOcean c-16 |
+| CPU | 16 vCPU (CPU-optimized) |
+| Vida útil | efímero — se destruye al terminar la corrida |
+| Snapshot base | ID `232701378` (`destroyer-base-v9`) |
+| Código | descargado desde S3 al arrancar (ver sección 4) |
 
 ---
 
 ## 2. Streams activos
 
-El sistema procesa **13 streams** de radio y TV hondureños (10 radio + 3 TV). Los MP3/TS se
-graban continuamente y se suben a S3.
+El sistema procesa 12 streams de radio y TV hondureños. Los MP3/TS se graban continuamente y se suben a S3.
 
 | ID | Tipo | Descripción |
 |---|---|---|
@@ -125,9 +109,8 @@ graban continuamente y se suben a S3.
 | `radio_choluteca` | Radio | Radio Choluteca |
 | `hch_tv` | TV | HCH TV |
 | `teleceiba` | TV | Teleceiba |
-| `canal_11` | TV | Canal 11 |
 
-**Fuente de verdad operativa:** `/opt/media-ai/config/stations.json` (13 estaciones `enabled=true`).
+**Fuente de verdad operativa:** `/opt/media-ai/config/stations.json` (12 estaciones `enabled=true`).
 
 **Query para ver catálogo activo en DB:**
 ```sql
@@ -137,8 +120,7 @@ WHERE status = 'active'
 ORDER BY type, name;
 ```
 
-Los streams de TV graban audio MP3 horario (para fingerprinting) y segmentos `.ts` de video
-(para el clip de evidencia). El corte de clip de video se hace off-box uniendo los `.ts` de S3.
+Los streams de TV generan clips de video (libx264 ultrafast) además del audio.
 
 ---
 
@@ -171,9 +153,10 @@ tenants      (cliente que paga: agencia, central de medios, radio, TV, gobierno)
 | `advertisements` | Anuncios/cuñas con su fingerprint de referencia |
 | `fingerprint_detections` | Detecciones de audio fingerprinting |
 | `report_public_links` | Links públicos del evidence portal (token + QR) |
-| `stream_catalog` | Catálogo de estaciones (id = slug varchar, ej. `"hch_tv"`) |
+| `stream_catalog` | Catálogo de ~193 estaciones (id = slug varchar, ej. `"hch_tv"`) |
 | `destroyer_runs` | Historial de corridas del Destroyer |
-| `s3_scan_log` | Registro de MP3s/segmentos subidos/escaneados en S3 |
+| `s3_scan_log` | Registro de MP3s/segmentos subidos a S3 |
+| `recording_coverage` | Ledger de cobertura del recorder: duración real, estado de validación/upload y gaps por hora |
 | `gateways`, `stream_assignments` | Red de gateways + asignación stream→gateway |
 | `mediadev_*` | Estado operativo de streams (espejo del stream-daemon) |
 
@@ -214,12 +197,29 @@ active     BOOLEAN
 **`destroyer_runs`:**
 ```sql
 id               SERIAL
-status           TEXT          -- 'deploying'|'running'|'done'|'timeout'|'killed'|'destroyed'
+status           TEXT          -- 'deploying'|'running'|'done'|'timeout'|'destroyed'
 files_done / total_files / total_detections  INTEGER
-release_version  TEXT          -- ej: 'destroyer-v22'
-last_activity    TIMESTAMPTZ   -- heartbeat por archivo (lo usa el watchdog AWS)
+release_version  TEXT          -- ej: 'destroyer-v11'
 t1_deployed / t2_started / t3_completed / t4_destroyed  TIMESTAMPTZ
 ```
+
+**`recording_coverage`:**
+```sql
+stream_id          TEXT
+media_type         TEXT          -- 'audio' | 'video'
+period_start_utc   TIMESTAMPTZ
+period_end_utc     TIMESTAMPTZ
+expected_seconds   INTEGER
+actual_seconds     DOUBLE PRECISION
+s3_key             TEXT
+status             TEXT          -- pending|validated|uploaded|upload_failed|invalid|skipped
+reason             TEXT          -- ej. partial_2840s, insufficient_segments_4
+upload_attempts    INTEGER
+last_error         TEXT
+pipeline_version   TEXT
+```
+
+El recorder escribe esta tabla de forma tolerante: si la tabla aún no existe, los servicios siguen capturando y solo se pierde el ledger hasta aplicar la migración.
 
 ### Queries útiles
 
@@ -248,122 +248,127 @@ FROM fingerprint_detections GROUP BY pipeline_version;
 
 ---
 
-## 4. El Destroyer (AWS — migrado 14 jun 2026)
+## 4. El Destroyer
 
 ### Qué hace
 
-El Destroyer es el motor de detección de audio fingerprinting. Compara los MP3s grabados de
-los streams contra un catálogo de anuncios de referencia. Corre **100% serverless en AWS**,
-independiente de mediaAPP/mediaCAP, en instancias **EC2 Spot c5.4xlarge** (16 vCPU) efímeras.
+El Destroyer es el motor de detección de audio fingerprinting. Compara los MP3s grabados de los streams contra un catálogo de anuncios de referencia. Corre en un droplet c-16 (16 vCPU) para procesar en paralelo rápido.
 
-### Flujo completo (AWS)
+### Flujo completo
 
 ```
-EventBridge Rule `destroyer-hourly`  (cron 15 * * * ? *  → :15 UTC; +15min para que lleguen los archivos a S3)
+Cron (0 0,6,12,18 * * *)
     │
-    └── Lambda `destroyer-launcher` (python3.12, 256MB, timeout 120s)
-         ├── lista S3, registra archivos pending en PG `s3_scan_log`
-         ├── inserta fila en `destroyer_runs` (status='deploying')
-         └── lanza EC2 Spot c5.4xlarge desde AMI destroyer-v3
-              user_data (cloud-init):
-              1. exporta credenciales/env (keys IAM mediadev-s3 horneadas)
-              2. aws s3 cp s3://mediadev-recordings/destroyer/releases/{RELEASE}.tar.gz
-              3. tar -xzf → /opt/destroyer/
-              4. python worker.py   (escanea, detecta, sube clips a S3, escribe detecciones a PG)
-              5. al terminar: la instancia se auto-termina (aws ec2 terminate-instances)
+    └── launcher.py (en mediaDEV)
+         │  Lee .env: SNAPSHOT_ID, DESTROYER_RELEASE, DESTROYER_WORKERS
+         │
+         ├── Crea droplet c-16 desde snapshot base (ID: 232701378)
+         │
+         ├── Inserta fila en destroyer_runs (status='deploying')
+         │
+         └── cloud-init ejecuta en el droplet:
+              1. Exporta todas las credenciales/env vars
+              2. aws s3 cp s3://mediadev-recordings/destroyer/releases/{DESTROYER_RELEASE}.tar.gz /tmp/release.tar.gz
+              3. tar -xzf /tmp/release.tar.gz -C /opt/destroyer/
+              4. python worker.py
+              5. Al terminar: droplet se auto-destruye
 ```
 
-Boot ~53-96s + scan ~30s. Cron horario ≈ **$6.6/mes** (spot c5.4xlarge ~$0.24/hr).
+El Destroyer toma ~70-90s para provisionar (DigitalOcean) + <1s para descargar el código de S3.
 
-### Watchdog (AWS)
+### Watchdog
 
-`Lambda destroyer-watchdog` + EventBridge `destroyer-watchdog-10min` (`rate(10 minutes)`).
-Mata instancias `Role=destroyer` **por falta de progreso, no por edad fija** — observa
-`destroyer_runs.last_activity` (heartbeat por archivo):
-- stall 25 min (running/completing), boot grace 15 min (sin heartbeat aún), hard cap 90 min (240 en backfills grandes), + huérfanas sin run o `status=destroyed` pero vivas.
-- Al matar: `terminate-instances` + run→`killed` + re-encola `scanning`→`pending`.
+`/opt/destroyer/watchdog.py` corre en `mediaAPP` en paralelo al droplet. Monitorea la fila activa en `destroyer_runs`. Si detecta que `files_done` no avanza por más de 20 minutos:
+1. Envía alerta a Telegram
+2. Destruye el droplet vía API de DigitalOcean
+3. Actualiza `status = 'timeout'` en la DB
 
-> Cerró el hueco de droplets huérfanos que tenía el watchdog viejo de DigitalOcean.
+### Sistema de releases S3 (implementado 13 jun 2026)
 
-### Recursos AWS (us-east-1, cuenta `050871635829`)
+**El snapshot base es estable.** Contiene: Ubuntu 24.04, ffmpeg, Python 3.12, venv con todas las librerías del Destroyer. Raramente cambia.
 
-| Recurso | Valor |
-|---|---|
-| AMI activa | `ami-065708bbb25ab56ad` (**destroyer-v3-ubuntu22-pydub**) — venv con pydub + ffmpeg 4.4.2 horneados |
-| Lambda launcher | `destroyer-launcher` (role `destroyer-lambda-exec`) |
-| Lambda watchdog | `destroyer-watchdog` |
-| EventBridge | `destroyer-hourly`, `destroyer-watchdog-10min` |
-| Security Group | `sg-042fecb04118e4ff9` (puerto 22 CERRADO; el worker sube su log a S3) |
-| Key pair | `destroyer-worker` (`.pem` en mediaAPP `/opt/destroyer/` y local — NO en git) |
-| IAM worker | user `mediadev-s3` (keys horneadas en user_data para S3/DB/terminate) |
-
-> **Cuenta AWS compartida:** `050871635829` hospeda también Odoo, 3CX (telefonía), un proyecto
-> "Shente" y una **"ECS Sample App" abandonada en us-west-2 (Oregon)** gastando ~$66/año por nada
-> (candidata a borrar). Tagging adoptado: `Project=MediaAI` + `Component` (destroyer/capture);
-> `tag_mediaai.py` aplica sobre lista curada (las 2 Lambdas quedaron sin tag por falta de permiso IAM).
-
-### Sistema de releases S3
-
-El **AMI base es estable** (Ubuntu 22, ffmpeg, Python 3.12, venv con pydub). El **código**
-(`worker.py`, `fingerprint.py`) se versiona en S3 y se descarga al arrancar la instancia. Además
-está espejado en GitHub `gchiham/destroyer` (`app/` = mediaAPP).
-
+**El código está en S3, versionado:**
 ```
-s3://mediadev-recordings/destroyer/releases/
-├── destroyer-v20.tar.gz
-├── destroyer-v21.tar.gz   ← costo real spot (describe_spot_price_history)
-├── destroyer-v22.tar.gz   ← producción actual
-└── latest.tar.gz
+s3://mediadev-recordings/
+└── destroyer/releases/
+    ├── destroyer-v10.tar.gz
+    ├── destroyer-v11.tar.gz
+    ├── destroyer-v14.tar.gz
+    ├── destroyer-v15.tar.gz    ← producción actual (worker.py + fingerprint.py)
+    └── latest.tar.gz           ← siempre = la última publicada
 ```
 
-**Publicar / activar / rollback:**
+**Publicar nueva release:**
 ```bash
-cd /opt/destroyer && ./release.sh v22     # publica a S3 (correr en mediaAPP)
-# Activar: editar /opt/destroyer/.env → DESTROYER_RELEASE=destroyer-v22
-# Rollback: DESTROYER_RELEASE=destroyer-v21  (1 línea, sin recrear AMI)
+# En el servidor mediaDEV:
+cd /opt/destroyer
+./release.sh v11
 ```
 
-**Cuándo recrear el AMI base:** solo cuando cambian dependencias del sistema (librería Python,
-versión de ffmpeg). Los cambios de código (`worker.py`/`fingerprint.py`) solo requieren `./release.sh`.
+**Activar la nueva release:**
+```bash
+# Editar /opt/destroyer/.env:
+DESTROYER_RELEASE=destroyer-v15
+```
+El próximo cron (o lanzamiento manual) usará el nuevo código.
+
+**Rollback instantáneo:**
+```bash
+# Sin recrear snapshots:
+DESTROYER_RELEASE=destroyer-v14   # en .env
+```
+
+**Cuándo recrear el snapshot base:**
+
+| Cambio | ¿Nuevo snapshot? |
+|---|---|
+| Fix en `worker.py` o `fingerprint.py` | No — solo `./release.sh vX` |
+| Nueva librería Python en el venv | Sí |
+| Actualización de ffmpeg | Sí |
+| Nuevo archivo `.py` en el Destroyer | No — agregar al tar.gz |
 
 ### Variables de entorno del Destroyer
 
-En `/opt/destroyer/.env` (NO en git):
+En `/opt/destroyer/.env`:
 ```bash
-DESTROYER_AMI_ID=ami-065708bbb25ab56ad   # AMI base AWS (reemplazó SNAPSHOT_ID de DO)
-DESTROYER_RELEASE=destroyer-v22          # release activa del código
-DESTROYER_WORKERS=32                      # workers paralelos
-DESTROYER_SCAN_FILE_TIMEOUT=300           # cap por archivo "veneno"
-DESTROYER_WTA_WINDOW_SEC=8                # ventana cross-ad para Winner Takes All
-DESTROYER_HOURLY_USD=0.25                 # fallback costo spot
-AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY # IAM mediadev-s3
-TG_TOKEN / TG_CHAT                        # Telegram bot
+SNAPSHOT_ID=232701378              # ID snapshot base en DigitalOcean
+DESTROYER_RELEASE=destroyer-v15    # Release activa del código
+DESTROYER_WORKERS=32               # Workers paralelos (default: 32)
+DESTROYER_SCAN_FILE_TIMEOUT=240    # Cap por archivo "veneno" antes de marcar error
+DESTROYER_WTA_WINDOW_SEC=8         # Ventana cross-ad para Winner Takes All
+DO_TOKEN=...                    # DigitalOcean API token
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+TG_TOKEN=...                    # Telegram bot
+TG_CHAT=...
 S3_BUCKET=mediadev-recordings
-PG_HOST / PG_PORT / PG_DB / PG_USER / PG_PASS
-MATCH_MIN=...                             # umbral de coincidencia
-PIPELINE_VERSION=utc_v2                   # etiqueta grabada en cada detección
-# DO_TOKEN ya es opcional/legacy (el worker en EC2 no usa la API de DigitalOcean)
+PG_HOST=private-media-db-...
+PG_PORT=25060
+PG_DB=destroyer_db
+PG_USER=destroyer
+PG_PASS=...
+MATCH_MIN=...                   # umbral mínimo de coincidencia para detección
+PIPELINE_VERSION=utc_v2         # etiqueta que se graba en cada detección
 ```
 
 ### Releases publicadas
 
 | Release | Fecha | Cambios |
 |---|---|---|
-| `destroyer-v10`–`v16` | 13–14 jun 2026 | Era DigitalOcean: releases S3, dedup + Winner Takes All, idempotencia `ON CONFLICT`, hotfixes de timeout. (Histórico.) |
-| `destroyer-v20` | 14 jun 2026 | Primera sobre **EC2**: `DO_TOKEN` opcional, `get_droplet_id()` usa metadata EC2, `self_destruct()` salta API DO. |
-| `destroyer-v21` | 14 jun 2026 | Costo real spot vía `describe_spot_price_history`; Telegram "💸 Costo de este deploy" con $/run y $/hr. |
-| `destroyer-v22` | 14 jun 2026 | **Release activa.** Fix cosmético del nombre del clip (`name_stem`=filename real en vez del tmp). |
+| `destroyer-v10` | 13 jun 2026 | Primera release S3. Fix libx264 ultrafast para clips TV. Migración UTC (pipeline_version=utc_v2). |
+| `destroyer-v11` | 13 jun 2026 | Launcher con releases S3 en producción. |
+| `destroyer-v14` | 14 jun 2026 | Colapso de offsets vecinos en `fingerprint.py`, dedup por ventana real, Winner Takes All por instante, logs de debug a S3 y timeout por archivo configurable. |
+| `destroyer-v15` | 14 jun 2026 | Inserción idempotente en DB con `ON CONFLICT DO NOTHING`, no genera clip/Telegram si la detección ya existe, y queda alineada con la migración de deduplicación en `fingerprint_detections`. Introdujo una regresión en el loop del pool del scanner. |
+| `destroyer-v16` | 14 jun 2026 | Hotfix del incidente `Destroyer0000`/run `28`: timeout vuelve a contarse al esperar el resultado (`ar.get(timeout=...)`) y el default sube otra vez a `300s`. Release activa actual. |
 
 ### Lanzamiento manual
 
 ```bash
-# Disparar la Lambda launcher manualmente (AWS CLI con perfil de la cuenta):
-aws lambda invoke --function-name destroyer-launcher /tmp/out.json --region us-east-1
-# O editar/relanzar desde mediaAPP /opt/destroyer (launcher_ec2.py es backup manual del código).
+# Desde mediaDEV:
+cd /opt/destroyer
+source .env
+python3 launcher.py
 ```
-
-> El `launcher.py` viejo de DigitalOcean en **mediaCAP** quedó **desmantelado**
-> (`launcher.py.do-legacy.DISABLED`, sin exec). Ningún cron lo dispara.
 
 ---
 
@@ -395,244 +400,300 @@ const airTimeHN  = new Date(airTimeUtc.getTime() - 6 * 60 * 60 * 1000)
 
 ---
 
-## 6. Servicios systemd
-
-### mediaCAP (captura) — `159.223.104.91`
+## 6. Servicios systemd en mediaDEV
 
 | Servicio | Propósito |
 |---|---|
-| `stream-daemon` | Health, grabación MP3 horario, espejo de estado a PG |
-| `supervisor` | 13× ffmpeg (un proceso por stream, `mediadev_streams.conf`) |
-| `video-segment-uploader` | Sube `.ts` de TV (y MP3 horario) a S3 |
-| `mediadev-gateway-api` | API de heartbeats de gateways |
-| `mediadev-health-engine` | Health score de gateways + failover |
-| `mediadev-monitor` | Vigila WireGuard, alertas Telegram |
-| `nginx`, `privoxy`, `wg-quick@wg0` | serving HLS / proxy / VPN |
-| `dashboard_mediadev` | **inactivo** (no corre dashboard) |
-
-### mediaAPP (app/control) — `137.184.53.234`
-
-| Servicio | Propósito |
-|---|---|
-| `media-app` | API REST del producto PubliAudit (FastAPI) + evidence portal |
-| `chihambot` | Bot de Telegram (alertas) |
-| `nginx` | reverse proxy (sites `default`, `media-app`) |
-
-> La orquestación del Destroyer NO es un servicio systemd ni un cron local — corre en AWS (§4).
+| `stream-daemon` | Graba streams de radio/TV y sube MP3s/segmentos a S3 |
+| `nginx` | Reverse proxy para media-app y gateway-api |
+| `media-app` | API REST para el producto PubliAudit (FastAPI) |
+| `gateway-api` | API para gestión de gateways WireGuard |
+| `health-engine` | Monitoreo de salud de streams y alertas Telegram |
+| `video-segment-uploader` | Sube segmentos de video TV a S3 |
+| `medio-orchestrator` | Orquestador de tareas periódicas del ecosistema |
+| `privoxy` | Proxy HTTP (usado por gateways) |
+| `wireguard` | VPN hacia gateways Honduras |
 
 **Comandos útiles:**
 ```bash
-systemctl status stream-daemon
+systemctl status media-app
 journalctl -u stream-daemon -n 100 --no-pager
-supervisorctl status      # 13 procesos ffmpeg (mediaCAP)
+systemctl restart media-app
 ```
 
-### Credenciales (fuera del repo, en `/etc/*.env`)
+### Credenciales de media-app
 
-Cargadas por systemd con `EnvironmentFile=` (no `Environment=` inline, que se expone vía
-`systemctl show`). Permisos `chmod 600`.
+Las credenciales están en `/etc/media-app.env` (chmod 600, root:root). NO están en el `.service` para evitar exposición vía `systemctl show`.
 
-| Archivo | Nodo | Contenido |
-|---|---|---|
-| `/etc/mediadev-db.env` | ambos | credenciales PostgreSQL |
-| `/etc/mediadev-s3.env` | mediaCAP | credenciales S3 |
-| `/etc/media-app.env` | mediaAPP | `PG_*`, `JWT_SECRET`, `AWS_*`, `S3_*`, `PUBLIC_BASE_URL`, `CORS_ORIGINS` |
-| `/opt/destroyer/.env` | ambos | config Destroyer (DB, AWS, Telegram) |
+```ini
+# /etc/systemd/system/media-app.service
+[Service]
+EnvironmentFile=/etc/media-app.env   ← así, no como Environment= inline
+```
+
+Variables en `/etc/media-app.env`:
+```bash
+PG_HOST, PG_PORT, PG_DB, PG_USER, PG_PASS
+JWT_SECRET, JWT_EXP_HOURS
+AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+S3_BUCKET, S3_REGION, PUBLIC_BASE_URL
+CORS_ORIGINS    # opcional: ej. https://app.publiaudit.com,https://admin.publiaudit.com
+                # si no se define, el default es '*'
+```
 
 ---
 
 ## 7. MCP Server (mediadev-mcp)
 
-Permite a Claude Code / Codex consultar el estado del ecosistema en tiempo real. **Corre en
-AMBOS nodos** (14 jun 2026): un MCP en mediaCAP (observa captura) y otro en mediaAPP (observa
-media-app + Destroyer). Los tools de DB/cloud dan datos globales; los de host
-(`get_service_logs`, `get_host_resources`, etc.) son **por-nodo**.
+Permite a Claude Code / Codex consultar el estado del ecosistema en tiempo real. **Corre en AMBOS nodos** (14 jun 2026): un MCP en mediaCAP (observa captura) y otro en mediaAPP (observa media-app + Destroyer launcher). Los tools de DB/DO-API dan datos globales; los de host (`get_service_logs`, `get_host_resources`, `get_workers`, `get_stream_bandwidth`) son **por-nodo**.
 
-### En el servidor
+### En el servidor (idéntico en ambos nodos)
+
 ```
-mediaCAP: /opt/media-ai/mcp/server.py     (FastMCP, stdio) + venv     → repo MediaDEV-Honduras
-mediaAPP: /opt/media-ai/mcp/server.py + tools/{system,workers,queue,
-          health,errors,logs,cost,capacity}.py                        → repo mediadev-infra
+/opt/media-ai/mcp/
+├── server.py       ← FastMCP, transport="stdio"
+└── venv/           ← Python venv con mcp[server]
 ```
 
-### Herramientas mediaCAP (~13, solo lectura)
-*Observabilidad:* `get_system_status` · `get_workers` · `get_queue_stats` · `get_service_health` · `get_recent_errors`
-*Diagnóstico:* `get_service_logs(service,lines,contains)` · `get_error_digest(hours)`
-*Escalado y costo:* `get_host_resources` · `get_stream_bandwidth` · `get_destroyer_analytics(limit)` · `get_droplets` · `get_disk_usage` · `get_uploader_status`
+**Herramientas disponibles (11, solo lectura):**
 
-> **Por qué estos tools:** cada decisión de operación/escalado requería cavar datos a mano
-> (journal, top/ps/df, bitrate de segmentos, `destroyer_runs`, API cloud). Estos tools los
-> exponen para que la IA diagnostique sin escarbar — ej. `get_destroyer_analytics` marca el
-> patrón de cuelgue del worker, `get_stream_bandwidth` muestra el cuello al escalar TV (red/disco/S3, no CPU).
+*Observabilidad:*
+- `get_system_status` — estado de los 12 streams
+- `get_workers` — procesos ffmpeg + servicios systemd
+- `get_queue_stats` — motor Destroyer: corridas, detecciones, costos
+- `get_service_health` — gateways, VPN, DB, proxies
+- `get_recent_errors` — eventos de stream (DOWN/UP/CB) + failovers de gateway + runs con error
+
+*Diagnóstico de errores (v1.1):*
+- `get_service_logs(service, lines, contains)` — tail/grep del journal de un servicio (incluye tracebacks de Python). Allowlist de 9 servicios
+- `get_error_digest(hours)` — escaneo consolidado de errores/tracebacks. Una llamada para "¿qué se está rompiendo?"
+
+*Decisiones de escalado y costo (v1.2):*
+- `get_host_resources` — CPU/RAM/disco/load + agregado ffmpeg + veredicto. ¿Hay headroom? ¿cuándo desacoplar captura?
+- `get_stream_bandwidth` — bitrate (Mbps) por stream + GB/día. El cuello al escalar TV es red/disco/S3, no CPU
+- `get_destroyer_analytics(limit)` — boot/work/costo por corrida + **detección automática de cuelgues** (timeout con 0 detecciones)
+- `get_droplets` — inventario DO + **caza de droplets Destroyer huérfanos** (money-leaks)
+
+> **Por qué estos tools (v1.1–v1.2, 13 jun 2026):** cada decisión de operación/escalado requería cavar datos a mano (journal, top/ps/df, bitrate de segmentos, `destroyer_runs`, API de DO). Estos tools los exponen para que la IA diagnostique y decida sin escarbar — ej. `get_droplets` caza droplets c-16 huérfanos que cuestan ~$0.95/h, y `get_destroyer_analytics` marca solo el patrón de cuelgue del worker.
 
 ### Desde Windows (Claude Code + Codex)
 
-**Wrappers locales** (uno por nodo): `mediadev` → `C:\Users\Sedesol\.ssh\mediadev-mcp.py`
-(mediaCAP), `mediadev-app` → `C:\Users\Sedesol\.ssh\mediadev-app-mcp.py` (mediaAPP). El wrapper
-hace SSH al nodo y proxea stdin/stdout del protocolo MCP sin modificar.
+**Wrappers locales** (uno por nodo, configurados en Claude y Codex):
+- `mediadev` → `C:\Users\Sedesol\.ssh\mediadev-mcp.py` (mediaCAP, captura)
+- `mediadev-app` → `C:\Users\Sedesol\.ssh\mediadev-app-mcp.py` (mediaAPP, app/control)
+
+El wrapper hace SSH al nodo y proxea stdin/stdout del protocolo MCP sin modificaciones.
 
 ```python
 # Flags críticos para que el protocolo MCP no se corrompa:
-"-T"                         # no pseudo-tty (stdio limpio)
-"-o", "LogLevel=QUIET"       # silencia banners SSH
-stderr=subprocess.DEVNULL    # SSH stderr no contamina JSON-RPC
+"-T"                    # no pseudo-tty (stdio limpio)
+"-o", "LogLevel=QUIET"  # silencia banners SSH
+stderr=subprocess.DEVNULL  # SSH stderr no contamina JSON-RPC
 ```
 
-**Test manual:**
+**Config en Claude Code desktop:**
+`C:\Users\Sedesol\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "mediadev": {
+      "command": "C:\\Users\\Sedesol\\AppData\\Local\\Programs\\Python\\Python314\\python.exe",
+      "args": ["C:\\Users\\Sedesol\\.ssh\\mediadev-mcp.py"]
+    }
+  }
+}
+```
+
+**Test manual (verifica que el MCP funciona):**
 ```powershell
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | python "C:\Users\Sedesol\.ssh\mediadev-mcp.py"
+# Respuesta esperada: {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"mediadev",...}}}
 ```
 
 ---
 
 ## 8. Archivos y rutas clave
 
-### mediaCAP (159.223.104.91)
+### En el servidor (159.223.104.91)
+
 ```
-/opt/media-ai/                 ← repo git MediaDEV-Honduras (working tree real)
-├── daemon/stream_daemon.py    ← health + grabación MP3 + espejo a PG
-├── scripts/stream_*.sh        ← un ffmpeg por stream (SOCKS5 o directo)
-├── scripts/video_segment_uploader.py
-├── monitor/monitor.py         ← vigila WireGuard, alertas Telegram
-├── mcp/server.py              ← MCP captura
-├── dashboard/dashboard_v4.py  ← referencia histórica (NO corre)
-└── config/stations.json       ← 13 estaciones
-/opt/destroyer/gateway/engine/{gateway_api,health_engine}.py  ← gateway engine (repo destroyer/cap)
-/opt/destroyer/launcher.py.do-legacy.DISABLED                 ← launcher DO viejo (desmantelado)
-/etc/mediadev-db.env, /etc/mediadev-s3.env, /etc/mediadev/gateway.conf
-/etc/wireguard/wg0.conf        ← llaves (NO en git)
+/opt/destroyer/
+├── launcher.py         ← orquestador principal: crea droplet, inyecta cloud-init
+├── worker.py           ← procesamiento de MP3s (corre en el droplet c-16)
+├── fingerprint.py      ← lógica de audio fingerprinting
+├── watchdog.py         ← mata el Destroyer si se cuelga >20 min
+├── release.sh          ← publica nueva release a S3 (./release.sh vX)
+├── .env                ← todas las variables de entorno del Destroyer
+└── logs/
+    ├── cloud-init.log  ← log del script que corre en el droplet al arrancar
+    └── worker.log      ← stdout/stderr del worker.py en el droplet
+
+/opt/media-ai/mcp/
+├── server.py           ← servidor MCP (FastMCP, stdio)
+└── venv/
+
+/opt/media-app/
+├── main.py             ← FastAPI app de PubliAudit
+└── ...
+
+/etc/media-app.env     ← credenciales media-app (chmod 600)
+/etc/systemd/system/        ← definiciones de servicios
 ```
 
-### mediaAPP (137.184.53.234)
-```
-/opt/media-app/main.py         ← FastAPI PubliAudit (repo media-app) + cobertura_static/
-/opt/destroyer/                ← repo destroyer/app/
-├── launcher_ec2.py            ← backup manual del launcher EC2
-├── worker.py                  ← procesa MP3s (corre en la instancia Spot)
-├── fingerprint.py             ← audio fingerprinting
-├── lambda_function.py         ← código de la Lambda destroyer-launcher
-├── watchdog_function.py       ← código de la Lambda destroyer-watchdog
-├── release.sh                 ← publica release a S3
-├── .env                       ← config (NO en git)
-└── destroyer-worker.pem       ← llave AWS (NO en git)
-/opt/chihambot/bot.py          ← bot Telegram (repo mediadev-infra)
-/opt/media-ai/mcp/             ← MCP app (repo mediadev-infra)
-/etc/media-app.env, /etc/mediadev-db.env
-```
+### En Windows (local)
 
-### Windows (local)
 ```
-C:\GusHD\CloudAWS\             ← working directory de auditoría (NO es repo git)
-├── live_mediaDEV.md           ← este archivo (copia; el repo es gchiham/MediaDEV-Honduras)
-├── lambda_function.py, launcher_ec2.py, worker_*.py  ← fuentes Destroyer editadas
-C:\GusHD\destroyer_sync\       ← clon git de gchiham/destroyer
-C:\GusHD\infra_sync\           ← clon git de gchiham/mediadev-infra
-C:\Users\Sedesol\.ssh\keySED   ← SSH key de los nodos DO
-C:\Users\Sedesol\.ssh\destroyer-worker.pem  ← SSH key del worker EC2
+C:\GusHD\CloudAWS\              ← working directory principal
+├── live_mediaDEV.md            ← este archivo
+├── MEDIADEV_MEJORAS_RESULTADOS.md
+├── MEDIADEV_DESTROYER_RELEASES.md
+└── patch_launcher_release.py   ← script de utilidad (referencia histórica)
+
+C:\Users\Sedesol\.ssh\
+├── keySED                      ← SSH key para mediaDEV
+└── mediadev-mcp.py             ← wrapper MCP para Claude Code
+
+C:\Users\Sedesol\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\
+└── LocalCache\Roaming\Claude\claude_desktop_config.json  ← config MCP
 ```
 
 ---
 
 ## 9. Historial de decisiones técnicas
 
-### Destroyer migrado de DigitalOcean a AWS EC2 Spot (14 jun 2026)
+### S3 releases en lugar de snapshot por código (13 jun 2026)
 
-**Decisión:** mover el Destroyer de droplets DigitalOcean c-16 efímeros a **AWS EC2 Spot
-c5.4xlarge**, 100% serverless (EventBridge → Lambda launcher → Spot → auto-terminate), con un
-Lambda watchdog que mata instancias estancadas por heartbeat (`last_activity`).
+**Decisión:** El snapshot del Destroyer solo tiene dependencias del sistema (Ubuntu, ffmpeg, Python, venv). El código (`worker.py`, `fingerprint.py`) se versiona en S3 y se descarga al arrancar el droplet.
 
-**Por qué:** spot c5.4xlarge cuesta ~$0.24/hr vs el c-16 de DO; el cron horario sale ≈$6.6/mes.
-El watchdog por progreso (no por edad) cierra el hueco de instancias huérfanas. AMI base estable
-+ releases S3 = deploy/rollback instantáneo. El launcher viejo de DO en mediaCAP quedó desmantelado.
+**Por qué:** Crear un nuevo snapshot tardaba ~10 minutos y no había auditoría de qué código corrió en cada run. Con S3 releases: deploy instantáneo, rollback en 1 línea, columna `release_version` en DB para auditoría completa.
 
-**Gotchas:** el user IAM `mediadev-s3` no tiene `lambda:GetFunctionConfiguration` (los re-deploys
-de Lambda evitan el waiter `function_updated`); el server no tiene `zip` (se empaqueta con `zipfile`
-de Python). Bug pydub resuelto horneando pydub en el AMI v3.
-
----
-
-### Versionado completo en GitHub (15 jun 2026)
-
-**Decisión:** espejar todo el sistema en 4 repos GitHub (`MediaDEV-Honduras`, `media-app`,
-`destroyer`, `mediadev-infra`) con la regla "la verdad es lo desplegado". Secretos nunca en git
-(`.env`, `.pem`, llaves WireGuard redactadas). Ver §0 y `mediadev-infra/INVENTORY.md`.
-
-**Por qué:** antes solo mediaCAP `/opt/media-ai` estaba versionado; media-app, destroyer y toda
-la config operativa (systemd, supervisor, nginx, wireguard) vivían solo en disco — riesgo total
-si se pierde un droplet. Ahora el developer tiene todo lo que opera.
+**Cuándo usar snapshot nuevo:** solo cuando cambian dependencias del sistema (librería Python, versión de ffmpeg). Los cambios de código no requieren snapshot.
 
 ---
 
 ### Deduplicación fuerte en DB + Winner Takes All (14 jun 2026)
 
-**Decisión:** separar dos capas de control: (1) aplicación (worker/fingerprint) colapsa offsets
-parciales, deduplica por ventana real y aplica Winner Takes All entre anuncios que compiten en el
-mismo instante; (2) DB con índice único parcial sobre `(tenant_id, campaign_id, ad_id, stream_id,
-s3_key, ts_seconds)` para idempotencia ante re-scans.
+**Decisión:** separar dos capas de control:
 
-**Ejecución real:** 14 jun 2026 — `58` grupos duplicados corregidos, `95` filas extra desactivadas, `0` duplicados activos remanentes.
+1. **Aplicación (worker/fingerprint):** colapsa offsets parciales del mismo anuncio, deduplica por ventana real según duración y aplica Winner Takes All entre anuncios que compiten en el mismo instante.
+2. **Base de datos:** índice único parcial sobre `(tenant_id, campaign_id, ad_id, stream_id, s3_key, ts_seconds)` para que un re-scan del mismo archivo no duplique filas aunque el worker reintente.
+
+**Por qué:** el ruido observado venía de dos fuentes distintas: detecciones múltiples dentro de una sola emisión y copias exactas causadas por re-scans/reintentos. La capa de aplicación reduce ruido semántico; la unicidad en DB blinda la idempotencia.
+
+**Ejecución real:** el 14 jun 2026 se aplicó la migración de dedup en la DB administrada. Resultado: `58` grupos duplicados activos corregidos, `95` filas extra desactivadas, y `0` duplicados activos remanentes tras la verificación.
 
 ---
 
 ### Hardening de reconexión en mediaCAP (14 jun 2026)
 
-**Decisión:** endurecer la captura con (1) flags de reconexión de ffmpeg en `stream_run.sh` —
-diferenciados: para HLS de ventana corta (`*.m3u8`) se usa `-reconnect -reconnect_streamed
--reconnect_on_network_error` SIN `reconnect_at_eof`/`reconnect_on_http_error` (que causaban
-crash-loop en Teleceiba), y para Icecast continuo el comportamiento viejo; (2) ventana de gracia
-de `35s` en stream-daemon tras un restart antes de re-incrementar `cb_fails`.
+**Decisión:** endurecer la captura de streams `auto` con dos guardas:
 
-**Por qué:** microcortes en `radio_el_patio`/`teleceiba` y un crash-loop de Teleceiba por gateway
-sin throughput + flags HLS dañinos. El nodo no estaba saturado; era resiliencia y timing.
+1. `stream_run.sh` agrega flags de reconexión de `ffmpeg` para fuentes HTTP no-Icecast (`-reconnect`, `-reconnect_streamed`, `-reconnect_at_eof`, `-reconnect_on_network_error`, `-reconnect_on_http_error`).
+2. `stream-daemon` aplica una ventana de gracia de `35s` después de un `supervisorctl restart` antes de volver a incrementar `cb_fails`.
+
+**Por qué:** el 14 jun 2026 `radio_el_patio` y `teleceiba` mostraron microcortes cortos. `radio_el_patio` incluso necesitó un segundo restart a los ~17s del primero, señal de que el daemon estaba reevaluando antes de que HLS terminara de levantar. El nodo no estaba saturado; el problema era de resiliencia y timing de recuperación.
+
+**Objetivo:** bajar reinicios redundantes y mejorar recuperación automática ante cortes breves del origen o de red, sin cambiar la topología ni el routing por estación.
+
+---
+
+### Hotfix de regresión Destroyer0000 / run 28 (14 jun 2026)
+
+**Decisión:** publicar `destroyer-v16` y activarlo en `mediaAPP` como release del Destroyer.
+
+**Causa raíz:** `destroyer-v15` empezó a medir el timeout por archivo desde `submitted_at`, o sea desde que la tarea entraba al pool, no desde que realmente empezaba a ejecutarse. Con lotes más grandes que el número de workers, archivos queued podían vencer mientras aún esperaban turno.
+
+**Corrección aplicada:** `worker.py` vuelve al patrón estable de `ar.get(timeout=...)` y `launcher.py` deja explícito un default de `300s` para `DESTROYER_SCAN_FILE_TIMEOUT`. Además, los `30` rows del run `28` que habían quedado en `scanning` se resetearon a `pending`, y `destroyer_runs.files_error` quedó corregido a `18`.
+
+**Nota de topología:** el `watchdog` y el `launcher` relevantes para Destroyer corren en `mediaAPP`. El cron legado de `watchdog` fue removido de `mediaCAP`; el único cron oficial del Destroyer vive en `mediaAPP`.
+
+---
+
+### Hardening del recorder y ledger de cobertura (16 jun 2026)
+
+**Decisión:** agregar una capa de validación y documentación fiel al recorder sin rediseñar la captura.
+
+Cambios:
+1. `stream-daemon` carga streams dinámicamente desde `stations.json` para que nuevos canales no requieran editar código.
+2. Los MP3 horarios se generan con concat demuxer en lugar de pipear todos los `.ts` en memoria.
+3. Cada MP3 se valida con `ffprobe`; si es parcial se sube igual, pero queda marcado con `actual_seconds` y `reason`.
+4. S3 se confirma con `head_object` antes de considerar un upload exitoso.
+5. Los MP3 locales pendientes se recuperan al arrancar y durante la ventana horaria.
+6. `video-segment-uploader` valida segmentos TV, confirma upload antes de borrar `.ts`, mueve segmentos inválidos a `_invalid/`, recupera `_tv_audio` viejo al arrancar y agrega cobertura horaria de video.
+7. `deploy.sh` reinicia `video-segment-uploader` cuando cambia su script, sin reiniciar todos los streams salvo que cambie `stream_run.sh`.
+8. El circuit breaker queda menos ruidoso para streams HLS reales: `STALE_SECS=90`, `CB_FAIL_OPEN=8`, `CB_RESET_SECS=600`, `RESTART_GRACE_SECS=45`.
+9. Los eventos `DOWN/UP` que alimentan alertas externas se escriben solo si la caída dura al menos `DOWN_EVENT_AFTER_SECS=180`; los microcortes siguen visibles en logs/estado, pero no disparan Telegram inmediatamente.
+10. Las alertas de grabación dejan de mandar un mensaje por stream ante fallos recuperables. Telegram solo envía una alerta agrupada por hora cuando la cobertura real baja de `RECORDING_ALERT_MIN_SECONDS=900`.
+
+**Migración requerida:**
+```bash
+psql "$DATABASE_URL" -f migrations/20260616_recorder_hardening.sql
+systemctl restart stream-daemon video-segment-uploader
+```
+
+**Por qué:** el objetivo ya no es solo "grabar", sino poder decir cuánta cobertura real tuvo cada hora y no borrar evidencia local sin confirmación remota.
 
 ---
 
 ### Modelo tenant → client(anunciante) → campaign → ad (13 jun 2026)
 
-**Decisión:** jerarquía multi-tenant con `tenant` = cliente que paga y `client` = anunciante,
-relación 1:N. Se renombró `clients`→`tenants` y `client_id`→`tenant_id` en 10 tablas; nueva
-`clients` = anunciante con FK `tenant_id`. Aislamiento por `tenant_id` (en el JWT), Auth intacto.
-Sin módulo de "pauta esperada vs real" — solo se publica lo **detectado**.
+**Decisión:** Jerarquía multi-tenant con `tenant` como cliente que paga (agencia/central/radio/TV/gobierno) y `client` como anunciante (Pepsi, Molineros). Relación tenant↔anunciante **1:N** (cada tenant maneja su propia cartera). Se renombró la tabla `clients` original → `tenants` y `client_id` → `tenant_id` en 10 tablas; se creó `clients` nueva = anunciante con FK `tenant_id`.
+
+**Por qué 1:N y no M2M:** aunque un anunciante fuera compartido entre agencias, las campañas/ads/detecciones quedan aisladas por tenant de todas formas — el M2M solo agregaría complejidad para compartir lo cosmético. La llave de aislamiento sigue siendo `tenant_id` a nivel aplicativo (el JWT lo lleva), por eso no se tocó Auth.
+
+**Sin "pauta esperada vs real":** el sistema solo publica lo **detectado**. Se descartó el módulo de `placements`.
+
+**API:** `media-app` expone CRUD de anunciantes (`/api/clients`), campañas con `client_name` + filtro `?client_id=`, `PATCH /api/campaigns/{id}` para reasignar anunciante. El evidence portal muestra el anunciante (`advertiser_name`) con el tenant como `provider_name`.
 
 ---
 
 ### UTC en backend, GMT-6 solo en display (13 jun 2026)
 
-**Decisión:** timestamps en UTC; el frontend aplica `-6h`. Honduras sin DST. Cutover 13 jun 16:07
-UTC; filas previas `pipeline_version='legacy'`, nuevas `'utc_v2'`.
+**Decisión:** Todas las timestamps se almacenan y calculan en UTC. El frontend aplica `-6h` para mostrar hora Honduras.
+
+**Por qué:** Honduras no tiene DST (offset siempre fijo), pero almacenar en UTC es la práctica correcta para evitar ambigüedades y facilitar queries cross-timezone en el futuro. Cutover ejecutado el 13 jun 2026 a las 16:07 UTC. Filas anteriores tienen `pipeline_version='legacy'`; las nuevas tienen `'utc_v2'`.
 
 ---
 
 ### EnvironmentFile en lugar de Environment= en systemd (13 jun 2026)
 
-**Decisión:** credenciales en `/etc/*.env` (chmod 600) vía `EnvironmentFile=`, no inline, porque
-`systemctl show` expone los `Environment=` en texto plano.
+**Decisión:** Las credenciales de `media-app` están en `/etc/media-app.env` (chmod 600) en lugar de inline como `Environment=` en el `.service`.
+
+**Por qué:** `systemctl show media-app` expone en texto plano todas las variables `Environment=`. Con `EnvironmentFile=` el archivo tiene permisos restringidos y `systemctl show` solo muestra la ruta del archivo, no el contenido.
 
 ---
 
-### libx264 ultrafast vs -c:v copy para clips TV (anterior a 13 jun 2026)
+### libx264 ultrafast en lugar de -c:v copy para clips TV (fecha: anterior a 13 jun 2026)
 
-**Decisión:** los clips de video TV se re-encodean con `libx264 -preset ultrafast` (no `-c:v copy`)
-para corte exacto. Con copy, el corte caía en un keyframe distinto al solicitado y el audio
-desincronizaba. Nota: este re-encode ocurre **off-box** al armar el clip de evidencia, no en mediaCAP.
+**Decisión:** Los clips de video de streams TV se re-encodean con `libx264 -preset ultrafast` en lugar de hacer `-c:v copy` (copia directa del stream).
+
+**Por qué:** Con `-c:v copy`, los clips de TV tenían un offset de timing (el audio no sincronizaba con el video) porque el punto de corte caía en un keyframe diferente al solicitado. Re-encodear con ultrafast fuerza el corte exacto sin sacrificar velocidad perceptiblemente.
 
 ---
 
 ## 10. Cómo actualizar este documento
 
-**Actualizar `live_mediaDEV.md` cuando cambie cualquiera de:** arquitectura de infraestructura ·
-tablas/schema de la DB · flujo del Destroyer o releases · servicios systemd · variables de entorno
-críticas · decisiones de diseño con impacto en el sistema.
+**Actualizar `live_mediaDEV.md` cuando cambie cualquiera de:**
 
-**No actualizar por:** cambios de código internos sin impacto en arquitectura · fixes de bugs sin
-cambio visible · config trivial.
+- Arquitectura de infraestructura (nuevo servidor, cambio de proveedor, nuevo servicio)
+- Tablas o schema de la DB (nueva tabla, columna nueva, cambio de tipo)
+- Flujo del Destroyer o sistema de releases (nueva release publicada, cambio en el proceso)
+- Servicios systemd (nuevo servicio, renombrado, cambio de configuración relevante)
+- Variables de entorno críticas (nueva variable, cambio de propósito)
+- Decisiones de diseño con impacto en el sistema
+
+**No actualizar por:**
+- Cambios de código internos sin impacto en arquitectura
+- Fixes de bugs sin cambio de comportamiento visible externamente
+- Cambios de configuración triviales
 
 **Proceso:**
 1. Hacer el cambio en el sistema
 2. Editar la sección correspondiente en este archivo
-3. Actualizar la fecha del header
-4. Commit y push al repo `gchiham/MediaDEV-Honduras` (y `git pull` en `/opt/media-ai`)
+3. Actualizar la fecha en el header: `Última actualización: DD mes AAAA`
+4. Commit y push al repo de GitHub
 
 ---
 
-*MediaDEV · mediaCAP 159.223.104.91 + mediaAPP 137.184.53.234 · DigitalOcean nyc1 + Destroyer en AWS us-east-1 · Actualizado: 15 junio 2026*
+*MediaDEV · 159.223.104.91 · DigitalOcean nyc1 · Actualizado: 14 junio 2026*
