@@ -1,104 +1,159 @@
 #!/bin/bash
-# =============================================================================
-# MediaDEV — Runner unificado de streams
-# =============================================================================
-# Uso: stream_run.sh <stream_id>
-#
-# Lee url / type / route de config/stations.json y decide cómo capturar:
-#   route=gateway → siempre por el gateway activo (geo-restringidos, ej. ice42)
-#   route=direct  → siempre conexión directa
-#   route=auto    → prueba directo; si falla, usa gateway. Re-evalúa en CADA
-#                   arranque, así que si una fuente directa es bloqueada, el
-#                   siguiente reinicio (supervisord) cae automáticamente al gateway.
-#
-# Captura:
-#   - Fuentes Icecast (ice42.securenetsystems.net) → curl pipe (headers Icy-MetaData)
-#   - Resto → ffmpeg (directo, o -http_proxy vía Privoxy para el gateway)
-# Salida:
-#   - type=radio → audio AAC 64k mono 22050
-#   - type=tv    → video copiado + audio AAC 128k
-# =============================================================================
+# /opt/media-ai/scripts/stream_run.sh
+# Captura de stream con soporte para hasta 3 URLs de fallback automático.
+# Supervisord gestiona el proceso; este script NUNCA sale en operación normal.
+
 set -uo pipefail
 
-STREAM_ID="${1:?uso: stream_run.sh <stream_id>}"
-STATIONS="/opt/media-ai/config/stations.json"
-GW_CONF="/etc/mediadev/gateway.conf"
-OUT_DIR="/var/www/streams/$STREAM_ID"
-mkdir -p "$OUT_DIR"
+STREAM_ID="${1:?Uso: stream_run.sh <stream_id>}"
 
-# Gateway activo (define GW_SOCKS5)
-# shellcheck source=/etc/mediadev/gateway.conf
-[ -f "$GW_CONF" ] && source "$GW_CONF"
+STATIONS_JSON="/opt/media-ai/config/stations.json"
+GATEWAY_CONF="/etc/mediadev/gateway.conf"
+HLS_DIR="/var/www/streams/${STREAM_ID}"
+RETRY_DELAY=5       # segundos entre reintentos
+URL_RETRY_LIMIT=3   # fallos consecutivos por URL antes de rotar a la siguiente
 
-# Config del stream (url|type|route) en una sola lectura
-CFG=$(python3 -c "
-import json,sys
-d=json.load(open('$STATIONS'))
-s=next((x for x in d['stations'] if x['id']=='$STREAM_ID'), None)
-if not s: sys.exit(1)
-print('|'.join([s['url'], s.get('type','radio'), s.get('route','gateway'), s.get('referer','')]))
-") || { echo "[$STREAM_ID] no encontrado en stations.json"; exit 1; }
-IFS='|' read -r URL TYPE ROUTE REFERER <<< "$CFG"
+mkdir -p "$HLS_DIR"
+source "$GATEWAY_CONF"   # → GW_SOCKS5, GW_PRIVOXY_PORT
 
-# ¿Fuente Icecast? (requiere curl pipe, no ffmpeg)
-is_ice42=0
-[[ "$URL" == *ice42.securenetsystems.net* ]] && is_ice42=1
+# ── Leer configuración del stream (una sola llamada Python) ───────────────────
+# Soporta "urls": [...] (array, hasta 3) y "url": "..." (string, retrocompat).
+_PY='
+import json, sys
+sid, path = sys.argv[1], sys.argv[2]
+cfg = json.load(open(path))
+st = next((s for s in cfg["stations"] if s["id"] == sid), None)
+if not st:
+    print("ERROR: stream no encontrado", file=sys.stderr); sys.exit(1)
+urls = st.get("urls") or ([st["url"]] if st.get("url") else [])
+if not urls:
+    print("ERROR: sin URLs configuradas", file=sys.stderr); sys.exit(1)
+print(st.get("type", "radio"))
+print(st.get("route", "auto"))
+print(st.get("referer", ""))
+for u in urls:
+    print(u)
+'
+mapfile -t _CFG < <(python3 -c "$_PY" "$STREAM_ID" "$STATIONS_JSON")
 
-# Decidir transporte
-probe_direct() {
-  # Conexión directa OK si la fuente responde 2xx. No usamos range requests:
-  # muchos servidores Icecast los ignoran y mandan stream continuo (falso negativo).
-  local code
-  code=$(curl -s --max-time 6 -o /dev/null -w '%{http_code}' -L -A "MediaDEV/1.0" "$1" 2>/dev/null)
-  [[ "$code" =~ ^2 ]]
+STREAM_TYPE="${_CFG[0]:-radio}"
+STREAM_ROUTE="${_CFG[1]:-auto}"
+STREAM_REFERER="${_CFG[2]:-}"
+URLS=("${_CFG[@]:3}")
+URL_COUNT="${#URLS[@]}"
+
+if [[ $URL_COUNT -eq 0 ]]; then
+    echo "[$STREAM_ID] ERROR: sin URLs en stations.json" >&2
+    exit 1
+fi
+
+echo "[$STREAM_ID] type=$STREAM_TYPE route=$STREAM_ROUTE urls=$URL_COUNT"
+
+# ── Determinar si usar proxy (se decide una sola vez al inicio) ───────────────
+USE_PROXY=0
+if [[ "$STREAM_ROUTE" == "gateway" ]]; then
+    USE_PROXY=1
+elif [[ "$STREAM_ROUTE" == "auto" ]]; then
+    # Prueba rápida: ¿la primera URL es accesible directo?
+    _code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "${URLS[0]}" 2>/dev/null | head -c 3)
+    if [[ "$_code" != 2* && "$_code" != 3* ]]; then
+        USE_PROXY=1
+        echo "[$STREAM_ID] auto: directo bloqueado (HTTP $_code) → vía gateway"
+    else
+        echo "[$STREAM_ID] auto: acceso directo OK (HTTP $_code)"
+    fi
+fi
+
+# Construir arrays de flags (vacíos si no aplican)
+PROXY_FLAGS=()
+if [[ $USE_PROXY -eq 1 ]]; then
+    PROXY_FLAGS=(-http_proxy "http://127.0.0.1:${GW_PRIVOXY_PORT:-3128}")
+fi
+
+REFERER_FLAGS=()
+if [[ -n "$STREAM_REFERER" ]]; then
+    REFERER_FLAGS=(-headers "Referer: ${STREAM_REFERER}\r\n")
+fi
+
+# Flags de reconexión HLS (-reconnect_at_eof 0: crítico para HLS de ventana corta)
+RECONNECT_FLAGS=(
+    -reconnect 1
+    -reconnect_at_eof 0
+    -reconnect_streamed 1
+    -reconnect_delay_max 8
+    -rw_timeout 20000000
+    -timeout 15000000
+)
+
+# Salida HLS local
+HLS_OUT=(
+    -f hls
+    -hls_time 4
+    -hls_list_size 10
+    -hls_flags "append_list+omit_endlist"
+    -hls_segment_filename "${HLS_DIR}/seg_%05d.ts"
+    "${HLS_DIR}/index.m3u8"
+)
+
+# ── Ejecutar ffmpeg para una URL concreta ─────────────────────────────────────
+run_url() {
+    local url="$1"
+
+    if [[ "$STREAM_TYPE" == "tv" ]]; then
+        ffmpeg -hide_banner -loglevel warning \
+            "${PROXY_FLAGS[@]+"${PROXY_FLAGS[@]}"}" \
+            "${REFERER_FLAGS[@]+"${REFERER_FLAGS[@]}"}" \
+            "${RECONNECT_FLAGS[@]}" \
+            -i "$url" \
+            -c:v copy -c:a aac -b:a 128k -ac 2 \
+            "${HLS_OUT[@]}"
+
+    elif [[ "$url" == *".m3u8"* || "$url" == *".m3u"* ]]; then
+        # Radio HLS
+        ffmpeg -hide_banner -loglevel warning \
+            "${PROXY_FLAGS[@]+"${PROXY_FLAGS[@]}"}" \
+            "${REFERER_FLAGS[@]+"${REFERER_FLAGS[@]}"}" \
+            "${RECONNECT_FLAGS[@]}" \
+            -i "$url" \
+            -vn -c:a aac -b:a 64k -ac 1 -ar 22050 \
+            "${HLS_OUT[@]}"
+
+    else
+        # Radio Icecast / flujo continuo → curl | ffmpeg
+        local -a CURL_FLAGS=(-s --max-time 0 --retry 0 -A "MediaDEV/1.0" -L)
+        if [[ $USE_PROXY -eq 1 ]]; then
+            CURL_FLAGS+=(--socks5-hostname "${GW_SOCKS5#socks5://}")
+        fi
+        curl "${CURL_FLAGS[@]}" "$url" | \
+        ffmpeg -hide_banner -loglevel warning \
+            -i pipe:0 \
+            -vn -c:a aac -b:a 64k -ac 1 -ar 22050 \
+            "${HLS_OUT[@]}"
+    fi
 }
-USE_GATEWAY=1
-case "$ROUTE" in
-  direct)  USE_GATEWAY=0 ;;
-  gateway) USE_GATEWAY=1 ;;
-  auto)    if probe_direct "$URL"; then USE_GATEWAY=0; else USE_GATEWAY=1; fi ;;
-  *)       USE_GATEWAY=1 ;;
-esac
 
-# Perfil de salida según tipo
-if [ "$TYPE" = "tv" ]; then
-  OUT=(-c:v copy -c:a aac -b:a 128k)
-else
-  OUT=(-vn -c:a aac -b:a 64k -ac 1 -ar 22050)
-fi
-HLS=(-f hls -hls_time 4 -hls_list_size 10 -hls_flags append_list
-     -hls_segment_filename "$OUT_DIR/seg_%05d.ts" "$OUT_DIR/index.m3u8")
+# ── Loop principal: rotar URLs ante fallos consecutivos ───────────────────────
+url_idx=0
+url_fails=0
 
-echo "[$STREAM_ID] type=$TYPE route=$ROUTE use_gateway=$USE_GATEWAY ice42=$is_ice42"
+while true; do
+    URL="${URLS[$url_idx]}"
+    if [[ $URL_COUNT -gt 1 ]]; then
+        echo "[$STREAM_ID] URL $((url_idx+1))/$URL_COUNT → $URL"
+    fi
 
-if [ "$is_ice42" = 1 ]; then
-  # Icecast → curl pipe. Directo o por gateway según USE_GATEWAY.
-  if [ "$USE_GATEWAY" = 1 ]; then
-    exec curl -s --retry 999 --retry-delay 3 --socks5-hostname "$GW_SOCKS5" \
-      -A "MediaDEV/1.0" -H "Icy-MetaData: 1" "$URL" \
-    | ffmpeg -y -loglevel warning -fflags nobuffer -i pipe:0 "${OUT[@]}" "${HLS[@]}"
-  else
-    exec curl -s --retry 999 --retry-delay 3 \
-      -A "MediaDEV/1.0" -H "Icy-MetaData: 1" "$URL" \
-    | ffmpeg -y -loglevel warning -fflags nobuffer -i pipe:0 "${OUT[@]}" "${HLS[@]}"
-  fi
-else
-  # Resto → ffmpeg directo o vía Privoxy (gateway)
-  PROXY=()
-  [ "$USE_GATEWAY" = 1 ] && PROXY=(-http_proxy http://127.0.0.1:3128)
-  HDRS=()
-  [ -n "$REFERER" ] && HDRS=(-headers "Referer: $REFERER
-")
-  # Reconnect: fuentes continuas conservan reconnect_at_eof + reintento en 5xx.
-  # HLS .m3u8 (ventana corta, origen a veces 502): SIN reconnect_at_eof (no bucle en el
-  # fin normal del playlist) y SIN reconnect_on_http_error 5xx (no se atasca reintentando
-  # un segmento ya expirado; deja que el demuxer HLS avance al siguiente).
-  RECONN=(-reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -reconnect_on_network_error 1 -reconnect_on_http_error 4xx,5xx)
-  if [[ "$URL" == *.m3u8* ]]; then
-    RECONN=(-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1)
-  fi
-  exec ffmpeg -y -loglevel warning -fflags nobuffer \
-    "${RECONN[@]}" \
-    -reconnect_delay_max 10 "${PROXY[@]}" "${HDRS[@]}" \
-    -user_agent "MediaDEV/1.0" -i "$URL" "${OUT[@]}" "${HLS[@]}"
-fi
+    run_url "$URL"
+    RC=$?
+    echo "[$STREAM_ID] ffmpeg salió rc=$RC"
+
+    sleep "$RETRY_DELAY"
+
+    if [[ $URL_COUNT -gt 1 ]]; then
+        url_fails=$(( url_fails + 1 ))
+        if [[ $url_fails -ge $URL_RETRY_LIMIT ]]; then
+            url_idx=$(( (url_idx + 1) % URL_COUNT ))
+            url_fails=0
+            echo "[$STREAM_ID] → rotando a URL $((url_idx+1))/$URL_COUNT"
+        fi
+    fi
+done

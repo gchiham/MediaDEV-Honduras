@@ -7,33 +7,50 @@ El estado operativo (salud, circuit breaker) vive en memoria y se recalcula
 desde el filesystem. PostgreSQL (media-db) es un espejo de solo-lectura para el
 dashboard; si la DB no está disponible el daemon sigue operando normalmente.
 """
-import os, sys, subprocess, time, signal, logging, boto3
+import os, sys, subprocess, time, signal, logging, boto3, json, tempfile
 import psycopg2
-from botocore.exceptions import ClientError
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 STREAMS_ROOT = Path(os.environ.get("STREAMS_ROOT", "/var/www/streams"))
 LOG_FILE     = os.environ.get("STREAMS_LOG",  "/var/log/streams/daemon.log")
+STATIONS     = Path(os.environ.get("STATIONS_JSON", "/opt/media-ai/config/stations.json"))
 
-STREAMS = [
-    "fm_941","hch_tv","radio_america","radio_choluteca","radio_el_patio",
-    "radio_globo","radio_satelite","suave_fm","teleceiba",
-    "xy_hrn","xy_sps","xy_tgu","canal_11",
-]
-TV_STREAMS = {"hch_tv", "teleceiba", "canal_11"}
+FALLBACK_STREAMS = ["fm_941", "hch_tv", "radio_america", "radio_choluteca", "radio_el_patio", "radio_globo", "radio_satelite", "suave_fm", "teleceiba", "xy_hrn", "xy_sps", "xy_tgu", "canal_11", "canal_6", "canal_5", "tsi"]
+FALLBACK_TV_STREAMS = {"hch_tv", "teleceiba", "canal_11", "canal_6", "canal_5", "tsi"}
 
-STALE_SECS          = 60
-CB_FAIL_OPEN        = 5
-CB_RESET_SECS       = 1800
+def load_stream_catalog() -> tuple[list[str], set[str]]:
+    try:
+        data = json.loads(STATIONS.read_text())
+        enabled = [s for s in data.get("stations", []) if s.get("enabled", True)]
+        streams = [s["id"] for s in enabled if s.get("id")]
+        tv_streams = {s["id"] for s in enabled if s.get("type") == "tv" and s.get("id")}
+        if streams:
+            return streams, tv_streams
+    except Exception:
+        pass
+    return FALLBACK_STREAMS, FALLBACK_TV_STREAMS
+
+STREAMS, TV_STREAMS = load_stream_catalog()
+
+STALE_SECS          = 90
+CB_FAIL_OPEN        = 8
+CB_RESET_SECS       = 600
 RESTART_AFTER_FAILS = 3
-RESTART_GRACE_SECS  = int(os.environ.get("RESTART_GRACE_SECS", "35"))
+RESTART_GRACE_SECS  = int(os.environ.get("RESTART_GRACE_SECS", "45"))
+DOWN_EVENT_AFTER_SECS = int(os.environ.get("DOWN_EVENT_AFTER_SECS", "180"))
 SEG_DURATION        = 4
 TGU = timezone(timedelta(hours=-6))
 RECORDING_NAMING_MODE = os.environ.get("RECORDING_NAMING_MODE", "utc").strip().lower()
 KEEP_SEG_HOURS = 8
 KEEP_MP3_COUNT = 8
+MIN_AUDIO_SECONDS = int(os.environ.get("MIN_AUDIO_SECONDS", "60"))
+FULL_HOUR_MIN_SECONDS = int(os.environ.get("FULL_HOUR_MIN_SECONDS", "3300"))
+RECORDING_ALERT_MIN_SECONDS = int(os.environ.get("RECORDING_ALERT_MIN_SECONDS", "900"))
+S3_UPLOAD_RETRIES = int(os.environ.get("S3_UPLOAD_RETRIES", "3"))
+PIPELINE_VERSION = os.environ.get("PIPELINE_VERSION", "utc_v2")
+TG_ENV_FILE = os.environ.get("TG_ENV_FILE", "/opt/destroyer/.env")
 
 # ── S3 ────────────────────────────────────────────────────────────────────────
 S3_BUCKET  = os.environ.get("S3_BUCKET",  "mediadev-recordings")
@@ -41,19 +58,43 @@ S3_REGION  = os.environ.get("S3_REGION",  "us-east-1")
 PEER_ROLE  = os.environ.get("PEER_ROLE",  "primary")
 BACKUP_PFX = "_backup"
 
-def s3_upload(local_path: Path, stream_id: str) -> bool:
+def audio_s3_key(local_path: Path, stream_id: str) -> str:
+    date_part = local_path.name[:10]
+    year, month = date_part[:4], date_part[5:7]
+    canon = f"{stream_id}/{year}/{month}/{local_path.name}"
+    return f"{BACKUP_PFX}/{canon}" if PEER_ROLE == "backup" else canon
+
+def s3_upload_verified(local_path: Path, stream_id: str) -> tuple[bool, str, str | None]:
+    s3 = boto3.client("s3", region_name=S3_REGION)
+    key = audio_s3_key(local_path, stream_id)
+    size = local_path.stat().st_size
+    last_error = None
+
+    for attempt in range(1, S3_UPLOAD_RETRIES + 1):
+        try:
+            s3.upload_file(str(local_path), S3_BUCKET, key,
+                           ExtraArgs={"ContentType": "audio/mpeg"})
+            head = s3.head_object(Bucket=S3_BUCKET, Key=key)
+            if int(head.get("ContentLength", -1)) != size:
+                raise RuntimeError(f"size mismatch local={size} s3={head.get('ContentLength')}")
+            log.info(f"[{stream_id}] S3 OK [{PEER_ROLE}] → s3://{S3_BUCKET}/{key}")
+            return True, key, None
+        except Exception as e:
+            last_error = str(e)
+            log.warning(f"[{stream_id}] S3 intento {attempt}/{S3_UPLOAD_RETRIES} falló: {e}")
+            time.sleep(min(2 ** attempt, 15))
+
+    log.error(f"[{stream_id}] S3 FAIL final: {last_error}")
+    return False, key, last_error
+
+def s3_object_matches(key: str, size: int) -> bool:
     try:
         s3 = boto3.client("s3", region_name=S3_REGION)
-        date_part = local_path.name[:10]
-        year, month = date_part[:4], date_part[5:7]
-        canon = f"{stream_id}/{year}/{month}/{local_path.name}"
-        key   = f"{BACKUP_PFX}/{canon}" if PEER_ROLE == "backup" else canon
-        s3.upload_file(str(local_path), S3_BUCKET, key,
-                       ExtraArgs={"ContentType": "audio/mpeg"})
-        log.info(f"[{stream_id}] S3 OK [{PEER_ROLE}] → s3://{S3_BUCKET}/{key}")
-        return True
-    except Exception as e:
-        log.error(f"[{stream_id}] S3 FAIL: {e}")
+        head = s3.head_object(Bucket=S3_BUCKET, Key=key)
+        if size <= 0:
+            return True
+        return int(head.get("ContentLength", -1)) == size
+    except Exception:
         return False
 
 # Intervalos
@@ -62,6 +103,7 @@ INTERVAL_METRICS = 60
 INTERVAL_RECORD  = 120
 INTERVAL_CLEAN   = 1800
 LOOP_SLEEP       = 2
+AUTO_BACKFILL_HOURS = int(os.environ.get("AUTO_BACKFILL_HOURS", "3"))
 
 # ── PostgreSQL (estado para el dashboard) ──────────────────────────────────────
 # El estado operativo vive en memoria; PostgreSQL es solo un espejo para el
@@ -75,6 +117,7 @@ METRICS_RETENTION_DAYS = 7
 EVENTS_RETENTION_DAYS  = 30
 
 _pg = None
+_schema_cols: dict[str, set[str]] = {}
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -122,11 +165,214 @@ def pg_write(sql, params=(), many=False):
         global _pg
         _pg = None
 
+def table_columns(table: str) -> set[str]:
+    cols = _schema_cols.get(table)
+    if cols is not None:
+        return cols
+
+    conn = pg()
+    if conn is None:
+        return set()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = %s
+                """,
+                (table,),
+            )
+            cols = {row[0] for row in cur.fetchall()}
+            _schema_cols[table] = cols
+            return cols
+    except Exception as e:
+        log.warning(f"[pg] no se pudo leer schema de {table}: {e}")
+        return set()
+
 def pg_event(sid, etype, detail=""):
     pg_write(
         "INSERT INTO mediadev_events (stream_id, ts, etype, detail) VALUES (%s,%s,%s,%s)",
         (sid, utc_epoch(), etype, detail),
     )
+
+def coverage_upsert(
+    stream_id: str,
+    media_type: str,
+    period_start: datetime,
+    period_end: datetime,
+    expected_seconds: int,
+    status: str,
+    *,
+    actual_seconds: float | None = None,
+    local_path: Path | None = None,
+    s3_key: str | None = None,
+    reason: str | None = None,
+    size_bytes: int | None = None,
+    upload_attempts: int = 0,
+    last_error: str | None = None,
+    source_service: str = "stream-daemon",
+) -> None:
+    if not table_columns("recording_coverage"):
+        return
+
+    pg_write(
+        """
+        INSERT INTO recording_coverage
+          (stream_id, media_type, period_start_utc, period_end_utc,
+           expected_seconds, actual_seconds, local_path, s3_key, status, reason,
+           size_bytes, upload_attempts, last_error, source_service,
+           pipeline_version, updated_at)
+        VALUES
+          (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+        ON CONFLICT (stream_id, media_type, period_start_utc) DO UPDATE SET
+          period_end_utc=EXCLUDED.period_end_utc,
+          expected_seconds=EXCLUDED.expected_seconds,
+          actual_seconds=EXCLUDED.actual_seconds,
+          local_path=EXCLUDED.local_path,
+          s3_key=EXCLUDED.s3_key,
+          status=EXCLUDED.status,
+          reason=EXCLUDED.reason,
+          size_bytes=EXCLUDED.size_bytes,
+          upload_attempts=recording_coverage.upload_attempts + EXCLUDED.upload_attempts,
+          last_error=EXCLUDED.last_error,
+          source_service=EXCLUDED.source_service,
+          pipeline_version=EXCLUDED.pipeline_version,
+          updated_at=NOW()
+        """,
+        (
+            stream_id, media_type, period_start, period_end, expected_seconds,
+            actual_seconds, str(local_path) if local_path else None, s3_key,
+            status, reason, size_bytes, upload_attempts, last_error,
+            source_service, PIPELINE_VERSION,
+        ),
+    )
+
+def s3_scan_register(s3_key: str, stream_id: str, hour_start_utc: datetime) -> None:
+    cols = table_columns("s3_scan_log")
+    if not cols:
+        return
+
+    insert_cols = ["s3_key", "stream", "recorded_date", "status", "updated_at"]
+    values = [s3_key, stream_id, hour_start_utc.date().isoformat(), "pending", utc_now()]
+
+    if "hour_start_utc" in cols:
+        insert_cols.append("hour_start_utc")
+        values.append(hour_start_utc)
+    if "pipeline_version" in cols:
+        insert_cols.append("pipeline_version")
+        values.append(PIPELINE_VERSION)
+
+    pg_write(
+        f"""
+        INSERT INTO s3_scan_log ({', '.join(insert_cols)})
+        VALUES ({', '.join(['%s'] * len(values))})
+        ON CONFLICT (s3_key) DO NOTHING
+        """,
+        values,
+    )
+
+def ffprobe_duration(path: Path, stream_selector: str = "a:0") -> tuple[float | None, str | None]:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", stream_selector,
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None, (result.stderr or "ffprobe failed")[-300:]
+    try:
+        return float(result.stdout.strip()), None
+    except ValueError:
+        return None, f"duration parse failed: {result.stdout.strip()}"
+
+def validate_audio(path: Path) -> tuple[bool, float | None, str | None]:
+    if not path.exists() or path.stat().st_size == 0:
+        return False, None, "missing_or_empty"
+
+    duration, err = ffprobe_duration(path, "a:0")
+    if duration is None:
+        return False, None, err or "no_audio_duration"
+    if duration < MIN_AUDIO_SECONDS:
+        return False, duration, f"too_short_{int(duration)}s"
+    if duration < FULL_HOUR_MIN_SECONDS:
+        return True, duration, f"partial_{int(duration)}s"
+    return True, duration, None
+
+def concat_file_line(path: Path) -> str:
+    safe = str(path.resolve()).replace("'", "'\\''")
+    return f"file '{safe}'"
+
+def parse_recording_hour(name: str) -> datetime | None:
+    stem = name.removesuffix(".mp3")
+    for fmt in ("%Y-%m-%dT%HZ", "%Y-%m-%d_%Hh"):
+        try:
+            dt = datetime.strptime(stem, fmt)
+            tz = timezone.utc if fmt == "%Y-%m-%dT%HZ" else TGU
+            return dt.replace(tzinfo=tz).astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+def recover_pending_audio_uploads() -> None:
+    for sid in STREAMS:
+        if sid in TV_STREAMS:
+            continue
+        rec_dir = STREAMS_ROOT / sid / "recordings"
+        if not rec_dir.exists():
+            continue
+
+        for mp3 in sorted(rec_dir.glob("*.mp3"), key=lambda f: f.name):
+            hour_start = parse_recording_hour(mp3.name)
+            if hour_start is None:
+                continue
+            hour_end = hour_start + timedelta(hours=1)
+            valid, duration, reason = validate_audio(mp3)
+            size = mp3.stat().st_size if mp3.exists() else 0
+            if not valid:
+                coverage_upsert(
+                    sid, "audio", hour_start, hour_end, 3600, "invalid",
+                    actual_seconds=duration,
+                    local_path=mp3,
+                    reason=reason,
+                    size_bytes=size,
+                    source_service="stream-daemon",
+                )
+                continue
+
+            key = audio_s3_key(mp3, sid)
+            if s3_object_matches(key, size):
+                s3_scan_register(key, sid, hour_start)
+                coverage_upsert(
+                    sid, "audio", hour_start, hour_end, 3600, "uploaded",
+                    actual_seconds=duration,
+                    local_path=mp3,
+                    s3_key=key,
+                    reason=reason,
+                    size_bytes=size,
+                    source_service="stream-daemon",
+                )
+                continue
+
+            ok, key, err = s3_upload_verified(mp3, sid)
+            coverage_upsert(
+                sid, "audio", hour_start, hour_end, 3600,
+                "uploaded" if ok else "upload_failed",
+                actual_seconds=duration,
+                local_path=mp3,
+                s3_key=key,
+                reason=reason,
+                size_bytes=size,
+                upload_attempts=1 if ok else S3_UPLOAD_RETRIES,
+                last_error=err,
+                source_service="stream-daemon",
+            )
+            if ok:
+                s3_scan_register(key, sid, hour_start)
 
 # ── LOGGING ───────────────────────────────────────────────────────────────────
 Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
@@ -136,6 +382,64 @@ logging.basicConfig(
     handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("daemon")
+
+# ── TELEGRAM (alertas agregadas de cobertura) ────────────────────────────────
+_tg_creds = None
+_recording_alert_sent_hours: set[int] = set()
+
+def _tg_get_creds():
+    global _tg_creds
+    if _tg_creds is not None:
+        return _tg_creds
+
+    tok = os.environ.get("TG_TOKEN")
+    chat = os.environ.get("TG_CHAT")
+    if not (tok and chat):
+        try:
+            for line in Path(TG_ENV_FILE).read_text().splitlines():
+                line = line.strip()
+                if line.startswith("TG_TOKEN=") and not tok:
+                    tok = line.split("=", 1)[1].strip().strip('"').strip("'")
+                elif line.startswith("TG_CHAT=") and not chat:
+                    chat = line.split("=", 1)[1].strip().strip('"').strip("'")
+        except Exception:
+            pass
+
+    _tg_creds = (tok, chat)
+    return _tg_creds
+
+def tg_send(text: str) -> None:
+    tok, chat = _tg_get_creds()
+    if not (tok and chat):
+        return
+    try:
+        import requests
+        requests.post(
+            f"https://api.telegram.org/bot{tok}/sendMessage",
+            json={"chat_id": chat, "text": text},
+            timeout=10,
+        )
+    except Exception as e:
+        log.warning(f"tg_send error: {e}")
+
+def send_recording_coverage_alert(hour_epoch: int, low_coverage: list[tuple[str, int]]) -> None:
+    if not low_coverage or hour_epoch in _recording_alert_sent_hours:
+        return
+
+    _recording_alert_sent_hours.add(hour_epoch)
+    label = recording_hour_label(hour_epoch)
+    lines = "\n".join(
+        f"- {sid}: {seconds // 60} min aprox" for sid, seconds in low_coverage
+    )
+    log.warning(f"[recording] ALERTA cobertura baja {label}: {low_coverage}")
+    tg_send(
+        "⚠️ COBERTURA BAJA DE GRABACIÓN\n"
+        f"Hora {label}\n"
+        f"Umbral: {RECORDING_ALERT_MIN_SECONDS // 60} min\n\n"
+        f"{lines}\n\n"
+        "No significa necesariamente que el stream cayó completo; revisar "
+        "recording_coverage y logs de mediaCAP."
+    )
 
 # ── STATE (en memoria) ────────────────────────────────────────────────────────
 def init_state():
@@ -152,9 +456,32 @@ def init_state():
             "last_up":       0,
             "restart_today": 0,
             "restart_grace_until": 0,
+            "first_bad_since": 0,
+            "down_event_sent": False,
         }
         for sid in STREAMS
     }
+
+def refresh_catalog_state(state):
+    global STREAMS, TV_STREAMS
+    streams, tv_streams = load_stream_catalog()
+    if streams == STREAMS and tv_streams == TV_STREAMS:
+        return
+
+    previous = set(STREAMS)
+    STREAMS = streams
+    TV_STREAMS = tv_streams
+    for sid in STREAMS:
+        state.setdefault(sid, init_state().get(sid, {
+            "status": "UNKNOWN", "sup": "UNKNOWN", "segs": 0, "age": 0,
+            "cb_state": "CLOSED", "cb_fails": 0, "cb_since": 0,
+            "last_down": 0, "last_up": 0, "restart_today": 0,
+            "restart_grace_until": 0,
+            "first_bad_since": 0, "down_event_sent": False,
+        }))
+    for sid in previous - set(STREAMS):
+        state.pop(sid, None)
+    log.info(f"Catálogo actualizado: {len(STREAMS)} streams ({len(TV_STREAMS)} TV)")
 
 # ── HEALTH CHECK ──────────────────────────────────────────────────────────────
 def sup_statuses():
@@ -185,6 +512,7 @@ def restart_stream(state, sid):
     state[sid]["restart_grace_until"] = utc_epoch() + RESTART_GRACE_SECS
 
 def do_health(state):
+    refresh_catalog_state(state)
     now  = utc_epoch()
     sups = sup_statuses()
 
@@ -219,20 +547,28 @@ def do_health(state):
 
         if ok:
             s["cb_fails"] = 0
+            s["first_bad_since"] = 0
             if prev not in ("OK", "UNKNOWN"):
                 log.info(f"[{sid}] ↑ UP")
                 s["last_up"] = now
-                pg_event(sid, "UP")
+                if s.get("down_event_sent"):
+                    pg_event(sid, "UP")
+                s["down_event_sent"] = False
             s["status"] = "OK"
         else:
             s["status"] = "STALE" if m3u8.exists() else "NO_M3U8"
+            if not s.get("first_bad_since"):
+                s["first_bad_since"] = now
             if s["restart_grace_until"] > now:
                 continue
             s["cb_fails"] += 1
             if prev == "OK":
                 log.warning(f"[{sid}] ↓ DOWN age={age}s cb_fails={s['cb_fails']} empty={empty_playlist}")
                 s["last_down"] = now
-                pg_event(sid, "DOWN", f"age={age}s empty={empty_playlist}")
+            down_for = now - (s.get("first_bad_since") or now)
+            if not s.get("down_event_sent") and down_for >= DOWN_EVENT_AFTER_SECS:
+                pg_event(sid, "DOWN", f"age={age}s down_for={down_for}s empty={empty_playlist}")
+                s["down_event_sent"] = True
             if not empty_playlist and s["cb_fails"] >= RESTART_AFTER_FAILS and s["cb_fails"] <= CB_FAIL_OPEN:
                 log.info(f"[{sid}] Reiniciando ffmpeg tras {s['cb_fails']} fallos")
                 restart_stream(state, sid)
@@ -287,166 +623,166 @@ def do_metrics(state):
         rows, many=True,
     )
 
-# ── TELEGRAM (alertas de grabación) ───────────────────────────────────────────
-# Las credenciales viven en /opt/destroyer/.env (no en el env del daemon).
-TG_ENV_FILE         = "/opt/destroyer/.env"
-TG_ALERT_COOLDOWN_S = 3 * 3600     # no repetir alerta del mismo stream antes de 3h
-_tg_creds           = None
-_tg_last_alert: dict = {}
-
-def _tg_get_creds():
-    global _tg_creds
-    if _tg_creds is not None:
-        return _tg_creds
-    tok = os.environ.get("TG_TOKEN"); chat = os.environ.get("TG_CHAT")
-    if not (tok and chat):
-        try:
-            for line in Path(TG_ENV_FILE).read_text().splitlines():
-                line = line.strip()
-                if line.startswith("TG_TOKEN=") and not tok:
-                    tok = line.split("=", 1)[1].strip().strip('"').strip("'")
-                elif line.startswith("TG_CHAT=") and not chat:
-                    chat = line.split("=", 1)[1].strip().strip('"').strip("'")
-        except Exception:
-            pass
-    _tg_creds = (tok, chat)
-    return _tg_creds
-
-def tg_send(text: str) -> None:
-    tok, chat = _tg_get_creds()
-    if not (tok and chat):
-        return
-    try:
-        import requests
-        requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                      json={"chat_id": chat, "text": text}, timeout=10)
-    except Exception as e:
-        log.warning(f"tg_send error: {e}")
-
-
-# ── Dedupe contra S3 (fuente de verdad, cacheada en memoria) ──────────────────
-# Evita re-encodear horas que ya están en S3 (aunque su .mp3 local fue rotado) y
-# evita falsas alertas de "captura caída" para horas que sí se grabaron.
-_s3_have: set = set()
-_s3_client_cached = None
-
-def _s3c():
-    global _s3_client_cached
-    if _s3_client_cached is None:
-        _s3_client_cached = boto3.client("s3", region_name=S3_REGION)
-    return _s3_client_cached
-
-def _canon_key(sid: str, h_label: str) -> str:
-    y, m = h_label[:4], h_label[5:7]
-    key = f"{sid}/{y}/{m}/{h_label}.mp3"
-    return f"{BACKUP_PFX}/{key}" if PEER_ROLE == "backup" else key
-
-def _in_s3(key: str) -> bool:
-    if key in _s3_have:
-        return True
-    try:
-        _s3c().head_object(Bucket=S3_BUCKET, Key=key)
-        _s3_have.add(key)
-        return True
-    except Exception:
-        return False
-
-
 # ── HOURLY RECORDINGS ─────────────────────────────────────────────────────────
-AUTO_BACKFILL_HOURS = 3   # graba/recupera las últimas N horas completas que falten
-ALERT_MISSED_HOURS  = 2   # alerta si las últimas N horas no se pudieron grabar
-
-def _encode_and_store(sid, h_label, segs, rec_dir, out) -> bool:
-    """Concatena los .ts → MP3, sube (radio) y rota. Aislado: nunca lanza."""
-    try:
-        result = subprocess.run(
-            ["ffmpeg","-y","-loglevel","error","-i","pipe:0",
-             "-c:a","libmp3lame","-b:a","64k","-ac","1","-ar","22050",str(out)],
-            input=b"".join(f.read_bytes() for f in segs),
-            capture_output=True
-        )
-        if result.returncode == 0 and out.exists():
-            log.info(f"[{sid}] {h_label}.mp3 OK ({out.stat().st_size//1024}KB)")
-            if sid in TV_STREAMS:
-                log.info(f"[{sid}] MP3 horario local OK — S3 lo publica video_segment_uploader para mantener sincronia con video")
-            else:
-                s3_upload(out, sid)
-            for old in sorted(rec_dir.glob("*.mp3"), key=lambda f: f.name, reverse=True)[KEEP_MP3_COUNT:]:
-                old.unlink(missing_ok=True)
-            return True
-        out.unlink(missing_ok=True)
-        log.error(f"[{sid}] Fallo grabando {h_label} (rc={result.returncode}, existe={out.exists()})")
-        return False
-    except Exception as e:
-        log.error(f"[{sid}] Excepción grabando {h_label}: {e}")
-        return False
-
-def _recording_alert(sid, cur_h, status, now):
-    """#2 — alerta Telegram si la captura de un stream está caída.
-
-    Señal: la hora recién cerrada no tuvo material (<10 segs) ni quedó en S3 →
-    el HLS de ese stream no está produciendo segmentos = captura caída. (Las horas
-    viejas con material ya rotado NO disparan: el dedupe contra S3 las marca 'exists'.)
-    """
-    last_h = cur_h - 3600
-    if status.get(last_h) not in ("no_material", "failed"):
-        return
-    if now - _tg_last_alert.get(sid, 0) < TG_ALERT_COOLDOWN_S:
-        return
-    _tg_last_alert[sid] = now
-    lbl = recording_hour_label(last_h)
-    log.warning(f"[{sid}] ALERTA: hora {lbl} sin grabar (captura caída)")
-    tg_send(f"⚠️ GRABACIÓN CAÍDA — {sid}\n"
-            f"La hora {lbl} no se grabó (sin segmentos / HLS caído).\n"
-            f"Revisar la captura de {sid} en mediaCAP.")
-
 def do_record(state):
-    now   = utc_epoch()
+    now = utc_epoch()
     cur_h = now - now % 3600
-    # #3 auto-backfill: intenta las últimas N horas COMPLETAS que falten. Como los
-    # .ts viven 8h, un fallo puntual (o un ciclo perdido) se recupera solo en el
-    # siguiente ciclo, sin intervención manual. Barato: si el .mp3 ya existe local
-    # (se guardan KEEP_MP3_COUNT), solo hace un stat() y sigue — no re-encodea.
-    target = [cur_h - 3600 * k for k in range(1, AUTO_BACKFILL_HOURS + 1)]
+    targets = [cur_h - 3600 * k for k in range(1, AUTO_BACKFILL_HOURS + 1)]
+
+    recover_pending_audio_uploads()
+    low_coverage_by_hour: dict[int, list[tuple[str, int]]] = {h: [] for h in targets}
 
     for sid in STREAMS:
-        # La grabación MP3 desde .ts es solo para RADIO. Los .ts de TV los sube y
-        # BORRA el video_segment_uploader (que además genera su audio horario), así
-        # que do_record no puede juzgarlos — saltarlos evita falsas alertas.
         if sid in TV_STREAMS:
             continue
+
         rec_dir = STREAMS_ROOT / sid / "recordings"
         rec_dir.mkdir(parents=True, exist_ok=True)
+
         seg_mtimes = None
-        status = {}
-        for h in target:
-            h_label = recording_hour_label(h)
+        for h_start in targets:
+            h_end   = h_start + 3600
+            h_label = recording_hour_label(h_start)
+            period_start = datetime.fromtimestamp(h_start, tz=timezone.utc)
+            period_end = datetime.fromtimestamp(h_end, tz=timezone.utc)
             out = rec_dir / f"{h_label}.mp3"
-            key = _canon_key(sid, h_label)
-            # Dedupe: ya grabada localmente, o ya en S3 (aunque el .mp3 local rotó)
-            if out.exists() or _in_s3(key):
-                status[h] = "exists"
+            key = audio_s3_key(out, sid)
+
+            if out.exists():
                 continue
-            if seg_mtimes is None:   # glob una sola vez por stream, y solo si falta algo
+            if s3_object_matches(key, 0):
+                s3_scan_register(key, sid, period_start)
+                coverage_upsert(
+                    sid, "audio", period_start, period_end, 3600, "uploaded",
+                    s3_key=key,
+                    reason="already_in_s3",
+                    source_service="stream-daemon",
+                )
+                continue
+
+            if seg_mtimes is None:
                 seg_mtimes = []
                 for f in (STREAMS_ROOT / sid).glob("seg_*.ts"):
                     try:
-                        seg_mtimes.append((f, f.stat().st_mtime))
+                        if f.exists():
+                            seg_mtimes.append((f, f.stat().st_mtime))
                     except OSError:
                         pass
-            segs = [f for f, mt in sorted(seg_mtimes, key=lambda x: x[1])
-                    if h <= mt < h + 3600]
-            if len(segs) < 10:
-                status[h] = "no_material"
-                continue
-            log.info(f"[{sid}] Grabando {h_label} ({len(segs)} segs)")
-            if _encode_and_store(sid, h_label, segs, rec_dir, out):
-                status[h] = "recorded"
-                _s3_have.add(key)
-            else:
-                status[h] = "failed"
 
-        _recording_alert(sid, cur_h, status, now)
+            segs = [
+                f for f, mt in sorted(seg_mtimes, key=lambda item: item[1])
+                if h_start <= mt < h_end
+            ]
+            if len(segs) < 10:
+                coverage_upsert(
+                    sid, "audio", period_start, period_end, 3600, "skipped",
+                    actual_seconds=len(segs) * SEG_DURATION,
+                    reason=f"insufficient_segments_{len(segs)}",
+                    source_service="stream-daemon",
+                )
+                if h_start == targets[0]:
+                    low_coverage_by_hour[h_start].append((sid, len(segs) * SEG_DURATION))
+                continue
+
+            log.info(f"[{sid}] Grabando {h_label} ({len(segs)} segs)")
+            coverage_upsert(
+                sid, "audio", period_start, period_end, 3600, "pending",
+                actual_seconds=len(segs) * SEG_DURATION,
+                local_path=out,
+                reason="building_mp3",
+                source_service="stream-daemon",
+            )
+
+            with tempfile.TemporaryDirectory(prefix=f"mediadev_{sid}_") as tmpdir:
+                concat = Path(tmpdir) / "segments.txt"
+                concat.write_text("\n".join(concat_file_line(f) for f in segs) + "\n")
+                result = subprocess.run(
+                    ["ffmpeg", "-y", "-loglevel", "error",
+                     "-f", "concat", "-safe", "0", "-i", str(concat),
+                     "-c:a", "libmp3lame", "-b:a", "64k", "-ac", "1", "-ar", "22050",
+                     str(out)],
+                    capture_output=True, text=True,
+                )
+
+            if result.returncode != 0:
+                out.unlink(missing_ok=True)
+                err = (result.stderr or "ffmpeg failed")[-300:]
+                coverage_upsert(
+                    sid, "audio", period_start, period_end, 3600, "invalid",
+                    actual_seconds=len(segs) * SEG_DURATION,
+                    local_path=out,
+                    reason="ffmpeg_failed",
+                    last_error=err,
+                    source_service="stream-daemon",
+                )
+                log.error(f"[{sid}] Fallo grabando {h_label}: {err}")
+                if h_start == targets[0] and len(segs) * SEG_DURATION < RECORDING_ALERT_MIN_SECONDS:
+                    low_coverage_by_hour[h_start].append((sid, len(segs) * SEG_DURATION))
+                continue
+
+            valid, duration, reason = validate_audio(out)
+            size = out.stat().st_size if out.exists() else 0
+            if not valid:
+                out.unlink(missing_ok=True)
+                coverage_upsert(
+                    sid, "audio", period_start, period_end, 3600, "invalid",
+                    actual_seconds=duration,
+                    local_path=out,
+                    reason=reason,
+                    size_bytes=size,
+                    source_service="stream-daemon",
+                )
+                log.error(f"[{sid}] {h_label}.mp3 inválido: {reason}")
+                if h_start == targets[0] and (duration or 0) < RECORDING_ALERT_MIN_SECONDS:
+                    low_coverage_by_hour[h_start].append((sid, int(duration or 0)))
+                continue
+
+            coverage_upsert(
+                sid, "audio", period_start, period_end, 3600, "validated",
+                actual_seconds=duration,
+                local_path=out,
+                reason=reason,
+                size_bytes=size,
+                source_service="stream-daemon",
+            )
+            log.info(f"[{sid}] {h_label}.mp3 OK ({size//1024}KB, {int(duration or 0)}s)")
+            if h_start == targets[0] and (duration or 0) < RECORDING_ALERT_MIN_SECONDS:
+                low_coverage_by_hour[h_start].append((sid, int(duration or 0)))
+
+            ok, key, err = s3_upload_verified(out, sid)
+            if ok:
+                s3_scan_register(key, sid, period_start)
+                coverage_upsert(
+                    sid, "audio", period_start, period_end, 3600, "uploaded",
+                    actual_seconds=duration,
+                    local_path=out,
+                    s3_key=key,
+                    reason=reason,
+                    size_bytes=size,
+                    upload_attempts=1,
+                    source_service="stream-daemon",
+                )
+            else:
+                coverage_upsert(
+                    sid, "audio", period_start, period_end, 3600, "upload_failed",
+                    actual_seconds=duration,
+                    local_path=out,
+                    s3_key=key,
+                    reason=reason,
+                    size_bytes=size,
+                    upload_attempts=S3_UPLOAD_RETRIES,
+                    last_error=err,
+                    source_service="stream-daemon",
+                )
+                continue
+
+            if ok:
+                old_files = sorted(rec_dir.glob("*.mp3"), key=lambda f: f.name, reverse=True)[KEEP_MP3_COUNT:]
+                for old in old_files:
+                    old.unlink()
+
+    for h_start, low_coverage in low_coverage_by_hour.items():
+        send_recording_coverage_alert(h_start, low_coverage)
 
 # ── CLEANUP ───────────────────────────────────────────────────────────────────
 def do_cleanup(state):
@@ -489,6 +825,7 @@ def main():
     log.info(f"health={INTERVAL_HEALTH}s metrics={INTERVAL_METRICS}s clean={INTERVAL_CLEAN}s loop={LOOP_SLEEP}s")
 
     state = init_state()
+    recover_pending_audio_uploads()
 
     running = [True]
     def _stop(sig, frame):

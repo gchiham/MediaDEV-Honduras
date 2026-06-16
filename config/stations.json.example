@@ -129,11 +129,9 @@
       "id": "teleceiba",
       "name": "Teleceiba",
       "type": "tv",
-      "route": "gateway",
-      "gateway": "hn02",
-      "url": "http://190.11.224.14:8200/tlcb720.m3u8",
-      "enabled": true,
-      "referer": "http://190.11.224.14:8200/"
+      "route": "direct",
+      "url": "http://YOUR_IPTV_SERVER/live/USER/PASS/STREAM_ID.m3u8",
+      "enabled": true
     },
     {
       "id": "radio_choluteca",
@@ -151,6 +149,32 @@
       "route": "auto",
       "gateway": "hn02",
       "url": "https://redirector.rudo.video/hls-video/c54ac2799874375c81c1672abb700870537c5223/canal11hn/canal11hn.smil/playlist.m3u8",
+      "enabled": true
+    },
+    {
+      "id": "canal_6",
+      "name": "Canal 6",
+      "type": "tv",
+      "route": "direct",
+      "url": "http://YOUR_IPTV_SERVER/live/USER/PASS/STREAM_ID.m3u8",
+      "enabled": true
+    },
+    {
+      "id": "canal_5",
+      "name": "Canal 5",
+      "type": "tv",
+      "route": "direct",
+      "urls": [
+        "http://YOUR_IPTV_SERVER/live/USER/PASS/STREAM_ID.m3u8"
+      ],
+      "enabled": true
+    },
+    {
+      "id": "tsi",
+      "name": "TSI",
+      "type": "tv",
+      "route": "direct",
+      "url": "http://YOUR_IPTV_SERVER/live/USER/PASS/STREAM_ID.m3u8",
       "enabled": true
     }
   ]

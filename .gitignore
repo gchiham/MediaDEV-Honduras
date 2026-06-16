@@ -50,3 +50,4 @@ scripts_backup_rpi/
 monitor/events.db
 monitor/logs/
 config/stations.json.bak
+config/stations.json

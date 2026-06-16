@@ -2,8 +2,8 @@
 tools/actions.py — Herramientas de acción (escritura) para el MCP de MediaDEV.
 
 restart_stream   — Reinicia un stream por supervisorctl
-add_stream       — Agrega un canal nuevo (stations.json + supervisor + daemon)
-update_stream    — Modifica campos de un canal existente
+add_stream       — Agrega un canal nuevo (stations.json + supervisor + daemon + stream_catalog)
+update_stream    — Modifica campos de un canal existente (+ sincroniza stream_catalog)
 """
 import json
 import re
@@ -11,14 +11,46 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-STATIONS_JSON  = Path("/opt/media-ai/config/stations.json")
-SUPERVISOR_CONF = Path("/etc/supervisor/conf.d/mediadev_streams.conf")
-DAEMON_PY      = Path("/opt/media-ai/daemon/stream_daemon.py")
+import psycopg2
+from dotenv import dotenv_values
 
-ALLOWED_UPDATE_FIELDS = {"url", "route", "gateway", "referer", "enabled", "name"}
+STATIONS_JSON   = Path("/opt/media-ai/config/stations.json")
+SUPERVISOR_CONF = Path("/etc/supervisor/conf.d/mediadev_streams.conf")
+
+ALLOWED_UPDATE_FIELDS = {"url", "urls", "route", "gateway", "referer", "enabled", "name"}
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+def _pg_write(sql: str, params: tuple = ()) -> None:
+    """Ejecuta una escritura en PostgreSQL. Nunca lanza — loguea el error."""
+    try:
+        cfg = dotenv_values("/etc/mediadev-db.env")
+        conn = psycopg2.connect(
+            host=cfg.get("PG_HOST"), port=int(cfg.get("PG_PORT", "25060")),
+            dbname=cfg.get("PG_DB"), user=cfg.get("PG_USER"), password=cfg.get("PG_PASS"),
+            connect_timeout=5, sslmode="require",
+        )
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+        conn.close()
+    except Exception as e:
+        print(f"[pg_write] error: {e}")
+
+
+def _catalog_upsert(stream_id: str, name: str, stream_type: str) -> None:
+    """Inserta o actualiza la entrada en stream_catalog con el tipo correcto."""
+    _pg_write(
+        """INSERT INTO stream_catalog (id, name, type, country_code, timezone, s3_prefix, status)
+           VALUES (%s, %s, %s, 'HN', 'America/Tegucigalpa', %s, 'active')
+           ON CONFLICT (id) DO UPDATE SET
+             name   = EXCLUDED.name,
+             type   = EXCLUDED.type,
+             status = EXCLUDED.status""",
+        (stream_id, name, stream_type, stream_id),
+    )
+
 
 def _run(cmd: list[str], timeout: int = 15) -> tuple[int, str, str]:
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -45,36 +77,6 @@ def _supervisor_block(stream_id: str) -> str:
         f"environment=HOME=\"/root\"\n"
     )
 
-
-def _daemon_add_stream(stream_id: str, stream_type: str) -> dict:
-    """Agrega stream_id a STREAMS[] y TV_STREAMS en stream_daemon.py."""
-    content = DAEMON_PY.read_bytes()
-
-    # Agregar a STREAMS[]
-    m = re.search(rb'STREAMS\s*=\s*\[([^\]]+)\]', content)
-    if not m:
-        return {"ok": False, "error": "No se encontró STREAMS[] en stream_daemon.py"}
-
-    ids_raw = m.group(1).decode()
-    existing = [s.strip().strip('"').strip("'") for s in ids_raw.split(",") if s.strip()]
-    if stream_id not in existing:
-        existing.append(stream_id)
-        new_list = ", ".join(f'"{s}"' for s in existing)
-        content = content[:m.start(1)] + new_list.encode() + content[m.end(1):]
-
-    # Agregar a TV_STREAMS si aplica
-    if stream_type == "tv":
-        m2 = re.search(rb'TV_STREAMS\s*=\s*\{([^\}]*)\}', content)
-        if m2:
-            tv_raw = m2.group(1).decode()
-            tv_ids = [s.strip().strip('"').strip("'") for s in tv_raw.split(",") if s.strip()]
-            if stream_id not in tv_ids:
-                tv_ids.append(stream_id)
-                new_set = ", ".join(f'"{s}"' for s in tv_ids)
-                content = content[:m2.start(1)] + new_set.encode() + content[m2.end(1):]
-
-    DAEMON_PY.write_bytes(content)
-    return {"ok": True}
 
 
 # ── tools ─────────────────────────────────────────────────────────────────────
@@ -113,6 +115,7 @@ def add_stream(
     name: str,
     stream_type: str,
     url: str,
+    urls: list[str] | None = None,
     route: str = "auto",
     gateway: str = "hn02",
     referer: str = "",
@@ -130,7 +133,9 @@ def add_stream(
       stream_id   — ID único sin espacios (ej: 'canal_5')
       name        — Nombre legible (ej: 'Canal 5 El Líder')
       stream_type — 'radio' o 'tv'
-      url         — URL del stream m3u8
+      url         — URL primaria del stream
+      urls        — Lista de hasta 3 URLs con fallback automático; si se provee,
+                    sustituye a 'url' y el script rotará entre ellas ante fallos
       route       — 'auto', 'gateway' o 'direct'
       gateway     — ID del gateway (ej: 'hn02')
       referer     — Header Referer si el servidor lo requiere (puede quedar vacío)
@@ -142,6 +147,12 @@ def add_stream(
     if not re.match(r'^[a-z0-9_]+$', stream_id):
         return {"ok": False, "error": "stream_id solo puede tener letras minúsculas, números y _"}
 
+    if urls is not None:
+        if not isinstance(urls, list) or not (1 <= len(urls) <= 3):
+            return {"ok": False, "error": "'urls' debe ser una lista de 1 a 3 URLs"}
+        if not all(isinstance(u, str) and u.strip() for u in urls):
+            return {"ok": False, "error": "Cada URL en 'urls' debe ser un string no vacío"}
+
     # 1. stations.json
     cfg = _load_stations()
     if any(s["id"] == stream_id for s in cfg["stations"]):
@@ -149,8 +160,12 @@ def add_stream(
 
     entry: dict = {
         "id": stream_id, "name": name, "type": stream_type,
-        "route": route, "gateway": gateway, "url": url, "enabled": enabled,
+        "route": route, "gateway": gateway, "enabled": enabled,
     }
+    if urls:
+        entry["urls"] = urls   # multi-URL con fallback automático
+    else:
+        entry["url"] = url     # URL única (formato legacy)
     if referer:
         entry["referer"] = referer
     cfg["stations"].append(entry)
@@ -161,17 +176,12 @@ def add_stream(
     with SUPERVISOR_CONF.open("a") as f:
         f.write(block)
 
-    # 3. stream_daemon.py
-    daemon_result = _daemon_add_stream(stream_id, stream_type)
-    if not daemon_result["ok"]:
-        return {"ok": False, "step": "daemon_py", "error": daemon_result["error"]}
+    # 3. Registrar en stream_catalog (el dashboard lee el tipo de aquí)
+    _catalog_upsert(stream_id, name, stream_type)
 
-    # 4. Activar en supervisor
+    # 4. Activar en supervisor (el daemon lee stations.json dinámicamente, no hace falta reiniciarlo)
     _run(["supervisorctl", "reread"])
     rc, out, err = _run(["supervisorctl", "update"])
-
-    # 5. Reiniciar daemon para que reconozca el stream en su lista interna
-    _run(["systemctl", "restart", "stream-daemon"])
 
     # Estado final del proceso
     _, status_out, _ = _run(["supervisorctl", "status", f"stream_{stream_id}"])
@@ -181,27 +191,35 @@ def add_stream(
         "stream_id": stream_id,
         "name": name,
         "type": stream_type,
-        "url": url,
+        "url": urls[0] if urls else url,
         "supervisor_status": status_out,
         "supervisor_update": out,
-        "note": "stream-daemon reiniciado para reconocer el nuevo canal",
+        "note": "stream-daemon lee stations.json dinámicamente; stream_catalog actualizado",
     }
 
 
 def update_stream(stream_id: str, fields: dict) -> dict[str, Any]:
     """
     Modifica campos de un stream existente en stations.json.
-    Campos permitidos: url, route, gateway, referer, enabled, name.
+    Campos permitidos: url, urls, route, gateway, referer, enabled, name.
 
-    Si se cambia url o route, reinicia el stream automáticamente.
+    Si se cambia url, urls o route, reinicia el stream automáticamente.
+    Para multi-URL con fallback, usar 'urls': ["url1", "url2", "url3"] (máx 3).
 
     Parámetros:
       stream_id — ID del stream a modificar
-      fields    — Dict con los campos a cambiar, ej: {"url": "...", "route": "gateway"}
+      fields    — Dict con los campos a cambiar, ej: {"urls": ["https://...", "https://..."]}
     """
     invalid = set(fields) - ALLOWED_UPDATE_FIELDS
     if invalid:
         return {"ok": False, "error": f"Campos no permitidos: {invalid}. Permitidos: {ALLOWED_UPDATE_FIELDS}"}
+
+    if "urls" in fields:
+        u = fields["urls"]
+        if not isinstance(u, list) or not (1 <= len(u) <= 3):
+            return {"ok": False, "error": "'urls' debe ser una lista de 1 a 3 URLs"}
+        if not all(isinstance(x, str) and x.strip() for x in u):
+            return {"ok": False, "error": "Cada URL en 'urls' debe ser un string no vacío"}
 
     cfg = _load_stations()
     station = next((s for s in cfg["stations"] if s["id"] == stream_id), None)
@@ -219,9 +237,17 @@ def update_stream(stream_id: str, fields: dict) -> dict[str, Any]:
 
     _save_stations(cfg)
 
+    # Sincronizar stream_catalog si cambió nombre o tipo
+    if changed.keys() & {"name", "type"}:
+        _catalog_upsert(
+            stream_id,
+            station.get("name", stream_id),
+            station.get("type", "radio"),
+        )
+
     # Reiniciar si cambió url, route o enabled
     restart_result = None
-    needs_restart = bool(changed.keys() & {"url", "route", "enabled", "referer"})
+    needs_restart = bool(changed.keys() & {"url", "urls", "route", "enabled", "referer"})
     if needs_restart and station.get("enabled", True):
         rc, out, _ = _run(["supervisorctl", "restart", f"stream_{stream_id}"])
         restart_result = out
