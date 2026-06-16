@@ -7,7 +7,9 @@ publicidad (Destroyer).
 
 > **Documentación viva completa:** [`live_mediaDEV.md`](live_mediaDEV.md) — referencia técnica detallada del ecosistema completo (infraestructura, DB, Destroyer, MCP, decisiones de diseño). Actualizar cuando cambie la arquitectura.
 
-> ⚠️ **Topología — 2 nodos (split 14 jun 2026):** este repo es el código de **mediaCAP** (nodo de captura, `159.223.104.91`). El producto **`media-app`** (SaaS + evidence portal) y la orquestación del **Destroyer** (launcher + watchdog) se movieron a un 2º nodo **mediaAPP** (`137.184.53.234`), misma VPC. El **dashboard viejo (`dashboard_v4.py`) fue eliminado** (harán uno nuevo) — las secciones de este README que lo mencionan son referencia histórica. mediaCAP corre: ffmpeg + stream-daemon + video-uploader + gateways + wireguard + monitor + MCP. Ver [`live_mediaDEV.md`](live_mediaDEV.md) §1 para el detalle por nodo.
+> ⚠️ **Topología — 2 nodos (split 14 jun 2026):** este repo es el código de **mediaCAP** (nodo de captura, `159.223.104.91`). El producto **`media-app`** (SaaS + evidence portal) y la orquestación del **Destroyer** se movieron a un 2º nodo **mediaAPP** (`137.184.53.234`), misma VPC. La orquestación del Destroyer corre en **AWS** (EventBridge → Lambda → EC2 Spot), ya no por cron local. El **dashboard viejo (`dashboard_v4.py`) fue eliminado** (harán uno nuevo) — las secciones de este README que lo mencionan son referencia histórica. mediaCAP corre: ffmpeg + stream-daemon + video-uploader + gateways + wireguard + monitor + MCP. Ver [`live_mediaDEV.md`](live_mediaDEV.md) §1 para el detalle por nodo.
+
+> 📦 **Repos GitHub (todo el sistema versionado):** `gchiham/MediaDEV-Honduras` (este, mediaCAP) · `gchiham/media-app` (priv, producto) · `gchiham/destroyer` (priv, `/opt/destroyer` de ambos nodos) · `gchiham/mediadev-infra` (priv, config operativa + `INVENTORY.md` con el mapa servicio→código→repo). Secretos nunca en git.
 
 ## Por qué existe este sistema
 

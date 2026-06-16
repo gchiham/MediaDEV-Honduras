@@ -18,7 +18,7 @@ orquestación del Destroyer viven en **mediaAPP** (nodo aparte, misma VPC nyc1).
                                                                       ▲
    mediaAPP (137.184.53.234 · 2vCPU/2GB) ─────────────────────────────┘ (DB privada, misma VPC)
      media-app + nginx (producto SaaS + evidence portal)
-     Destroyer launcher + watchdog (cron) · MCP
+     Destroyer launcher + watchdog (orquestación AWS: EventBridge+Lambda+EC2 Spot) · chihambot · MCP
 ```
 
 ## Hardware (por nodo)
@@ -52,7 +52,7 @@ aparte que SÍ usa el monitor — no confundir.
 - **Dashboard viejo (`dashboard_v4.py`) ELIMINADO** el 14 jun 2026 (van a hacer uno nuevo). El
   código sigue en `dashboard/` como referencia; sus endpoints `/api/*` read-only ya no corren.
 - **`media-app`** (producto SaaS + evidence portal) corre en **mediaAPP** (`137.184.53.234`),
-  NO en este repo — es código aparte, aún sin versionar.
+  NO en este repo — es código aparte, versionado en `gchiham/media-app` (privado).
 
 ## Servicios systemd
 **mediaCAP (captura):**
@@ -61,7 +61,22 @@ systemctl status stream-daemon mediadev-gateway-api mediadev-health-engine \
                  mediadev-monitor video-segment-uploader nginx privoxy wg-quick@wg0
 supervisorctl status   # 12 procesos ffmpeg
 ```
-**mediaAPP (app/control):** `media-app`, `nginx`, + cron del Destroyer (launcher + watchdog).
+**mediaAPP (app/control):** `media-app`, `chihambot` (bot Telegram), `nginx`, MCP. La
+orquestación del Destroyer ya NO usa cron local — corre en **AWS** (EventBridge horario →
+Lambda → EC2 Spot); el `launcher.py`/`watchdog.py` viven en `/opt/destroyer`.
+
+## Versionado (GitHub)
+Todo el código y la config operativa está espejado en GitHub (la verdad es lo desplegado):
+
+| Repo | Contenido | Vis. |
+|---|---|---|
+| `gchiham/MediaDEV-Honduras` | **este repo** — mediaCAP `/opt/media-ai` (captura) | público |
+| `gchiham/media-app` | mediaAPP `/opt/media-app` (producto SaaS) | privado |
+| `gchiham/destroyer` | `/opt/destroyer` ambos nodos (`app/`=mediaAPP, `cap/`=mediaCAP) | privado |
+| `gchiham/mediadev-infra` | config operativa (systemd, supervisor, nginx, wireguard) + `INVENTORY.md` | privado |
+
+Secretos (`/etc/*.env`, llaves WireGuard, `destroyer-worker.pem`) NUNCA en git — ver
+`mediadev-infra/INVENTORY.md`.
 
 ## Red y gateways
 - **WireGuard wg0**: MediaDEV `10.101.0.1/24`. Gateways en `config/stations.json`.
