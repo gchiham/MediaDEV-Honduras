@@ -47,6 +47,8 @@ scripts_backup_rpi/
 *.bak.*
 *.backup.*
 *.cutoverbak*
+rollback/
+CHANGES.log
 monitor/events.db
 monitor/logs/
 config/stations.json.bak
