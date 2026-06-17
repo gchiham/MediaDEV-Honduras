@@ -6,6 +6,9 @@ Health: 15s | Metrics: 60s | Record: 120s | Cleanup: 1800s
 El estado operativo (salud, circuit breaker) vive en memoria y se recalcula
 desde el filesystem. PostgreSQL (media-db) es un espejo de solo-lectura para el
 dashboard; si la DB no está disponible el daemon sigue operando normalmente.
+
+v2: config de streams desde DB (capture_config) con cache local de emergencia.
+    procesos ffmpeg dueñados por el daemon — no supervisord.
 """
 import os, sys, subprocess, time, signal, logging, boto3, json, tempfile
 import psycopg2
@@ -17,10 +20,52 @@ STREAMS_ROOT = Path(os.environ.get("STREAMS_ROOT", "/var/www/streams"))
 LOG_FILE     = os.environ.get("STREAMS_LOG",  "/var/log/streams/daemon.log")
 STATIONS     = Path(os.environ.get("STATIONS_JSON", "/opt/media-ai/config/stations.json"))
 
+# Nuevos: gateway activo y cache de config
+STREAM_CACHE    = Path(os.environ.get("STREAM_CACHE", "/etc/mediadev/stream_config.cache.json"))
+GW_PRIVOXY_PORT = int(os.environ.get("GW_PRIVOXY_PORT", "3128"))
+GW_SOCKS5       = os.environ.get("GW_SOCKS5", "")
+
+# Globals de runtime
+STREAM_CFGS: dict[str, dict] = {}   # slug → config dict
+_procs:      dict[str, dict] = {}   # slug → {main: Popen, aux: Popen|None}
+
+def load_gateway_conf() -> None:
+    """Lee GW_SOCKS5 y GW_PRIVOXY_PORT desde /etc/mediadev/gateway.conf.
+    Expande referencias bash ${VAR} usando las variables ya parseadas en el mismo archivo."""
+    global GW_SOCKS5, GW_PRIVOXY_PORT
+    gw = Path("/etc/mediadev/gateway.conf")
+    if not gw.exists():
+        return
+    vals: dict[str, str] = {}
+    for line in gw.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("#") or "=" not in line:
+            continue
+        key, _, raw = line.partition("=")
+        key = key.strip()
+        raw = raw.strip().strip('"').strip("'")
+        for k, v in vals.items():
+            raw = raw.replace(f"${{{k}}}", v)
+        vals[key] = raw
+
+    socks5 = vals.get("GW_SOCKS5", "")
+    if not socks5 and "GW_SOCKS5_HOST" in vals and "GW_SOCKS5_PORT" in vals:
+        socks5 = f"{vals['GW_SOCKS5_HOST']}:{vals['GW_SOCKS5_PORT']}"
+    if socks5:
+        GW_SOCKS5 = socks5
+
+    port = vals.get("GW_PRIVOXY_PORT", "")
+    if port:
+        try:
+            GW_PRIVOXY_PORT = int(port)
+        except ValueError:
+            pass
+
 FALLBACK_STREAMS = ["fm_941", "hch_tv", "radio_america", "radio_choluteca", "radio_el_patio", "radio_globo", "radio_satelite", "suave_fm", "teleceiba", "xy_hrn", "xy_sps", "xy_tgu", "canal_11", "canal_6", "canal_5", "tsi"]
 FALLBACK_TV_STREAMS = {"hch_tv", "teleceiba", "canal_11", "canal_6", "canal_5", "tsi"}
 
 def load_stream_catalog() -> tuple[list[str], set[str]]:
+    """Bootstrap de módulo: lee stations.json o usa fallback hardcodeado."""
     try:
         data = json.loads(STATIONS.read_text())
         enabled = [s for s in data.get("stations", []) if s.get("enabled", True)]
@@ -102,6 +147,7 @@ INTERVAL_HEALTH  = 15
 INTERVAL_METRICS = 60
 INTERVAL_RECORD  = 120
 INTERVAL_CLEAN   = 1800
+INTERVAL_CONFIG  = 300   # refrescar config de DB cada 5 min
 LOOP_SLEEP       = 2
 AUTO_BACKFILL_HOURS = int(os.environ.get("AUTO_BACKFILL_HOURS", "3"))
 
@@ -374,6 +420,154 @@ def recover_pending_audio_uploads() -> None:
             if ok:
                 s3_scan_register(key, sid, hour_start)
 
+# ── CONFIG DESDE DB (disponible después de que pg() esté definido) ─────────────
+def load_config_from_db() -> list[dict] | None:
+    conn = pg()
+    if conn is None:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT ms.slug, ms.name, ms.media_type,
+                       cc.stream_url, cc.route,
+                       cc.mp3_s3_prefix, cc.ts_s3_prefix
+                FROM capture_config cc
+                JOIN media_sources ms ON ms.id = cc.media_source_id
+                WHERE cc.is_enabled = true
+                  AND ms.lifecycle_status = 'active'
+                  AND ms.slug IS NOT NULL
+                ORDER BY ms.media_type, ms.slug
+            """)
+            cfgs = [{"slug": r[0], "name": r[1], "media_type": r[2],
+                     "stream_url": r[3], "route": r[4],
+                     "mp3_s3_prefix": r[5], "ts_s3_prefix": r[6]}
+                    for r in cur.fetchall()]
+            return cfgs or None
+    except Exception as e:
+        log.warning(f"[config] DB query falló: {e}")
+        return None
+
+def apply_stream_configs(cfgs: list[dict]) -> tuple[list[str], set[str]]:
+    global STREAM_CFGS
+    STREAM_CFGS = {c["slug"]: c for c in cfgs}
+    return ([c["slug"] for c in cfgs],
+            {c["slug"] for c in cfgs if c["media_type"] == "tv"})
+
+def refresh_config() -> list[dict] | None:
+    """DB → escribe cache → devuelve configs. Si DB falla, lee cache."""
+    cfgs = load_config_from_db()
+    if cfgs:
+        try:
+            STREAM_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            STREAM_CACHE.write_text(json.dumps(cfgs, indent=2))
+        except Exception:
+            pass
+        log.info(f"[config] DB: {len(cfgs)} streams activos")
+        return cfgs
+    try:
+        if STREAM_CACHE.exists():
+            cfgs = json.loads(STREAM_CACHE.read_text())
+            if cfgs:
+                log.warning(f"[config] DB no disponible — cache ({len(cfgs)} streams)")
+                return cfgs
+    except Exception as e:
+        log.warning(f"[config] cache inválido: {e}")
+    return None
+
+# ── PROCESS MANAGEMENT ────────────────────────────────────────────────────────
+_RECONNECT = [
+    "-reconnect", "1", "-reconnect_at_eof", "0",
+    "-reconnect_streamed", "1", "-reconnect_delay_max", "8",
+    "-rw_timeout", "20000000", "-timeout", "15000000",
+]
+
+def _hls_args(sid: str) -> list[str]:
+    d = str(STREAMS_ROOT / sid)
+    return ["-f", "hls", "-hls_time", "4", "-hls_list_size", "10",
+            "-hls_flags", "append_list+omit_endlist",
+            "-hls_segment_filename", f"{d}/seg_%05d.ts", f"{d}/index.m3u8"]
+
+def spawn_stream(sid: str) -> bool:
+    cfg = STREAM_CFGS.get(sid)
+    if not cfg:
+        log.warning(f"[{sid}] spawn: sin config en STREAM_CFGS")
+        return False
+    # Reap any zombie from a previous dead process for this sid
+    old = _procs.get(sid)
+    if old:
+        for p in [old.get("main"), old.get("aux")]:
+            if p and p.poll() is not None:
+                try:
+                    p.wait(timeout=1)
+                except Exception:
+                    pass
+    (STREAMS_ROOT / sid).mkdir(parents=True, exist_ok=True)
+    url    = cfg["stream_url"]
+    route  = cfg.get("route", "direct")
+    mtype  = cfg.get("media_type", "radio")
+    socks5 = (route == "socks5")
+    is_ice = mtype == "radio" and ".m3u8" not in url and ".m3u" not in url
+    proxy  = ["-http_proxy", f"http://127.0.0.1:{GW_PRIVOXY_PORT}"] if socks5 else []
+    try:
+        if is_ice:
+            cc = ["curl", "-s", "--max-time", "0", "--retry", "0",
+                  "-A", "MediaDEV/1.0", "-L"]
+            if socks5 and GW_SOCKS5:
+                cc += ["--socks5-hostname", GW_SOCKS5.replace("socks5://", "")]
+            cc.append(url)
+            fc = (["ffmpeg", "-hide_banner", "-loglevel", "warning",
+                   "-i", "pipe:0",
+                   "-vn", "-c:a", "aac", "-b:a", "64k", "-ac", "1", "-ar", "22050"]
+                  + _hls_args(sid))
+            cp = subprocess.Popen(cc, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL,
+                                  preexec_fn=os.setsid)
+            fp = subprocess.Popen(fc, stdin=cp.stdout,
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.PIPE,
+                                  preexec_fn=os.setsid)
+            cp.stdout.close()
+            _procs[sid] = {"main": fp, "aux": cp}
+        elif mtype == "tv":
+            cmd = (["ffmpeg", "-hide_banner", "-loglevel", "warning"]
+                   + proxy + _RECONNECT
+                   + ["-i", url,
+                      "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ac", "2"]
+                   + _hls_args(sid))
+            _procs[sid] = {"main": subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                preexec_fn=os.setsid), "aux": None}
+        else:  # radio HLS / m3u8
+            cmd = (["ffmpeg", "-hide_banner", "-loglevel", "warning"]
+                   + proxy + _RECONNECT
+                   + ["-i", url,
+                      "-vn", "-c:a", "aac", "-b:a", "64k", "-ac", "1", "-ar", "22050"]
+                   + _hls_args(sid))
+            _procs[sid] = {"main": subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                preexec_fn=os.setsid), "aux": None}
+        log.info(f"[{sid}] spawned pid={_procs[sid]['main'].pid} "
+                 f"route={route} type={mtype} ice={is_ice}")
+        return True
+    except Exception as e:
+        log.error(f"[{sid}] spawn error: {e}")
+        return False
+
+def stop_stream(sid: str) -> None:
+    info = _procs.pop(sid, None)
+    if not info:
+        return
+    for p in [info.get("main"), info.get("aux")]:
+        if p and p.poll() is None:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+            except Exception:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+    log.info(f"[{sid}] proceso detenido")
+
 # ── LOGGING ───────────────────────────────────────────────────────────────────
 Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -462,41 +656,46 @@ def init_state():
         for sid in STREAMS
     }
 
+_last_config_refresh = 0.0
+
 def refresh_catalog_state(state):
-    global STREAMS, TV_STREAMS
-    streams, tv_streams = load_stream_catalog()
+    global STREAMS, TV_STREAMS, _last_config_refresh
+    now_float = time.time()
+    if now_float - _last_config_refresh < INTERVAL_CONFIG:
+        return
+    _last_config_refresh = now_float
+
+    cfgs = refresh_config()
+    if not cfgs:
+        return
+
+    streams, tv_streams = apply_stream_configs(cfgs)
     if streams == STREAMS and tv_streams == TV_STREAMS:
         return
 
     previous = set(STREAMS)
-    STREAMS = streams
+    new_set  = set(streams)
+    STREAMS    = streams
     TV_STREAMS = tv_streams
-    for sid in STREAMS:
-        state.setdefault(sid, init_state().get(sid, {
+
+    for sid in previous - new_set:
+        log.info(f"[{sid}] removido del catálogo — deteniendo")
+        stop_stream(sid)
+        state.pop(sid, None)
+
+    for sid in new_set - previous:
+        log.info(f"[{sid}] nuevo en catálogo — spawneando")
+        state[sid] = {
             "status": "UNKNOWN", "sup": "UNKNOWN", "segs": 0, "age": 0,
             "cb_state": "CLOSED", "cb_fails": 0, "cb_since": 0,
             "last_down": 0, "last_up": 0, "restart_today": 0,
-            "restart_grace_until": 0,
-            "first_bad_since": 0, "down_event_sent": False,
-        }))
-    for sid in previous - set(STREAMS):
-        state.pop(sid, None)
+            "restart_grace_until": 0, "first_bad_since": 0, "down_event_sent": False,
+        }
+        spawn_stream(sid)
+
     log.info(f"Catálogo actualizado: {len(STREAMS)} streams ({len(TV_STREAMS)} TV)")
 
 # ── HEALTH CHECK ──────────────────────────────────────────────────────────────
-def sup_statuses():
-    try:
-        out = subprocess.check_output(
-            ["timeout","5","supervisorctl","status"],
-            stderr=subprocess.DEVNULL, text=True
-        )
-        return {
-            line.split()[0].replace("stream_",""): line.split()[1]
-            for line in out.splitlines() if len(line.split()) >= 2
-        }
-    except:
-        return {}
-
 def m3u8_seg_count(m3u8: Path) -> int:
     try:
         return sum(1 for l in m3u8.read_text().splitlines() if l.endswith(".ts"))
@@ -504,23 +703,31 @@ def m3u8_seg_count(m3u8: Path) -> int:
         return 0
 
 def restart_stream(state, sid):
-    subprocess.Popen(
-        ["supervisorctl","restart",f"stream_{sid}"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
+    stop_stream(sid)
+    time.sleep(1)
+    spawn_stream(sid)
     state[sid]["restart_today"] += 1
     state[sid]["restart_grace_until"] = utc_epoch() + RESTART_GRACE_SECS
 
 def do_health(state):
     refresh_catalog_state(state)
     now  = utc_epoch()
-    sups = sup_statuses()
 
     for sid in STREAMS:
         s    = state[sid]
         prev = s["status"]
 
-        sup  = sups.get(sid, "UNKNOWN")
+        # Liveness check del proceso (reemplaza supervisorctl status)
+        pinfo = _procs.get(sid)
+        main  = pinfo.get("main") if pinfo else None
+        alive = main is not None and main.poll() is None
+        sup   = "RUNNING" if alive else "STOPPED"
+
+        # Si el proceso murió y no estamos en CB OPEN ni en grace, respawnear
+        if not alive and s["cb_state"] != "OPEN" and s["restart_grace_until"] < now:
+            log.warning(f"[{sid}] proceso muerto — respawneando automáticamente")
+            spawn_stream(sid)
+
         m3u8 = STREAMS_ROOT / sid / "index.m3u8"
 
         if m3u8.exists():
@@ -608,7 +815,6 @@ def do_metrics(state):
     window = now - INTERVAL_METRICS
     rows   = []
     for sid in STREAMS:
-        # bytes producidos en la última ventana (throughput aproximado)
         b = 0
         for seg in (STREAMS_ROOT / sid).glob("seg_*.ts"):
             try:
@@ -799,7 +1005,6 @@ def do_cleanup(state):
     if deleted:
         log.info(f"Cleanup: {deleted} segmentos eliminados")
 
-    # Purga de retención en PostgreSQL
     now = utc_epoch()
     pg_write("DELETE FROM mediadev_metrics WHERE ts < %s",
              (now - METRICS_RETENTION_DAYS * 86400,))
@@ -821,40 +1026,61 @@ def do_daily_reset(state):
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     log.info("=" * 50)
-    log.info("MediaDEV Stream Daemon")
-    log.info(f"health={INTERVAL_HEALTH}s metrics={INTERVAL_METRICS}s clean={INTERVAL_CLEAN}s loop={LOOP_SLEEP}s")
+    log.info("MediaDEV Stream Daemon v2 (DB config + owned ffmpeg)")
+    log.info(f"health={INTERVAL_HEALTH}s metrics={INTERVAL_METRICS}s "
+             f"config_refresh={INTERVAL_CONFIG}s clean={INTERVAL_CLEAN}s loop={LOOP_SLEEP}s")
+
+    # Cargar gateway activo
+    load_gateway_conf()
+    log.info(f"[gateway] socks5={GW_SOCKS5 or 'no configurado'} privoxy_port={GW_PRIVOXY_PORT}")
+
+    # Cargar config de streams desde DB (→ cache si DB no disponible)
+    cfgs = refresh_config()
+    if cfgs:
+        global STREAMS, TV_STREAMS
+        STREAMS, TV_STREAMS = apply_stream_configs(cfgs)
+    log.info(f"[config] {len(STREAMS)} streams ({len(TV_STREAMS)} TV)")
 
     state = init_state()
+
+    # Spawn de todos los procesos ffmpeg
+    log.info(f"Spawneando {len(STREAMS)} procesos ffmpeg")
+    for sid in STREAMS:
+        spawn_stream(sid)
+    time.sleep(3)  # grace period inicial
+
     recover_pending_audio_uploads()
 
     running = [True]
     def _stop(sig, frame):
         running[0] = False
-        log.info("Señal de parada recibida")
+        log.info("Señal de parada — terminando procesos ffmpeg")
+        for sid in list(_procs.keys()):
+            stop_stream(sid)
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT,  _stop)
 
-    last = {k: 0 for k in ("health","metrics","record","clean","daily")}
+    last = {k: 0 for k in ("health", "metrics", "record", "clean", "daily")}
     log.info(f"Monitoreando {len(STREAMS)} streams")
     log.info(f"PostgreSQL: {'configurado' if (PG_HOST and PG_PASS) else 'NO configurado (solo memoria)'}")
 
     while running[0]:
         now = time.time()
 
-        if now - last["health"] >= INTERVAL_HEALTH:
-            do_health(state);        last["health"] = now
+        if now - last["health"]  >= INTERVAL_HEALTH:
+            do_health(state);        last["health"]  = now
 
         if now - last["metrics"] >= INTERVAL_METRICS:
             do_metrics(state);       last["metrics"] = now
 
-        if now - last["record"] >= INTERVAL_RECORD:
-            do_record(state);        last["record"] = now
+        if now - last["record"]  >= INTERVAL_RECORD:
+            do_record(state);        last["record"]  = now
 
-        if now - last["clean"] >= INTERVAL_CLEAN:
-            do_cleanup(state);       last["clean"]  = now
+        if now - last["clean"]   >= INTERVAL_CLEAN:
+            do_cleanup(state);       last["clean"]   = now
 
-        if now - last["daily"] >= 3600:
-            do_daily_reset(state);   last["daily"]  = now
+        if now - last["daily"]   >= 3600:
+            do_daily_reset(state);   last["daily"]   = now
 
         time.sleep(LOOP_SLEEP)
 
