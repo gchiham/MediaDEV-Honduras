@@ -431,7 +431,7 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
     r = subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error",
          "-f", "concat", "-safe", "0", "-i", str(concat_txt),
-         "-c:a", "libmp3lame", "-b:a", "64k", "-ac", "1", "-ar", "22050",
+         "-c:a", "libmp3lame", "-b:a", "128k", "-ac", "1", "-ar", "44100",
          str(mp3_path)],
         capture_output=True, text=True
     )
