@@ -67,12 +67,12 @@ case "$NEW_GW_ID" in
     NEW_GW_HOST="10.101.0.6"
     NEW_GW_PORT="1080"
     ;;
-  # ---- Agregar nuevos gateways aqui (siguiente: hn04 con IP 10.101.0.7) --------
-  # hn04)
-  #   NEW_GW_NAME="Nombre del gateway"
-  #   NEW_GW_HOST="10.101.0.7"
-  #   NEW_GW_PORT="1080"
-  #   ;;
+  hn04)
+    NEW_GW_NAME="CNS"
+    NEW_GW_HOST="10.101.0.7"
+    NEW_GW_PORT="1080"
+    ;;
+  # ---- Agregar nuevos gateways aqui (siguiente: hn05 con IP 10.101.0.8) --------
   *)
     error "Gateway desconocido: '$NEW_GW_ID'. Opciones: hn01, hn02, hn03"
     ;;
@@ -204,42 +204,51 @@ else
 fi
 
 # =============================================================================
-# PASO 4: Reiniciar streams con proxy
+# PASO 4: Reiniciar streams para que tomen el nuevo gateway
 # =============================================================================
-# Solo reiniciamos los streams que usan --socks5-hostname (los que leen
-# GW_SOCKS5 de gateway.conf). Los streams directos no necesitan reinicio.
+# Los streams socks5 corren bajo stream-daemon (NO supervisor — supervisor quedo
+# obsoleto, 'supervisorctl status' sale vacio). Reiniciar el daemon respawnea
+# todos los ffmpeg, que releen gateway.conf y reconectan por el nuevo gateway.
+# Los streams 'direct' tambien respawnean (sin cambio de ruta).
+#
+# OJO timing: el respawn resetea el contador seg_%05d -> corrompe la 1a parte de
+# la hora EN CURSO de TODAS las estaciones. Correr al filo de hora (HH:00-02 UTC).
+#
+# Fuente unica de verdad: este restart lo hace SOLO el script. El failover
+# automatico (_apply_gateway_switch en health_engine.py) llama a este script y ya
+# NO reinicia el daemon por su cuenta (antes lo hacia -> doble restart redundante).
 # =============================================================================
-step "4/4  Reiniciando streams con proxy"
+step "4/4  Reiniciando stream-daemon (los streams releen el gateway)"
 
-PROXY_STREAMS=(
-  "stream_fm_941"
-  "stream_radio_choluteca"
-  "stream_radio_satelite"
-  "stream_suave_fm"
-  "stream_xy_hrn"
-  "stream_xy_sps"
-  "stream_xy_tgu"
-)
+if systemctl is-active --quiet stream-daemon; then
+  systemctl restart stream-daemon
+  sleep 10
+  info "stream-daemon reiniciado"
+else
+  warning "stream-daemon no esta activo -- los streams NO migraron al nuevo gateway"
+fi
 
-RESTARTED=0
-SKIPPED=0
-
-for stream in "${PROXY_STREAMS[@]}"; do
-  if supervisorctl status "$stream" &>/dev/null 2>&1; then
-    supervisorctl restart "$stream" > /dev/null 2>&1
-    info "Reiniciado: $stream"
-    RESTARTED=$((RESTARTED + 1))
-  else
-    warning "No en supervisorctl: $stream (revisar nombre)"
-    SKIPPED=$((SKIPPED + 1))
-  fi
-done
-
-# Esperar a que levanten y mostrar estado
-sleep 3
+# Verificacion REAL: a que SOCKS5 quedaron conectados los ffmpeg
 echo ""
-step "Estado de streams tras el cambio"
-supervisorctl status | grep "stream_" || echo "  (no hay streams en supervisorctl)"
+step "Verificacion: ffmpeg conectados a SOCKS5 (esperado -> $NEW_GW_HOST:$NEW_GW_PORT)"
+ps aux | grep -o 'socks5-hostname [0-9.]*:1080' | sort | uniq -c || echo "  (sin ffmpeg con proxy todavia)"
+
+# =============================================================================
+# PASO 5: Actualizar is_active en PostgreSQL
+# =============================================================================
+step "5/5  Actualizando is_active en base de datos"
+
+DB_ENV="/etc/mediadev-db.env"
+if [ -f "$DB_ENV" ]; then
+  # shellcheck source=/etc/mediadev-db.env
+  source "$DB_ENV" 2>/dev/null
+  PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -p "${PG_PORT:-5432}" -U "$PG_USER" -d "$PG_DB" \
+    -c "UPDATE gateways SET is_active = (gateway_id = '$NEW_GW_ID');" &>/dev/null \
+    && info "DB: is_active → $NEW_GW_ID" \
+    || warning "No se pudo actualizar is_active en DB (no crítico)"
+else
+  warning "/etc/mediadev-db.env no encontrado — is_active no actualizado en DB"
+fi
 
 # =============================================================================
 # RESUMEN
@@ -256,7 +265,7 @@ echo "  Cambios aplicados:"
 echo "    /etc/mediadev/gateway.conf   (fuente de verdad)"
 echo "    /etc/privoxy/config          (Privoxy reapuntado)"
 echo "    /opt/media-ai/config/stations.json"
-echo "    $RESTARTED streams reiniciados"
+echo "    stream-daemon reiniciado (streams reconectados al nuevo gateway)"
 echo ""
 echo "  Para revertir:"
 echo "    sudo /opt/media-ai/scripts/gateway_switch.sh $CURRENT_GW_ID"
