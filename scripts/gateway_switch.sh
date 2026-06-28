@@ -160,48 +160,20 @@ else
 fi
 
 # =============================================================================
-# PASO 3: stations.json
+# PASO 3: stations.json — YA NO se muta el estado de gateways aqui
 # =============================================================================
-# Actualiza los flags enabled/disabled de los gateways y el campo "gateway"
-# de cada station para que el panel y el health_engine reflejen la realidad.
+# Consolidacion de fuente de verdad (27 jun 2026): el gateway activo vive en
+# gateway.conf (verdad de runtime) y en la DB (gateways.is_active, auto-sanada
+# cada ciclo por el health_engine). El bloque "gateways" de stations.json era una
+# TERCERA copia que se desincronizaba cuando algo bypasaba este script (paso el
+# 27 jun: stations.json decia hn04 con hn01 activo). Las MCP tools leen los
+# gateways de la DB (_gateways_from_db); stations.json solo es fallback de
+# bootstrap si la tabla esta vacia. Por eso ya NO tocamos stations.json en el
+# switch — se elimina esa copia como fuente de drift. stations.json sigue siendo
+# la fuente de la LISTA de streams (stations[]), eso no cambia.
 # =============================================================================
-step "3/4  Actualizando stations.json"
-
-STATIONS_JSON="/opt/media-ai/config/stations.json"
-
-if command -v python3 &>/dev/null && [ -f "$STATIONS_JSON" ]; then
-  python3 - "$NEW_GW_ID" "$CURRENT_GW_ID" "$TIMESTAMP" << 'PYEOF'
-import json, sys
-
-new_id     = sys.argv[1]
-current_id = sys.argv[2]
-ts         = sys.argv[3]
-
-with open("/opt/media-ai/config/stations.json") as f:
-    data = json.load(f)
-
-# Actualizar flags enabled en la seccion gateways
-for gw_id, gw in data.get("gateways", {}).items():
-    gw["enabled"] = (gw_id == new_id)
-    if gw_id == new_id:
-        gw["note"] = f"Activo desde {ts} -- cambiado por gateway_switch.sh"
-    elif gw_id == current_id:
-        gw["note"] = f"Inactivo desde {ts} -- cambiado por gateway_switch.sh"
-
-# Actualizar el campo gateway de cada station que usaba el gateway anterior
-for station in data.get("stations", []):
-    if station.get("gateway") == current_id:
-        station["gateway"] = new_id
-
-with open("/opt/media-ai/config/stations.json", "w") as f:
-    json.dump(data, f, indent=2, ensure_ascii=False)
-
-print(f"  stations.json: {current_id} -> {new_id}")
-PYEOF
-  info "stations.json actualizado"
-else
-  warning "python3 no disponible o stations.json no existe -- saltando"
-fi
+step "3/4  stations.json — sin cambios (estado de gateways vive en DB + gateway.conf)"
+info "stations.json no se muta (gateway activo = gateway.conf + DB is_active)"
 
 # =============================================================================
 # PASO 4: Reiniciar streams para que tomen el nuevo gateway

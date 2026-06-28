@@ -224,7 +224,6 @@ Internet
     ├── stream_run.sh           # Runner unificado (lee url/type/route de stations.json)
     ├── video_segment_uploader.py   # TV .ts → S3
     ├── gateway_switch.sh           # Aplica cambio de gateway activo
-    ├── gateway_watchdog.py         # Watchdog del gateway
     ├── deploy_peer_b.sh            # Deploy de peer B
     ├── backup_healthcheck.py       # Health check de backups
     └── release.sh                  # Publica nueva release del Destroyer a S3

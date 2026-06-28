@@ -54,7 +54,7 @@ y reinicia los streams. El failover normalmente es automático (health_engine).
 
 ## Otros scripts
 - `video_segment_uploader.py` — sube .ts de TV a S3 (servicio `video-segment-uploader`).
-- `gateway_switch.sh` / `gateway_watchdog.py` — cambio y vigilancia de gateway.
+- `gateway_switch.sh` — cambio de gateway (gateway_watchdog.py retirado 27 jun 2026).
 - `deploy_peer_b.sh` — configura un peer de respaldo.
 - `backup_healthcheck.py` — failover active-active de grabaciones en S3.
 
