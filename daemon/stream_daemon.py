@@ -61,7 +61,7 @@ def load_gateway_conf() -> None:
         except ValueError:
             pass
 
-FALLBACK_STREAMS = ["fm_941", "hch_tv", "radio_america", "radio_choluteca", "radio_el_patio", "radio_globo", "radio_satelite", "suave_fm", "teleceiba", "xy_hrn", "xy_sps", "xy_tgu", "canal_11", "canal_6", "canal_5", "tsi"]
+FALLBACK_STREAMS = ["fm_941", "hch_tv", "radio_america", "radio_choluteca", "radio_el_patio", "radio_globo", "radio_satelite", "suave_fm_teg", "teleceiba", "xy_hrn", "xy_sps", "xy_tgu", "canal_11", "canal_6", "canal_5", "tsi", "super_100", "radio_valle"]
 FALLBACK_TV_STREAMS = {"hch_tv", "teleceiba", "canal_11", "canal_6", "canal_5", "tsi"}
 
 def load_stream_catalog() -> tuple[list[str], set[str]]:
@@ -97,6 +97,14 @@ S3_UPLOAD_RETRIES = int(os.environ.get("S3_UPLOAD_RETRIES", "3"))
 PIPELINE_VERSION = os.environ.get("PIPELINE_VERSION", "utc_v2")
 TG_ENV_FILE = os.environ.get("TG_ENV_FILE", "/opt/destroyer/.env")
 
+# Offload de transcode al Destroyer: en vez de recodificar a MP3 (libmp3lame) en
+# mediaCAP, concatenamos los segmentos AAC con -c copy (casi gratis) y subimos el
+# .ts crudo. El worker del Destroyer ya tiene el path .ts→mp3 ("offloaded from
+# mediaCAP") y deriva el airtime de hour_start_utc (DB), no del nombre. Kill-switch:
+# RAW_AUDIO_OFFLOAD=0 + restart vuelve al MP3 local.
+RAW_AUDIO_OFFLOAD = os.environ.get("RAW_AUDIO_OFFLOAD", "1") == "1"
+RAW_AUDIO_EXT = "ts" if RAW_AUDIO_OFFLOAD else "mp3"
+
 # ── S3 ────────────────────────────────────────────────────────────────────────
 S3_BUCKET  = os.environ.get("S3_BUCKET",  "mediadev-recordings")
 S3_REGION  = os.environ.get("S3_REGION",  "us-east-1")
@@ -113,12 +121,13 @@ def s3_upload_verified(local_path: Path, stream_id: str) -> tuple[bool, str, str
     s3 = boto3.client("s3", region_name=S3_REGION)
     key = audio_s3_key(local_path, stream_id)
     size = local_path.stat().st_size
+    ctype = "video/mp2t" if local_path.suffix == ".ts" else "audio/mpeg"
     last_error = None
 
     for attempt in range(1, S3_UPLOAD_RETRIES + 1):
         try:
             s3.upload_file(str(local_path), S3_BUCKET, key,
-                           ExtraArgs={"ContentType": "audio/mpeg"})
+                           ExtraArgs={"ContentType": ctype})
             head = s3.head_object(Bucket=S3_BUCKET, Key=key)
             if int(head.get("ContentLength", -1)) != size:
                 raise RuntimeError(f"size mismatch local={size} s3={head.get('ContentLength')}")
@@ -354,7 +363,7 @@ def concat_file_line(path: Path) -> str:
     return f"file '{safe}'"
 
 def parse_recording_hour(name: str) -> datetime | None:
-    stem = name.removesuffix(".mp3")
+    stem = name.rsplit(".", 1)[0]  # quita .mp3 o .ts
     for fmt in ("%Y-%m-%dT%HZ", "%Y-%m-%d_%Hh"):
         try:
             dt = datetime.strptime(stem, fmt)
@@ -372,7 +381,9 @@ def recover_pending_audio_uploads() -> None:
         if not rec_dir.exists():
             continue
 
-        for mp3 in sorted(rec_dir.glob("*.mp3"), key=lambda f: f.name):
+        pending = sorted([*rec_dir.glob("*.mp3"), *rec_dir.glob("*.ts")],
+                         key=lambda f: f.name)
+        for mp3 in pending:
             hour_start = parse_recording_hour(mp3.name)
             if hour_start is None:
                 continue
@@ -481,10 +492,35 @@ _RECONNECT = [
     "-rw_timeout", "20000000", "-timeout", "15000000",
 ]
 
+def _next_seg_number(sid: str) -> int:
+    """Mayor índice de seg_NNNNN.ts existente + 1 (0 si no hay).
+
+    Para que un respawn de ffmpeg CONTINÚE la numeración en vez de reiniciar a 0 y
+    SOBRESCRIBIR los segmentos de la hora en curso. do_record selecciona segmentos
+    por mtime; pisar archivos = perder esa parte de la hora (corrupción del filo de
+    hora documentada). Continuar la numeración la elimina para TODO respawn (crash,
+    health-restart, restart del daemon, gateway switch).
+
+    '%05d' es ancho MÍNIMO (printf): índices > 99999 usan más dígitos, sin overflow.
+    Glob de un solo directorio por stream — barato, no viola el constraint de 2 vCPU.
+    """
+    mx = -1
+    try:
+        for f in (STREAMS_ROOT / sid).glob("seg_*.ts"):
+            n = f.stem[4:]  # 'seg_00042' → '00042'
+            if n.isdigit():
+                v = int(n)
+                if v > mx:
+                    mx = v
+    except OSError:
+        pass
+    return mx + 1
+
 def _hls_args(sid: str) -> list[str]:
     d = str(STREAMS_ROOT / sid)
     return ["-f", "hls", "-hls_time", "4", "-hls_list_size", "10",
             "-hls_flags", "append_list+omit_endlist",
+            "-start_number", str(_next_seg_number(sid)),
             "-hls_segment_filename", f"{d}/seg_%05d.ts", f"{d}/index.m3u8"]
 
 def spawn_stream(sid: str) -> bool:
@@ -664,6 +700,7 @@ def refresh_catalog_state(state):
     if now_float - _last_config_refresh < INTERVAL_CONFIG:
         return
     _last_config_refresh = now_float
+    load_gateway_conf()
 
     cfgs = refresh_config()
     if not cfgs:
@@ -851,8 +888,9 @@ def do_record(state):
             h_label = recording_hour_label(h_start)
             period_start = datetime.fromtimestamp(h_start, tz=timezone.utc)
             period_end = datetime.fromtimestamp(h_end, tz=timezone.utc)
-            out = rec_dir / f"{h_label}.mp3"
+            out = rec_dir / f"{h_label}.{RAW_AUDIO_EXT}"
             key = audio_s3_key(out, sid)
+            mp3_key = audio_s3_key(rec_dir / f"{h_label}.mp3", sid)  # legacy, para dedup
 
             if out.exists():
                 continue
@@ -862,6 +900,16 @@ def do_record(state):
                     sid, "audio", period_start, period_end, 3600, "uploaded",
                     s3_key=key,
                     reason="already_in_s3",
+                    source_service="stream-daemon",
+                )
+                continue
+            # Si esa hora ya fue procesada históricamente como MP3, no reprocesar
+            # como .ts (evita detecciones duplicadas en el cutover del offload).
+            if RAW_AUDIO_OFFLOAD and s3_object_matches(mp3_key, 0):
+                coverage_upsert(
+                    sid, "audio", period_start, period_end, 3600, "uploaded",
+                    s3_key=mp3_key,
+                    reason="already_in_s3_mp3",
                     source_service="stream-daemon",
                 )
                 continue
@@ -902,11 +950,15 @@ def do_record(state):
             with tempfile.TemporaryDirectory(prefix=f"mediadev_{sid}_") as tmpdir:
                 concat = Path(tmpdir) / "segments.txt"
                 concat.write_text("\n".join(concat_file_line(f) for f in segs) + "\n")
+                # RAW_AUDIO_OFFLOAD: concat -c copy (sin recodificar) → .ts crudo.
+                # El Destroyer hace el .ts→mp3. Si no, MP3 local con libmp3lame.
+                codec_args = (["-c", "copy"] if RAW_AUDIO_OFFLOAD
+                              else ["-c:a", "libmp3lame", "-b:a", "64k",
+                                    "-ac", "1", "-ar", "22050"])
                 result = subprocess.run(
                     ["ffmpeg", "-y", "-loglevel", "error",
-                     "-f", "concat", "-safe", "0", "-i", str(concat),
-                     "-c:a", "libmp3lame", "-b:a", "64k", "-ac", "1", "-ar", "22050",
-                     str(out)],
+                     "-f", "concat", "-safe", "0", "-i", str(concat)]
+                    + codec_args + [str(out)],
                     capture_output=True, text=True,
                 )
 
@@ -938,7 +990,7 @@ def do_record(state):
                     size_bytes=size,
                     source_service="stream-daemon",
                 )
-                log.error(f"[{sid}] {h_label}.mp3 inválido: {reason}")
+                log.error(f"[{sid}] {out.name} inválido: {reason}")
                 if h_start == targets[0] and (duration or 0) < RECORDING_ALERT_MIN_SECONDS:
                     low_coverage_by_hour[h_start].append((sid, int(duration or 0)))
                 continue
@@ -951,7 +1003,7 @@ def do_record(state):
                 size_bytes=size,
                 source_service="stream-daemon",
             )
-            log.info(f"[{sid}] {h_label}.mp3 OK ({size//1024}KB, {int(duration or 0)}s)")
+            log.info(f"[{sid}] {out.name} OK ({size//1024}KB, {int(duration or 0)}s)")
             if h_start == targets[0] and (duration or 0) < RECORDING_ALERT_MIN_SECONDS:
                 low_coverage_by_hour[h_start].append((sid, int(duration or 0)))
 
@@ -983,7 +1035,8 @@ def do_record(state):
                 continue
 
             if ok:
-                old_files = sorted(rec_dir.glob("*.mp3"), key=lambda f: f.name, reverse=True)[KEEP_MP3_COUNT:]
+                old_files = sorted([*rec_dir.glob("*.mp3"), *rec_dir.glob("*.ts")],
+                                   key=lambda f: f.name, reverse=True)[KEEP_MP3_COUNT:]
                 for old in old_files:
                     old.unlink()
 
