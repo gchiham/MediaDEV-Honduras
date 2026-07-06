@@ -61,8 +61,12 @@ def load_gateway_conf() -> None:
         except ValueError:
             pass
 
-FALLBACK_STREAMS = ["fm_941", "hch_tv", "radio_america", "radio_choluteca", "radio_el_patio", "radio_globo", "radio_satelite", "suave_fm_teg", "teleceiba", "xy_hrn", "xy_sps", "xy_tgu", "canal_11", "canal_6", "canal_5", "tsi", "super_100", "radio_valle"]
-FALLBACK_TV_STREAMS = {"hch_tv", "teleceiba", "canal_11", "canal_6", "canal_5", "tsi"}
+FALLBACK_STREAMS = ["fm_941", "hch_tv", "radio_america", "radio_choluteca", "radio_el_patio", "radio_globo", "radio_satelite", "suave_fm_teg", "teleceiba", "xy_hrn", "xy_sps", "xy_tgu", "canal_11", "canal_6", "canal_5", "tsi", "super_100", "radio_valle", "tnh"]
+FALLBACK_TV_STREAMS = {"hch_tv", "teleceiba", "canal_11", "canal_6", "canal_5", "tsi", "tnh"}
+
+# Plataformas cuyo stream_url es la pagina del canal, no un manifest directo -- ffmpeg no
+# puede resolverlas solo (requieren negociar un token de reproduccion). streamlink si sabe.
+_RESOLVER_PLATFORMS = ("kick.com",)
 
 def load_stream_catalog() -> tuple[list[str], set[str]]:
     """Bootstrap de módulo: lee stations.json o usa fallback hardcodeado."""
@@ -528,13 +532,26 @@ def spawn_stream(sid: str) -> bool:
     if not cfg:
         log.warning(f"[{sid}] spawn: sin config en STREAM_CFGS")
         return False
-    # Reap any zombie from a previous dead process for this sid
-    old = _procs.get(sid)
+    # Matar SIEMPRE el proceso previo de este sid antes de respawnear (vivo o muerto).
+    # BUG raíz del leak: antes solo se hacía wait() de los YA-muertos; los ffmpeg STALLED
+    # (vivos pero colgados en el source flaky) quedaban huérfanos al sobrescribir _procs[sid]
+    # y se acumulaban (load-96 jun-16 / teleceiba 16 ffmpeg jun-29). Ahora se reapean siempre.
+    old = _procs.pop(sid, None)
     if old:
         for p in [old.get("main"), old.get("aux")]:
-            if p and p.poll() is not None:
+            if not p:
+                continue
+            if p.poll() is None:                       # vivo (stalled) → matar el grupo
                 try:
-                    p.wait(timeout=1)
+                    os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                except Exception:
+                    pass
+            try:
+                p.wait(timeout=3)                      # esperar a que muera
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)   # terco → SIGKILL al grupo
+                    p.wait(timeout=2)
                 except Exception:
                     pass
     (STREAMS_ROOT / sid).mkdir(parents=True, exist_ok=True)
@@ -543,9 +560,28 @@ def spawn_stream(sid: str) -> bool:
     mtype  = cfg.get("media_type", "radio")
     socks5 = (route == "socks5")
     is_ice = mtype == "radio" and ".m3u8" not in url and ".m3u" not in url
+    needs_resolver = any(p in url for p in _RESOLVER_PLATFORMS)
     proxy  = ["-http_proxy", f"http://127.0.0.1:{GW_PRIVOXY_PORT}"] if socks5 else []
     try:
-        if is_ice:
+        if mtype == "tv" and needs_resolver:
+            # Canal cuya URL es la pagina del stream (no un .m3u8 directo) -- streamlink
+            # resuelve el manifest firmado (token corto, ~10min) y lo mantiene refrescado.
+            sc = ["streamlink", "--stdout", "--stream-timeout", "20",
+                  "--hls-live-restart", url, "720p,best"]
+            fc = (["ffmpeg", "-hide_banner", "-loglevel", "warning",
+                   "-i", "pipe:0",
+                   "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ac", "2"]
+                  + _hls_args(sid))
+            cp = subprocess.Popen(sc, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL,
+                                  preexec_fn=os.setsid)
+            fp = subprocess.Popen(fc, stdin=cp.stdout,
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.PIPE,
+                                  preexec_fn=os.setsid)
+            cp.stdout.close()
+            _procs[sid] = {"main": fp, "aux": cp}
+        elif is_ice:
             cc = ["curl", "-s", "--max-time", "0", "--retry", "0",
                   "-A", "MediaDEV/1.0", "-L"]
             if socks5 and GW_SOCKS5:
@@ -565,10 +601,15 @@ def spawn_stream(sid: str) -> bool:
             cp.stdout.close()
             _procs[sid] = {"main": fp, "aux": cp}
         elif mtype == "tv":
+            # teleceiba: source con VIDEO corrupto (H264) pero AUDIO limpio. Re-encodear el
+            # audio (-c:a aac) degradaba el fingerprint (doble compresión AAC → scores ~357).
+            # -c:a copy pasa el audio original tal cual → mejor detección. Video se copia igual
+            # para la evidencia. PRUEBA teleceiba-only; si mejora, generalizar a TV.
+            audio_args = (["-c:a", "copy"] if sid == "teleceiba"
+                          else ["-c:a", "aac", "-b:a", "128k", "-ac", "2"])
             cmd = (["ffmpeg", "-hide_banner", "-loglevel", "warning"]
                    + proxy + _RECONNECT
-                   + ["-i", url,
-                      "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ac", "2"]
+                   + ["-i", url, "-c:v", "copy"] + audio_args
                    + _hls_args(sid))
             _procs[sid] = {"main": subprocess.Popen(
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -583,7 +624,7 @@ def spawn_stream(sid: str) -> bool:
                 cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                 preexec_fn=os.setsid), "aux": None}
         log.info(f"[{sid}] spawned pid={_procs[sid]['main'].pid} "
-                 f"route={route} type={mtype} ice={is_ice}")
+                 f"route={route} type={mtype} ice={is_ice} resolver={needs_resolver}")
         return True
     except Exception as e:
         log.error(f"[{sid}] spawn error: {e}")
