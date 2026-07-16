@@ -80,9 +80,28 @@ def _hour_label(hour_epoch: int) -> str:
 
 # ── Audio hourly accumulation ─────────────────────────────────────────────────
 
+def _manifest_s3_key(stream_id: str, h_epoch: int) -> str:
+    dt = datetime.fromtimestamp(h_epoch, tz=timezone.utc)
+    return f"{stream_id}/{dt.year}/{dt.month:02d}/{_hour_label(h_epoch)}.manifest.json"
+
+def _seg_real_duration(path: Path) -> float:
+    """Duracion real del segmento (ffprobe), NO el SEGMENT_DUR nominal fijo.
+    Los segmentos HLS de origen rara vez duran EXACTAMENTE 4s (keyframe-aligned,
+    +-0.5s tipico); usar el nominal fijo para construir el manifiesto de tiempo
+    real reintroduce el mismo error que este manifiesto existe para eliminar."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        return float(r.stdout.strip())
+    except Exception:
+        return float(SEGMENT_DUR)
+
+
 def _audio_s3_key(stream_id: str, h_epoch: int) -> str:
     dt = datetime.fromtimestamp(h_epoch, tz=timezone.utc)
-    return f"{stream_id}/{dt.year}/{dt.month:02d}/{_hour_label(h_epoch)}.mp3"
+    return f"{stream_id}/{dt.year}/{dt.month:02d}/{_hour_label(h_epoch)}.ts"
 
 def _table_columns(conn, table: str) -> set[str]:
     cols = _schema_cols.get(table)
@@ -402,7 +421,7 @@ def parse_hour_label(label: str) -> int | None:
     return None
 
 def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path) -> None:
-    """Concatena mini-segs de audio acumulados, crea MP3, sube a S3, registra en DB."""
+    """Concatena mini-segs de audio acumulados, sube TS raw a S3 para que Destroyer encode."""
     segs    = sorted(segs_dir.glob("*.ts"))
     h_label = _hour_label(hour_epoch)
     rec_day = datetime.fromtimestamp(hour_epoch, tz=timezone.utc).strftime("%Y-%m-%d")
@@ -418,21 +437,38 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
         shutil.rmtree(segs_dir, ignore_errors=True)
         return
 
-    mp3_path   = segs_dir / f"{h_label}.mp3"
+    ts_path    = segs_dir / f"{h_label}.ts"
     concat_txt = segs_dir / "list.txt"
     concat_txt.write_text("\n".join(concat_file_line(p) for p in segs) + "\n")
+
+    # Manifiesto: mapeo (posicion acumulada real en el .ts concatenado -> epoch real
+    # de inicio de ESE segmento). Corrige el drift que se acumula cuando el calculo
+    # ingenuo hour_start_utc + ts_seconds asume que cada segundo de audio grabado
+    # equivale a un segundo de reloj real -- eso se rompe cuando faltan segmentos
+    # (reconexiones) y el tiempo perdido se salta silenciosamente del concat.
+    # Ver CHANGES.log (fix drift audio/video TV, 15 jul 2026) para el analisis
+    # que valido este mecanismo con ~2-3% de error contra casos reales.
+    manifest = []
+    cum = 0.0
+    for p in segs:
+        try:
+            epoch_start = int(p.stem)
+        except ValueError:
+            epoch_start = None
+        dur = _seg_real_duration(p)
+        manifest.append({"cum_start": round(cum, 3), "epoch_start": epoch_start, "duration": round(dur, 3)})
+        cum += dur
     _coverage_upsert_audio(
         stream_id, hour_epoch, "pending",
         actual_seconds=len(segs) * SEGMENT_DUR,
-        local_path=mp3_path,
-        reason="building_mp3",
+        local_path=ts_path,
+        reason="building_ts",
     )
 
     r = subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error",
          "-f", "concat", "-safe", "0", "-i", str(concat_txt),
-         "-c:a", "libmp3lame", "-b:a", "128k", "-ac", "1", "-ar", "44100",
-         str(mp3_path)],
+         "-c", "copy", str(ts_path)],
         capture_output=True, text=True
     )
     if r.returncode != 0:
@@ -440,7 +476,7 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
         _coverage_upsert_audio(
             stream_id, hour_epoch, "invalid",
             actual_seconds=len(segs) * SEGMENT_DUR,
-            local_path=mp3_path,
+            local_path=ts_path,
             reason="ffmpeg_failed",
             last_error=r.stderr[-300:],
         )
@@ -448,42 +484,42 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
 
     key = _audio_s3_key(stream_id, hour_epoch)
     hour_start_utc = datetime.fromtimestamp(hour_epoch, tz=timezone.utc)
-    valid, duration, reason = validate_audio_file(mp3_path)
-    size = mp3_path.stat().st_size if mp3_path.exists() else 0
-    if not valid:
-        log.error(f"[{stream_id}] audio flush inválido {h_label}: {reason}")
-        _coverage_upsert_audio(
-            stream_id, hour_epoch, "invalid",
-            actual_seconds=duration,
-            local_path=mp3_path,
-            reason=reason,
-            size_bytes=size,
-        )
-        return
+    size = ts_path.stat().st_size if ts_path.exists() else 0
+    actual_secs = len(segs) * SEGMENT_DUR
 
-    ok, err = upload_file_verified(s3_client, mp3_path, key, "audio/mpeg")
+    ok, err = upload_file_verified(s3_client, ts_path, key, "video/mp2t")
     if not ok:
         log.error(f"[{stream_id}] audio upload error: {err}")
         _coverage_upsert_audio(
             stream_id, hour_epoch, "upload_failed",
-            actual_seconds=duration,
-            local_path=mp3_path,
+            actual_seconds=actual_secs,
+            local_path=ts_path,
             s3_key_value=key,
-            reason=reason,
+            reason="upload_failed",
             size_bytes=size,
             upload_attempts=S3_UPLOAD_RETRIES,
             last_error=err,
         )
         return
 
-    log.info(f"[{stream_id}] {h_label}.mp3 → s3://{S3_BUCKET}/{key}  ({len(segs)} segs)")
+    log.info(f"[{stream_id}] {h_label}.ts → s3://{S3_BUCKET}/{key}  ({len(segs)} segs, {size//1024//1024}MB raw)")
+    try:
+        import json as _json
+        manifest_key = _manifest_s3_key(stream_id, hour_epoch)
+        manifest_path = segs_dir / "manifest.json"
+        manifest_path.write_text(_json.dumps(manifest))
+        s3_client.upload_file(str(manifest_path), S3_BUCKET, manifest_key,
+                               ExtraArgs={"ContentType": "application/json"})
+        log.info(f"[{stream_id}] manifest -> s3://{S3_BUCKET}/{manifest_key} ({len(manifest)} entradas)")
+    except Exception as e:
+        log.warning(f"[{stream_id}] manifest upload fallo (no bloqueante): {e}")
     _db_register(key, stream_id, rec_day, hour_start_utc)
     _coverage_upsert_audio(
         stream_id, hour_epoch, "uploaded",
-        actual_seconds=duration,
-        local_path=mp3_path,
+        actual_seconds=actual_secs,
+        local_path=ts_path,
         s3_key_value=key,
-        reason=reason,
+        reason=None,
         size_bytes=size,
         upload_attempts=1,
     )
