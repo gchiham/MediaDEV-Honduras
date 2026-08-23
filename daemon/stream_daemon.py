@@ -10,7 +10,7 @@ dashboard; si la DB no está disponible el daemon sigue operando normalmente.
 v2: config de streams desde DB (capture_config) con cache local de emergencia.
     procesos ffmpeg dueñados por el daemon — no supervisord.
 """
-import os, sys, subprocess, time, signal, logging, boto3, json, tempfile
+import os, sys, subprocess, time, signal, logging, boto3, json, tempfile, shlex
 import psycopg2
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -66,7 +66,17 @@ FALLBACK_TV_STREAMS = {"hch_tv", "teleceiba", "canal_11", "canal_6", "canal_5", 
 
 # Plataformas cuyo stream_url es la pagina del canal, no un manifest directo -- ffmpeg no
 # puede resolverlas solo (requieren negociar un token de reproduccion). streamlink si sabe.
-_RESOLVER_PLATFORMS = ("kick.com",)
+#
+# mdstrm.com (canal_5, Televicentro con inserción de anuncios de Google Ad Manager/DAI):
+# el demuxer HLS nativo de ffmpeg no puede reusar la conexión HTTP cada vez que un
+# segmento viene de un host distinto (el contenido regular sale de mdstrm.com, cada
+# anuncio insertado sale de un edge de googlevideo.com distinto) -- eso generaba ~750
+# reconexiones/10h y dejaba la cobertura real en ~49% aunque el proceso nunca se caía
+# (por eso no disparaba el circuit breaker). streamlink maneja el pool de conexiones
+# por su cuenta (via requests/urllib3) y no paga ese costo -- probado 2026-08-07:
+# 170s pedidos = 170.03s reales capturados, 0 reconexiones, a 720p (misma calidad que
+# el ffmpeg directo usaba). Ver CHANGES.log / memoria de canal_5 para el detalle.
+_RESOLVER_PLATFORMS = ("kick.com", "mdstrm.com", "dailymotion.com")
 
 def load_stream_catalog() -> tuple[list[str], set[str]]:
     """Bootstrap de módulo: lee stations.json o usa fallback hardcodeado."""
@@ -445,7 +455,7 @@ def load_config_from_db() -> list[dict] | None:
             cur.execute("""
                 SELECT ms.slug, ms.name, ms.media_type,
                        cc.stream_url, cc.route,
-                       cc.mp3_s3_prefix, cc.ts_s3_prefix
+                       cc.mp3_s3_prefix, cc.ts_s3_prefix, cc.ffmpeg_extra
                 FROM capture_config cc
                 JOIN media_sources ms ON ms.id = cc.media_source_id
                 WHERE cc.is_enabled = true
@@ -455,7 +465,8 @@ def load_config_from_db() -> list[dict] | None:
             """)
             cfgs = [{"slug": r[0], "name": r[1], "media_type": r[2],
                      "stream_url": r[3], "route": r[4],
-                     "mp3_s3_prefix": r[5], "ts_s3_prefix": r[6]}
+                     "mp3_s3_prefix": r[5], "ts_s3_prefix": r[6],
+                     "ffmpeg_extra": r[7]}
                     for r in cur.fetchall()]
             return cfgs or None
     except Exception as e:
@@ -495,6 +506,43 @@ _RECONNECT = [
     "-reconnect_streamed", "1", "-reconnect_delay_max", "8",
     "-rw_timeout", "20000000", "-timeout", "15000000",
 ]
+
+def _extra_ffmpeg_args(cfg: dict) -> list[str]:
+    """capture_config.ffmpeg_extra → lista de args, insertados antes de -i.
+    Pensado para overrides puntuales por canal (ej. canal_5/mdstrm.com: fuente
+    con segmentos de 10s vs los 4s habituales -- por defecto el demuxer HLS de
+    ffmpeg no reintenta un segmento que falla (seg_max_retry=0), lo descarta y
+    sigue; con segmentos de 10s eso pierde bloques grandes de contenido sin
+    generar ningún error visible (la conexión sigue viva). ffmpeg_extra permite
+    setear '-seg_max_retry 3' u otros ajustes por canal sin tocar código de nuevo."""
+    raw = (cfg.get("ffmpeg_extra") or "").strip()
+    if not raw:
+        return []
+    try:
+        return shlex.split(raw)
+    except ValueError as e:
+        log.warning(f"[{cfg.get('slug')}] ffmpeg_extra inválido ({raw!r}): {e}")
+        return []
+
+FFMPEG_ERR_DIR = Path(os.environ.get("FFMPEG_ERR_DIR", "/var/log/streams/ffmpeg"))
+FFMPEG_ERR_MAX_BYTES = int(os.environ.get("FFMPEG_ERR_MAX_BYTES", str(20 * 1024 * 1024)))
+
+def _ffmpeg_stderr_file(sid: str):
+    """Archivo de stderr de ffmpeg para sid (trunca si excede el límite).
+
+    Antes stderr iba a un subprocess.PIPE que el daemon nunca leía. Si ffmpeg
+    escribía suficientes warnings (típico en streams con discontinuidades de
+    inserción de anuncios), el pipe (buffer de 64KB del kernel) podía llenarse
+    y el write() de ffmpeg se bloqueaba en silencio -- sin ese log no había
+    forma de diagnosticar nada de esto salvo inferirlo por mtimes de archivos."""
+    FFMPEG_ERR_DIR.mkdir(parents=True, exist_ok=True)
+    path = FFMPEG_ERR_DIR / f"{sid}.err"
+    try:
+        if path.exists() and path.stat().st_size > FFMPEG_ERR_MAX_BYTES:
+            path.write_text("")
+    except OSError:
+        pass
+    return open(path, "a")
 
 def _next_seg_number(sid: str) -> int:
     """Mayor índice de seg_NNNNN.ts existente + 1 (0 si no hay).
@@ -566,8 +614,15 @@ def spawn_stream(sid: str) -> bool:
         if mtype == "tv" and needs_resolver:
             # Canal cuya URL es la pagina del stream (no un .m3u8 directo) -- streamlink
             # resuelve el manifest firmado (token corto, ~10min) y lo mantiene refrescado.
-            sc = ["streamlink", "--stdout", "--stream-timeout", "20",
-                  "--hls-live-restart", url, "720p,best"]
+            quality = cfg.get("ffmpeg_extra") or "720p,best"
+            sc = ["streamlink", "--stdout", "--stream-timeout", "20"]
+            # --hls-live-restart re-descarga la ventana DVR completa al arrancar. Con
+            # fuentes de ventana corta recupera huecos; con DVR de HORAS (Dailymotion,
+            # canal_10) provoca captura a 4x con contenido duplicado y air_time rotos
+            # (visto 23 ago 2026). Configurable por estacion; default true = como antes.
+            if cfg.get("hls_live_restart", True):
+                sc.append("--hls-live-restart")
+            sc += [url, quality]
             fc = (["ffmpeg", "-hide_banner", "-loglevel", "warning",
                    "-i", "pipe:0",
                    "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ac", "2"]
@@ -575,10 +630,12 @@ def spawn_stream(sid: str) -> bool:
             cp = subprocess.Popen(sc, stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL,
                                   preexec_fn=os.setsid)
+            errf = _ffmpeg_stderr_file(sid)
             fp = subprocess.Popen(fc, stdin=cp.stdout,
                                   stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.PIPE,
+                                  stderr=errf,
                                   preexec_fn=os.setsid)
+            errf.close()
             cp.stdout.close()
             _procs[sid] = {"main": fp, "aux": cp}
         elif is_ice:
@@ -594,10 +651,12 @@ def spawn_stream(sid: str) -> bool:
             cp = subprocess.Popen(cc, stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL,
                                   preexec_fn=os.setsid)
+            errf = _ffmpeg_stderr_file(sid)
             fp = subprocess.Popen(fc, stdin=cp.stdout,
                                   stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.PIPE,
+                                  stderr=errf,
                                   preexec_fn=os.setsid)
+            errf.close()
             cp.stdout.close()
             _procs[sid] = {"main": fp, "aux": cp}
         elif mtype == "tv":
@@ -605,24 +664,28 @@ def spawn_stream(sid: str) -> bool:
             # audio (-c:a aac) degradaba el fingerprint (doble compresión AAC → scores ~357).
             # -c:a copy pasa el audio original tal cual → mejor detección. Video se copia igual
             # para la evidencia. PRUEBA teleceiba-only; si mejora, generalizar a TV.
-            audio_args = (["-c:a", "copy"] if sid == "teleceiba"
+            audio_args = (["-c:a", "copy"] if sid in ("teleceiba", "canal_5")
                           else ["-c:a", "aac", "-b:a", "128k", "-ac", "2"])
             cmd = (["ffmpeg", "-hide_banner", "-loglevel", "warning"]
-                   + proxy + _RECONNECT
+                   + proxy + _RECONNECT + _extra_ffmpeg_args(cfg)
                    + ["-i", url, "-c:v", "copy"] + audio_args
                    + _hls_args(sid))
+            errf = _ffmpeg_stderr_file(sid)
             _procs[sid] = {"main": subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                cmd, stdout=subprocess.DEVNULL, stderr=errf,
                 preexec_fn=os.setsid), "aux": None}
+            errf.close()
         else:  # radio HLS / m3u8
             cmd = (["ffmpeg", "-hide_banner", "-loglevel", "warning"]
-                   + proxy + _RECONNECT
+                   + proxy + _RECONNECT + _extra_ffmpeg_args(cfg)
                    + ["-i", url,
                       "-vn", "-c:a", "aac", "-b:a", "64k", "-ac", "1", "-ar", "22050"]
                    + _hls_args(sid))
+            errf = _ffmpeg_stderr_file(sid)
             _procs[sid] = {"main": subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                cmd, stdout=subprocess.DEVNULL, stderr=errf,
                 preexec_fn=os.setsid), "aux": None}
+            errf.close()
         log.info(f"[{sid}] spawned pid={_procs[sid]['main'].pid} "
                  f"route={route} type={mtype} ice={is_ice} resolver={needs_resolver}")
         return True
