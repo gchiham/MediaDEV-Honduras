@@ -1,4 +1,5 @@
 #!/opt/media-ai/monitor/venv/bin/python3
+import os
 import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -10,7 +11,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = '5955525376:AAE63GJ5CwbJ6DWTTZnGch8VAVlhsM2zulY'
+TOKEN = os.environ["TG_TOKEN"]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info('Comando /start')

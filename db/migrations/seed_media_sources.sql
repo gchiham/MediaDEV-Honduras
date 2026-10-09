@@ -1,3 +1,5 @@
+-- NOTA: seed historico. Las URLs de tvprem llevan marcadores <TVPREM_USER>/<TVPREM_PASS>;
+-- la fuente de verdad vigente es capture_config en la DB (credenciales NO versionadas).
 BEGIN;
 
 DO $$
@@ -131,19 +133,19 @@ BEGIN
     VALUES (v_hch_tv, 'https://live.streamhch.com/live/streams/hch1.m3u8', 'direct');
 
   INSERT INTO capture_config (media_source_id, stream_url, route)
-    VALUES (v_teleceiba, 'http://tvprem.pro:8080/live/Gchiham1/IPTV2207/2723.m3u8', 'direct');
+    VALUES (v_teleceiba, 'http://tvprem.pro:8080/live/<TVPREM_USER>/<TVPREM_PASS>/2723.m3u8', 'direct');
 
   INSERT INTO capture_config (media_source_id, stream_url, route)
     VALUES (v_canal_11, 'https://redirector.rudo.video/hls-video/c54ac2799874375c81c1672abb700870537c5223/canal11hn/canal11hn.smil/playlist.m3u8', 'direct');
 
   INSERT INTO capture_config (media_source_id, stream_url, route, ts_s3_prefix)
-    VALUES (v_canal_6, 'http://tvprem.pro:8080/live/Gchiham1/IPTV2207/472634.m3u8', 'direct', 'canal_6');
+    VALUES (v_canal_6, 'http://tvprem.pro:8080/live/<TVPREM_USER>/<TVPREM_PASS>/472634.m3u8', 'direct', 'canal_6');
 
   INSERT INTO capture_config (media_source_id, stream_url, route, ts_s3_prefix)
-    VALUES (v_canal_5, 'http://tvprem.pro:8080/live/Gchiham1/IPTV2207/2700.m3u8', 'direct', 'canal_5');
+    VALUES (v_canal_5, 'http://tvprem.pro:8080/live/<TVPREM_USER>/<TVPREM_PASS>/2700.m3u8', 'direct', 'canal_5');
 
   INSERT INTO capture_config (media_source_id, stream_url, route, ts_s3_prefix)
-    VALUES (v_tsi, 'http://tvprem.pro:8080/live/Gchiham1/IPTV2207/2718.m3u8', 'direct', 'tsi');
+    VALUES (v_tsi, 'http://tvprem.pro:8080/live/<TVPREM_USER>/<TVPREM_PASS>/2718.m3u8', 'direct', 'tsi');
 
   RAISE NOTICE 'capture_config: 16 insertadas';
 

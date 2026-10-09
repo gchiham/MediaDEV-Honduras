@@ -1,4 +1,5 @@
 #!/opt/media-ai/monitor/venv/bin/python3
+import os
 import subprocess, time, logging, sqlite3, re, requests
 from pathlib import Path
 from datetime import datetime
@@ -8,8 +9,8 @@ logging.basicConfig(level=logging.INFO,
     handlers=[logging.FileHandler('logs/monitor.log'), logging.StreamHandler()])
 logger = logging.getLogger(__name__)
 
-TOKEN   = '5955525376:AAE63GJ5CwbJ6DWTTZnGch8VAVlhsM2zulY'
-CHAT_ID = 1687412948
+TOKEN   = os.environ["TG_TOKEN"]
+CHAT_ID = int(os.environ.get("TG_CHAT", "1687412948"))
 BASE_URL = 'https://api.telegram.org/bot' + TOKEN
 
 # =============================================================================
