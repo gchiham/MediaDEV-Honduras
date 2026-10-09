@@ -53,3 +53,8 @@ monitor/events.db
 monitor/logs/
 config/stations.json.bak
 config/stations.json
+
+# backups con fecha/sufijo y estado de runtime (no versionar)
+*.bak-*
+config/*.bak*
+config/tvprem_watch.json

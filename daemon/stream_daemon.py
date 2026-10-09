@@ -10,7 +10,7 @@ dashboard; si la DB no está disponible el daemon sigue operando normalmente.
 v2: config de streams desde DB (capture_config) con cache local de emergencia.
     procesos ffmpeg dueñados por el daemon — no supervisord.
 """
-import os, sys, subprocess, time, signal, logging, boto3, json, tempfile
+import os, sys, subprocess, time, signal, logging, boto3, json, tempfile, shlex
 import psycopg2
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -28,6 +28,7 @@ GW_SOCKS5       = os.environ.get("GW_SOCKS5", "")
 # Globals de runtime
 STREAM_CFGS: dict[str, dict] = {}   # slug → config dict
 _procs:      dict[str, dict] = {}   # slug → {main: Popen, aux: Popen|None}
+_fo:         dict[str, dict] = {}   # slug → estado de failover de URL (en memoria)
 
 def load_gateway_conf() -> None:
     """Lee GW_SOCKS5 y GW_PRIVOXY_PORT desde /etc/mediadev/gateway.conf.
@@ -66,7 +67,17 @@ FALLBACK_TV_STREAMS = {"hch_tv", "teleceiba", "canal_11", "canal_6", "canal_5", 
 
 # Plataformas cuyo stream_url es la pagina del canal, no un manifest directo -- ffmpeg no
 # puede resolverlas solo (requieren negociar un token de reproduccion). streamlink si sabe.
-_RESOLVER_PLATFORMS = ("kick.com",)
+#
+# mdstrm.com (canal_5, Televicentro con inserción de anuncios de Google Ad Manager/DAI):
+# el demuxer HLS nativo de ffmpeg no puede reusar la conexión HTTP cada vez que un
+# segmento viene de un host distinto (el contenido regular sale de mdstrm.com, cada
+# anuncio insertado sale de un edge de googlevideo.com distinto) -- eso generaba ~750
+# reconexiones/10h y dejaba la cobertura real en ~49% aunque el proceso nunca se caía
+# (por eso no disparaba el circuit breaker). streamlink maneja el pool de conexiones
+# por su cuenta (via requests/urllib3) y no paga ese costo -- probado 2026-08-07:
+# 170s pedidos = 170.03s reales capturados, 0 reconexiones, a 720p (misma calidad que
+# el ffmpeg directo usaba). Ver CHANGES.log / memoria de canal_5 para el detalle.
+_RESOLVER_PLATFORMS = ("kick.com", "mdstrm.com", "dailymotion.com")
 
 def load_stream_catalog() -> tuple[list[str], set[str]]:
     """Bootstrap de módulo: lee stations.json o usa fallback hardcodeado."""
@@ -88,16 +99,33 @@ CB_FAIL_OPEN        = 8
 CB_RESET_SECS       = 600
 RESTART_AFTER_FAILS = 3
 RESTART_GRACE_SECS  = int(os.environ.get("RESTART_GRACE_SECS", "45"))
+# Failover de URL: solo actua si capture_config.fallback_url esta definido (hoy: tvprem).
+FAILOVER_DEATHS      = int(os.environ.get("FAILOVER_DEATHS", "4"))      # muertes de proceso en la ventana
+FAILOVER_WINDOW_SECS = int(os.environ.get("FAILOVER_WINDOW_SECS", "300"))
+FAILOVER_HOLD_SECS   = int(os.environ.get("FAILOVER_HOLD_SECS", "180")) # min entre cambios (anti-flapping)
+FAILOVER_SETTLE_SECS = int(os.environ.get("FAILOVER_SETTLE_SECS", "5")) # que el panel libere la sesion
+FAILOVER_MAX_STREAK  = int(os.environ.get("FAILOVER_MAX_STREAK", "4"))  # cambios sin estabilizar -> alertar y parar
+FAILOVER_STABLE_SECS = int(os.environ.get("FAILOVER_STABLE_SECS", "300"))
 DOWN_EVENT_AFTER_SECS = int(os.environ.get("DOWN_EVENT_AFTER_SECS", "180"))
 SEG_DURATION        = 4
 TGU = timezone(timedelta(hours=-6))
 RECORDING_NAMING_MODE = os.environ.get("RECORDING_NAMING_MODE", "utc").strip().lower()
 KEEP_SEG_HOURS = 8
+# TV: el uploader borra cada seg_*.ts al subirlo; si S3 falla, los segs solo viven lo que diga
+# esto. 8h perdio el video de la suspension AWS (6-7 oct 2026).
+KEEP_SEG_HOURS_TV = int(os.environ.get("KEEP_SEG_HOURS_TV", "24"))
 KEEP_MP3_COUNT = 8
 MIN_AUDIO_SECONDS = int(os.environ.get("MIN_AUDIO_SECONDS", "60"))
 FULL_HOUR_MIN_SECONDS = int(os.environ.get("FULL_HOUR_MIN_SECONDS", "3300"))
 RECORDING_ALERT_MIN_SECONDS = int(os.environ.get("RECORDING_ALERT_MIN_SECONDS", "900"))
 S3_UPLOAD_RETRIES = int(os.environ.get("S3_UPLOAD_RETRIES", "3"))
+# Circuit breaker S3 (8 oct 2026): con credenciales rechazadas (cuenta AWS suspendida) cada
+# archivo costaba ~15 s de reintentos y recover_pending reintentaba TODO el backlog por ciclo;
+# el ciclo supero 1 h y el cron borro segmentos antes de armar la hora. Tras un error de auth
+# se omiten las subidas S3_AUTH_BACKOFF s; los archivos quedan en disco y se suben despues.
+S3_AUTH_BACKOFF = int(os.environ.get("S3_AUTH_BACKOFF", "600"))
+_S3_AUTH_ERRORS = ("InvalidAccessKeyId", "InvalidClientTokenId", "AccountProblem")
+_s3_auth_down_until = 0.0
 PIPELINE_VERSION = os.environ.get("PIPELINE_VERSION", "utc_v2")
 TG_ENV_FILE = os.environ.get("TG_ENV_FILE", "/opt/destroyer/.env")
 
@@ -122,8 +150,11 @@ def audio_s3_key(local_path: Path, stream_id: str) -> str:
     return f"{BACKUP_PFX}/{canon}" if PEER_ROLE == "backup" else canon
 
 def s3_upload_verified(local_path: Path, stream_id: str) -> tuple[bool, str, str | None]:
-    s3 = boto3.client("s3", region_name=S3_REGION)
+    global _s3_auth_down_until
     key = audio_s3_key(local_path, stream_id)
+    if time.time() < _s3_auth_down_until:
+        return False, key, "S3 auth rechazada: subida omitida (circuit breaker)"
+    s3 = boto3.client("s3", region_name=S3_REGION)
     size = local_path.stat().st_size
     ctype = "video/mp2t" if local_path.suffix == ".ts" else "audio/mpeg"
     last_error = None
@@ -139,6 +170,10 @@ def s3_upload_verified(local_path: Path, stream_id: str) -> tuple[bool, str, str
             return True, key, None
         except Exception as e:
             last_error = str(e)
+            if any(code in last_error for code in _S3_AUTH_ERRORS):
+                _s3_auth_down_until = time.time() + S3_AUTH_BACKOFF
+                log.error(f"[{stream_id}] S3 auth rechazada; subidas omitidas {S3_AUTH_BACKOFF}s: {e}")
+                return False, key, last_error
             log.warning(f"[{stream_id}] S3 intento {attempt}/{S3_UPLOAD_RETRIES} falló: {e}")
             time.sleep(min(2 ** attempt, 15))
 
@@ -366,6 +401,82 @@ def concat_file_line(path: Path) -> str:
     safe = str(path.resolve()).replace("'", "'\\''")
     return f"file '{safe}'"
 
+# --- helper: arma el .ts horario aunque la hora tenga varios tramos (reinicios del daemon/ffmpeg) y/o
+# codecs mezclados. Cada reinicio de ffmpeg reinicia el PTS (la numeracion seg_N puede continuar) y el concat
+# directo descarta tramos. Se detectan saltos de PTS/codec por bisección, cada tramo se lleva a PTS 0 y se
+# normaliza a AAC mono 22050 si hace falta. ---
+_NORM_SIG = "aac,22050,1"
+
+
+def _seg_probe(path: Path) -> tuple[str, float]:
+    import json as _json
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+             "stream=codec_name,sample_rate,channels:stream=start_time", "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=20)
+        st = _json.loads(r.stdout)["streams"][0]
+        return f"{st['codec_name']},{st['sample_rate']},{st['channels']}", float(st.get("start_time", 0.0))
+    except Exception:
+        return "unknown", 0.0
+
+
+def build_hour_ts(segs: list, out: Path, tmpdir: str):
+    def run_concat(files, dest, codec_args, offset=0.0):
+        lst = Path(tmpdir) / f"{dest.stem}.txt"
+        lst.write_text("\n".join(concat_file_line(f) for f in files) + "\n")
+        extra = ["-output_ts_offset", f"{-offset:.6f}"] if offset else []
+        return subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(lst)]
+            + codec_args + extra + [str(dest)], capture_output=True, text=True)
+
+    segs = [f for f in segs if f.stat().st_size >= 188]  # reinicio del ffmpeg deja segmentos de 0 bytes
+    if not segs:
+        return subprocess.CompletedProcess([], 1, "", "sin segmentos validos")
+    cache = {}
+
+    def probe(i):
+        if i not in cache:
+            cache[i] = _seg_probe(segs[i])
+        return cache[i]
+
+    def consistent(i, j):
+        (sa, ta), (sb, tb) = probe(i), probe(j)
+        return sa == sb and abs((tb - ta) - 3.95 * (j - i)) <= 0.05 * (j - i) + 4.0
+
+    def split(i, j):  # indices inclusivos -> lista de (i, j) tramos continuos
+        if i == j or consistent(i, j):
+            return [(i, j)]
+        if j == i + 1:
+            return [(i, i), (j, j)]
+        m = (i + j) // 2
+        return split(i, m) + split(m + 1, j)
+
+    runs = split(0, len(segs) - 1)
+    # une tramos contiguos que en realidad son continuos (la division por mitades puede partir un tramo)
+    merged = [runs[0]]
+    for a, b in runs[1:]:
+        pi, pj = merged[-1]
+        if probe(pj)[0] == probe(a)[0] and abs((probe(a)[1] - probe(pj)[1]) - 3.95) <= 1.5:
+            merged[-1] = (pi, b)
+        else:
+            merged.append((a, b))
+    if len(merged) == 1:
+        return run_concat(segs, out, ["-c", "copy"])
+    log.warning(f"[{out.parent.parent.name}] {out.name}: {len(merged)} tramos (reinicios), normalizando")
+    parts = []
+    for k, (a, b) in enumerate(merged):
+        sg, st = probe(a)
+        part = Path(tmpdir) / f"part{k:03d}.ts"
+        args = ["-c", "copy"] if sg == _NORM_SIG else \
+               ["-vn", "-c:a", "aac", "-b:a", "64k", "-ac", "1", "-ar", "22050"]
+        r = run_concat(segs[a:b + 1], part, args, st)
+        if r.returncode != 0:
+            return r
+        parts.append(part)
+    return run_concat(parts, out, ["-c", "copy"])
+
+
 def parse_recording_hour(name: str) -> datetime | None:
     stem = name.rsplit(".", 1)[0]  # quita .mp3 o .ts
     for fmt in ("%Y-%m-%dT%HZ", "%Y-%m-%d_%Hh"):
@@ -388,6 +499,8 @@ def recover_pending_audio_uploads() -> None:
         pending = sorted([*rec_dir.glob("*.mp3"), *rec_dir.glob("*.ts")],
                          key=lambda f: f.name)
         for mp3 in pending:
+            if time.time() < _s3_auth_down_until:
+                return
             hour_start = parse_recording_hour(mp3.name)
             if hour_start is None:
                 continue
@@ -445,7 +558,8 @@ def load_config_from_db() -> list[dict] | None:
             cur.execute("""
                 SELECT ms.slug, ms.name, ms.media_type,
                        cc.stream_url, cc.route,
-                       cc.mp3_s3_prefix, cc.ts_s3_prefix
+                       cc.mp3_s3_prefix, cc.ts_s3_prefix, cc.ffmpeg_extra,
+                       cc.hls_live_restart, cc.fallback_url
                 FROM capture_config cc
                 JOIN media_sources ms ON ms.id = cc.media_source_id
                 WHERE cc.is_enabled = true
@@ -455,7 +569,10 @@ def load_config_from_db() -> list[dict] | None:
             """)
             cfgs = [{"slug": r[0], "name": r[1], "media_type": r[2],
                      "stream_url": r[3], "route": r[4],
-                     "mp3_s3_prefix": r[5], "ts_s3_prefix": r[6]}
+                     "mp3_s3_prefix": r[5], "ts_s3_prefix": r[6],
+                     "ffmpeg_extra": r[7],
+                     "hls_live_restart": r[8],
+                     "fallback_url": r[9]}
                     for r in cur.fetchall()]
             return cfgs or None
     except Exception as e:
@@ -464,6 +581,11 @@ def load_config_from_db() -> list[dict] | None:
 
 def apply_stream_configs(cfgs: list[dict]) -> tuple[list[str], set[str]]:
     global STREAM_CFGS
+    for c in cfgs:
+        old = STREAM_CFGS.get(c["slug"])
+        if old and (old.get("stream_url") != c.get("stream_url")
+                    or old.get("fallback_url") != c.get("fallback_url")):
+            _fo.pop(c["slug"], None)   # URL editada a mano: volver a la primaria
     STREAM_CFGS = {c["slug"]: c for c in cfgs}
     return ([c["slug"] for c in cfgs],
             {c["slug"] for c in cfgs if c["media_type"] == "tv"})
@@ -496,6 +618,43 @@ _RECONNECT = [
     "-rw_timeout", "20000000", "-timeout", "15000000",
 ]
 
+def _extra_ffmpeg_args(cfg: dict) -> list[str]:
+    """capture_config.ffmpeg_extra → lista de args, insertados antes de -i.
+    Pensado para overrides puntuales por canal (ej. canal_5/mdstrm.com: fuente
+    con segmentos de 10s vs los 4s habituales -- por defecto el demuxer HLS de
+    ffmpeg no reintenta un segmento que falla (seg_max_retry=0), lo descarta y
+    sigue; con segmentos de 10s eso pierde bloques grandes de contenido sin
+    generar ningún error visible (la conexión sigue viva). ffmpeg_extra permite
+    setear '-seg_max_retry 3' u otros ajustes por canal sin tocar código de nuevo."""
+    raw = (cfg.get("ffmpeg_extra") or "").strip()
+    if not raw:
+        return []
+    try:
+        return shlex.split(raw)
+    except ValueError as e:
+        log.warning(f"[{cfg.get('slug')}] ffmpeg_extra inválido ({raw!r}): {e}")
+        return []
+
+FFMPEG_ERR_DIR = Path(os.environ.get("FFMPEG_ERR_DIR", "/var/log/streams/ffmpeg"))
+FFMPEG_ERR_MAX_BYTES = int(os.environ.get("FFMPEG_ERR_MAX_BYTES", str(20 * 1024 * 1024)))
+
+def _ffmpeg_stderr_file(sid: str):
+    """Archivo de stderr de ffmpeg para sid (trunca si excede el límite).
+
+    Antes stderr iba a un subprocess.PIPE que el daemon nunca leía. Si ffmpeg
+    escribía suficientes warnings (típico en streams con discontinuidades de
+    inserción de anuncios), el pipe (buffer de 64KB del kernel) podía llenarse
+    y el write() de ffmpeg se bloqueaba en silencio -- sin ese log no había
+    forma de diagnosticar nada de esto salvo inferirlo por mtimes de archivos."""
+    FFMPEG_ERR_DIR.mkdir(parents=True, exist_ok=True)
+    path = FFMPEG_ERR_DIR / f"{sid}.err"
+    try:
+        if path.exists() and path.stat().st_size > FFMPEG_ERR_MAX_BYTES:
+            path.write_text("")
+    except OSError:
+        pass
+    return open(path, "a")
+
 def _next_seg_number(sid: str) -> int:
     """Mayor índice de seg_NNNNN.ts existente + 1 (0 si no hay).
 
@@ -519,6 +678,17 @@ def _next_seg_number(sid: str) -> int:
     except OSError:
         pass
     return mx + 1
+
+# Radios cuya fuente ya es MP3<=64k/AAC bajo: pasar el audio tal cual (-c:a copy) ahorra CPU y
+# evita doble compresion. NO incluir fuentes de 128k (duplicaria almacenamiento). Rollback: vaciar el set.
+AUDIO_COPY_SIDS: set = set()  # rollback 2026-10-08: radios vuelven a AAC 64k mono 22050
+
+
+def _radio_audio_args(sid: str) -> list[str]:
+    if sid in AUDIO_COPY_SIDS:
+        return ["-c:a", "copy"]
+    return ["-c:a", "aac", "-b:a", "64k", "-ac", "1", "-ar", "22050"]
+
 
 def _hls_args(sid: str) -> list[str]:
     d = str(STREAMS_ROOT / sid)
@@ -555,7 +725,7 @@ def spawn_stream(sid: str) -> bool:
                 except Exception:
                     pass
     (STREAMS_ROOT / sid).mkdir(parents=True, exist_ok=True)
-    url    = cfg["stream_url"]
+    url    = _active_url(sid, cfg)
     route  = cfg.get("route", "direct")
     mtype  = cfg.get("media_type", "radio")
     socks5 = (route == "socks5")
@@ -566,8 +736,15 @@ def spawn_stream(sid: str) -> bool:
         if mtype == "tv" and needs_resolver:
             # Canal cuya URL es la pagina del stream (no un .m3u8 directo) -- streamlink
             # resuelve el manifest firmado (token corto, ~10min) y lo mantiene refrescado.
-            sc = ["streamlink", "--stdout", "--stream-timeout", "20",
-                  "--hls-live-restart", url, "720p,best"]
+            quality = cfg.get("ffmpeg_extra") or "720p,best"
+            sc = ["streamlink", "--stdout", "--stream-timeout", "20"]
+            # --hls-live-restart re-descarga la ventana DVR completa al arrancar. Con
+            # fuentes de ventana corta recupera huecos; con DVR de HORAS (Dailymotion,
+            # canal_10) provoca captura a 4x con contenido duplicado y air_time rotos
+            # (visto 23 ago 2026). Configurable por estacion; default true = como antes.
+            if cfg.get("hls_live_restart", True):
+                sc.append("--hls-live-restart")
+            sc += [url, quality]
             fc = (["ffmpeg", "-hide_banner", "-loglevel", "warning",
                    "-i", "pipe:0",
                    "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-ac", "2"]
@@ -575,10 +752,12 @@ def spawn_stream(sid: str) -> bool:
             cp = subprocess.Popen(sc, stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL,
                                   preexec_fn=os.setsid)
+            errf = _ffmpeg_stderr_file(sid)
             fp = subprocess.Popen(fc, stdin=cp.stdout,
                                   stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.PIPE,
+                                  stderr=errf,
                                   preexec_fn=os.setsid)
+            errf.close()
             cp.stdout.close()
             _procs[sid] = {"main": fp, "aux": cp}
         elif is_ice:
@@ -589,15 +768,17 @@ def spawn_stream(sid: str) -> bool:
             cc.append(url)
             fc = (["ffmpeg", "-hide_banner", "-loglevel", "warning",
                    "-i", "pipe:0",
-                   "-vn", "-c:a", "aac", "-b:a", "64k", "-ac", "1", "-ar", "22050"]
+                   "-vn"] + _radio_audio_args(sid)
                   + _hls_args(sid))
             cp = subprocess.Popen(cc, stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL,
                                   preexec_fn=os.setsid)
+            errf = _ffmpeg_stderr_file(sid)
             fp = subprocess.Popen(fc, stdin=cp.stdout,
                                   stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.PIPE,
+                                  stderr=errf,
                                   preexec_fn=os.setsid)
+            errf.close()
             cp.stdout.close()
             _procs[sid] = {"main": fp, "aux": cp}
         elif mtype == "tv":
@@ -605,24 +786,28 @@ def spawn_stream(sid: str) -> bool:
             # audio (-c:a aac) degradaba el fingerprint (doble compresión AAC → scores ~357).
             # -c:a copy pasa el audio original tal cual → mejor detección. Video se copia igual
             # para la evidencia. PRUEBA teleceiba-only; si mejora, generalizar a TV.
-            audio_args = (["-c:a", "copy"] if sid == "teleceiba"
+            audio_args = (["-c:a", "copy"] if sid in ("teleceiba", "canal_5")
                           else ["-c:a", "aac", "-b:a", "128k", "-ac", "2"])
             cmd = (["ffmpeg", "-hide_banner", "-loglevel", "warning"]
-                   + proxy + _RECONNECT
+                   + proxy + _RECONNECT + _extra_ffmpeg_args(cfg)
                    + ["-i", url, "-c:v", "copy"] + audio_args
                    + _hls_args(sid))
+            errf = _ffmpeg_stderr_file(sid)
             _procs[sid] = {"main": subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                cmd, stdout=subprocess.DEVNULL, stderr=errf,
                 preexec_fn=os.setsid), "aux": None}
+            errf.close()
         else:  # radio HLS / m3u8
             cmd = (["ffmpeg", "-hide_banner", "-loglevel", "warning"]
-                   + proxy + _RECONNECT
+                   + proxy + _RECONNECT + _extra_ffmpeg_args(cfg)
                    + ["-i", url,
-                      "-vn", "-c:a", "aac", "-b:a", "64k", "-ac", "1", "-ar", "22050"]
+                      "-vn"] + _radio_audio_args(sid)
                    + _hls_args(sid))
+            errf = _ffmpeg_stderr_file(sid)
             _procs[sid] = {"main": subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                cmd, stdout=subprocess.DEVNULL, stderr=errf,
                 preexec_fn=os.setsid), "aux": None}
+            errf.close()
         log.info(f"[{sid}] spawned pid={_procs[sid]['main'].pid} "
                  f"route={route} type={mtype} ice={is_ice} resolver={needs_resolver}")
         return True
@@ -780,6 +965,70 @@ def m3u8_seg_count(m3u8: Path) -> int:
     except:
         return 0
 
+# ── FAILOVER DE URL (solo canales con capture_config.fallback_url) ─────────────
+def _fo_get(sid):
+    return _fo.setdefault(sid, {"on_fb": False, "last": 0, "streak": 0,
+                                "alerted": False, "deaths": []})
+
+def _active_url(sid, cfg):
+    fb = (cfg.get("fallback_url") or "").strip()
+    if fb and _fo.get(sid, {}).get("on_fb"):
+        return fb
+    return cfg["stream_url"]
+
+def _fo_record_death(sid, now):
+    cfg = STREAM_CFGS.get(sid) or {}
+    if not (cfg.get("fallback_url") or "").strip():
+        return
+    d = _fo_get(sid)["deaths"]
+    d.append(now)
+    d[:] = [t for t in d if now - t <= FAILOVER_WINDOW_SECS]
+
+def _fo_deaths_exceeded(sid):
+    return len(_fo.get(sid, {}).get("deaths", [])) >= FAILOVER_DEATHS
+
+def _fo_note_ok(sid, now):
+    fo = _fo.get(sid)
+    if fo and fo["streak"] and now - fo["last"] >= FAILOVER_STABLE_SECS:
+        fo["streak"] = 0
+        fo["alerted"] = False
+
+def do_failover(state, sid, reason) -> bool:
+    """Alterna primaria <-> fallback. True si cambio de URL y respawneo."""
+    cfg = STREAM_CFGS.get(sid) or {}
+    if not (cfg.get("fallback_url") or "").strip():
+        return False
+    now = utc_epoch()
+    fo = _fo_get(sid)
+    if now - fo["last"] < FAILOVER_HOLD_SECS:
+        return False
+    if fo["streak"] >= FAILOVER_MAX_STREAK:
+        if not fo["alerted"]:
+            fo["alerted"] = True
+            log.error(f"[{sid}] FAILOVER agotado: {fo['streak']} cambios sin estabilizar")
+            pg_event(sid, "FAILOVER_EXHAUSTED", f"{fo['streak']} cambios sin estabilizar")
+            tg_send(f"🚨 {sid}: ambas URLs (primaria y fallback) fallan — "
+                    f"{fo['streak']} cambios sin estabilizar. Probable caída del panel "
+                    "completo (clave rotada / 451), no de una variante. Revisar fuente.")
+        return False
+    src, dst = ("fallback", "primaria") if fo["on_fb"] else ("primaria", "fallback")
+    fo["on_fb"] = not fo["on_fb"]
+    fo["last"] = now
+    fo["streak"] += 1
+    fo["deaths"].clear()
+    s = state[sid]
+    s["cb_fails"] = 0            # si no, el CB se abre en pleno cambio (lec. 22-sep)
+    s["first_bad_since"] = 0
+    log.warning(f"[{sid}] FAILOVER {src} -> {dst} ({reason})")
+    pg_event(sid, "FAILOVER", f"{src}->{dst}: {reason}")
+    tg_send(f"🔁 {sid}: failover {src} → {dst} ({reason})")
+    stop_stream(sid)
+    time.sleep(FAILOVER_SETTLE_SECS)   # tvprem limita a 2 conexiones: dejar liberar la sesion
+    spawn_stream(sid)
+    s["restart_today"] += 1
+    s["restart_grace_until"] = utc_epoch() + RESTART_GRACE_SECS
+    return True
+
 def restart_stream(state, sid):
     stop_stream(sid)
     time.sleep(1)
@@ -804,7 +1053,10 @@ def do_health(state):
         # Si el proceso murió y no estamos en CB OPEN ni en grace, respawnear
         if not alive and s["cb_state"] != "OPEN" and s["restart_grace_until"] < now:
             log.warning(f"[{sid}] proceso muerto — respawneando automáticamente")
-            spawn_stream(sid)
+            _fo_record_death(sid, now)
+            if not (_fo_deaths_exceeded(sid) and do_failover(
+                    state, sid, f"{FAILOVER_DEATHS} muertes en {FAILOVER_WINDOW_SECS}s")):
+                spawn_stream(sid)
 
         m3u8 = STREAMS_ROOT / sid / "index.m3u8"
 
@@ -832,6 +1084,7 @@ def do_health(state):
 
         if ok:
             s["cb_fails"] = 0
+            _fo_note_ok(sid, now)
             s["first_bad_since"] = 0
             if prev not in ("OK", "UNKNOWN"):
                 log.info(f"[{sid}] ↑ UP")
@@ -855,8 +1108,9 @@ def do_health(state):
                 pg_event(sid, "DOWN", f"age={age}s down_for={down_for}s empty={empty_playlist}")
                 s["down_event_sent"] = True
             if not empty_playlist and s["cb_fails"] >= RESTART_AFTER_FAILS and s["cb_fails"] <= CB_FAIL_OPEN:
-                log.info(f"[{sid}] Reiniciando ffmpeg tras {s['cb_fails']} fallos")
-                restart_stream(state, sid)
+                if not do_failover(state, sid, f"{s['cb_fails']} fallos de salud"):
+                    log.info(f"[{sid}] Reiniciando ffmpeg tras {s['cb_fails']} fallos")
+                    restart_stream(state, sid)
             if s["cb_fails"] >= CB_FAIL_OPEN and s["cb_state"] == "CLOSED":
                 s["cb_state"] = "OPEN"; s["cb_since"] = now
                 log.warning(f"[{sid}] CB → OPEN tras {s['cb_fails']} fallos")
@@ -996,12 +1250,15 @@ def do_record(state):
                 codec_args = (["-c", "copy"] if RAW_AUDIO_OFFLOAD
                               else ["-c:a", "libmp3lame", "-b:a", "64k",
                                     "-ac", "1", "-ar", "22050"])
-                result = subprocess.run(
-                    ["ffmpeg", "-y", "-loglevel", "error",
-                     "-f", "concat", "-safe", "0", "-i", str(concat)]
-                    + codec_args + [str(out)],
-                    capture_output=True, text=True,
-                )
+                if RAW_AUDIO_OFFLOAD:
+                    result = build_hour_ts(segs, out, tmpdir)
+                else:
+                    result = subprocess.run(
+                        ["ffmpeg", "-y", "-loglevel", "error",
+                         "-f", "concat", "-safe", "0", "-i", str(concat)]
+                        + codec_args + [str(out)],
+                        capture_output=True, text=True,
+                    )
 
             if result.returncode != 0:
                 out.unlink(missing_ok=True)
@@ -1086,9 +1343,10 @@ def do_record(state):
 
 # ── CLEANUP ───────────────────────────────────────────────────────────────────
 def do_cleanup(state):
-    cutoff  = time.time() - KEEP_SEG_HOURS * 3600
     deleted = 0
     for sid in STREAMS:
+        keep_h = KEEP_SEG_HOURS_TV if sid in TV_STREAMS else KEEP_SEG_HOURS
+        cutoff = time.time() - keep_h * 3600
         for seg in (STREAMS_ROOT / sid).glob("seg_*.ts"):
             try:
                 if seg.stat().st_mtime < cutoff:

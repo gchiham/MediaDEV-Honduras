@@ -22,6 +22,9 @@ INVALID_DIR    = Path(os.environ.get("INVALID_SEGMENT_DIR", "/var/www/streams/_i
 HLS_KEEP       = int(os.environ.get("HLS_KEEP", "12"))
 SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", "15"))
 SEGMENT_DUR    = int(os.environ.get("SEGMENT_DUR", "4"))
+# Tope de cordura del concat: con -c copy la salida pesa aprox lo mismo que la suma
+# de sus entradas. Ver flush_audio_hour() y CHANGES.log (incidente 26 ago 2026).
+CONCAT_MAX_RATIO = float(os.environ.get("CONCAT_MAX_RATIO", "3"))
 S3_UPLOAD_RETRIES = int(os.environ.get("S3_UPLOAD_RETRIES", "3"))
 VIDEO_VALIDATE_FFPROBE = os.environ.get("VIDEO_VALIDATE_FFPROBE", "1") != "0"
 MIN_VIDEO_SECONDS = float(os.environ.get("MIN_VIDEO_SECONDS", "1.0"))
@@ -422,7 +425,11 @@ def parse_hour_label(label: str) -> int | None:
 
 def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path) -> None:
     """Concatena mini-segs de audio acumulados, sube TS raw a S3 para que Destroyer encode."""
-    segs    = sorted(segs_dir.glob("*.ts"))
+    # Solo segmentos legitimos: se llaman {epoch:010d}.ts. Excluye explicitamente el
+    # <hora>.ts de salida, que se escribe en este mismo dir: si un flush previo murio
+    # antes del rmtree, incluirlo aqui realimenta el concat y el archivo crece sin fin
+    # (incidente 26 ago 2026: 126MB -> 41.8GB, disco lleno). Ver CHANGES.log.
+    segs    = sorted(q for q in segs_dir.glob("*.ts") if q.stem.isdigit())
     h_label = _hour_label(hour_epoch)
     rec_day = datetime.fromtimestamp(hour_epoch, tz=timezone.utc).strftime("%Y-%m-%d")
 
@@ -479,6 +486,28 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
             local_path=ts_path,
             reason="ffmpeg_failed",
             last_error=r.stderr[-300:],
+        )
+        return
+
+    # Guarda de cordura: con -c copy la salida debe pesar aproximadamente lo mismo que la
+    # suma de sus entradas. Un desborde grosero significa que el concat se realimento (el
+    # 26 ago 2026: 126 MB de segmentos produjeron 41.8 GB y llenaron el disco del nodo) o
+    # que el muxer se descarrilo. Abortar aqui cuesta una hora de audio de una estacion;
+    # no abortar costo la grabacion de las 7 estaciones de TV durante medio dia.
+    entrada = sum(q.stat().st_size for q in segs if q.exists())
+    salida  = ts_path.stat().st_size if ts_path.exists() else 0
+    if entrada and salida > CONCAT_MAX_RATIO * entrada:
+        ratio = salida / entrada
+        log.error(f"[{stream_id}] audio flush {h_label} ABORTADO: salida {salida // 1048576}MB "
+                  f"vs entrada {entrada // 1048576}MB (ratio {ratio:.1f}x, tope "
+                  f"{CONCAT_MAX_RATIO}x) - posible concat realimentado")
+        ts_path.unlink(missing_ok=True)
+        _coverage_upsert_audio(
+            stream_id, hour_epoch, "invalid",
+            actual_seconds=len(segs) * SEGMENT_DUR,
+            local_path=ts_path,
+            reason="concat_runaway",
+            last_error=f"ratio={ratio:.1f}x entrada={entrada} salida={salida}",
         )
         return
 
