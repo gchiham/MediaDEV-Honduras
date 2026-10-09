@@ -1,5 +1,10 @@
 # MediaDEV Stream Monitor
 
+> **Para revisar el sistema actual empezá por [`MAPA_MEDIACAP.md`](MAPA_MEDIACAP.md).** Este README es de
+> junio-2026: las secciones de supervisor/runner (5), dashboards (8) y API REST describen piezas que ya no
+> corren. Los ffmpeg los lanza `stream_daemon` y el dashboard se eliminó el 14-jun.
+
+
 Sistema de monitoreo, grabación y auditoría 24/7 para estaciones de radio y TV de Honduras.
 Captura streams en vivo a través de gateways residenciales hondureños, los sirve como HLS,
 archiva el contenido (audio MP3 + video en S3) y alimenta el motor de detección de
