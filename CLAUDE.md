@@ -1,8 +1,8 @@
 # MediaDEV Stream Monitor — Contexto raíz
 
 ## Propósito del proyecto
-Sistema de monitoreo, grabación y auditoría 24/7 de 12 estaciones de Honduras
-(10 radios audio + 2 canales de TV con video). Captura streams vía gateways residenciales
+Sistema de monitoreo, grabación y auditoría 24/7 de ~20 estaciones de Honduras
+(radios audio + canales de TV con video; la lista real vive en `capture_config`, ver abajo). Captura streams vía gateways residenciales
 hondureños (geo-restriction), los sirve como HLS, archiva audio (MP3) y video (S3), expone
 dashboards + API REST, y alimenta el motor de detección de anuncios (Destroyer).
 
@@ -11,7 +11,7 @@ Este repo es el código de **mediaCAP** (nodo de captura). El producto (`media-a
 orquestación del Destroyer viven en **mediaAPP** (nodo aparte, misma VPC nyc1).
 ```
 [Streams HN] → [Gateways SOCKS5] ──WireGuard──► mediaCAP (159.223.104.91 · 2vCPU/4GB)
-                                                  │  supervisord (12 ffmpeg) · stream-daemon
+                                                  │  stream-daemon (lanza 1 ffmpeg por estación)
                                                   │  video-uploader · gateway-api · health-engine
                                                   │  wireguard · privoxy · monitor · MCP
                                                   └──────────► PostgreSQL media-db (DO Managed)
@@ -30,12 +30,13 @@ orquestación del Destroyer viven en **mediaAPP** (nodo aparte, misma VPC nyc1).
 | Componente | Ruta | Descripción |
 |---|---|---|
 | Stream daemon | `daemon/stream_daemon.py` | Health, grabación MP3, espejo de estado a PG |
-| Dashboard + API | `dashboard/dashboard_v4.py` | Vistas web + endpoints JSON (lee de PG) |
-| Scripts de stream | `scripts/stream_*.sh` | Un script ffmpeg por stream (proxy SOCKS5 o directo) |
+| Dashboard + API | `dashboard/dashboard_v4.py` | ELIMINADO de prod (14 jun); solo referencia |
+| Captura ffmpeg | `daemon/stream_daemon.py` (`spawn_stream`) | El daemon lanza ffmpeg directo (Popen). `scripts/stream_*.sh`/`stream_run.sh` ya NO se usan |
 | Video uploader | `scripts/video_segment_uploader.py` | Sube .ts de TV a S3 |
 | Gateways | `/opt/destroyer/gateway/` | API de heartbeats + health engine (failover) |
 | Monitor | `monitor/monitor.py` | Vigila WireGuard, alertas Telegram |
-| Config | `config/stations.json` | Estaciones activas + definición de gateways |
+| Config de captura | tabla `capture_config` JOIN `media_sources` (PG) | **Única fuente de verdad** de URLs, route y banderas por estación |
+| Definición de gateways | `config/stations.json` | Solo definición de gateways (sus URLs de estaciones están stale) |
 
 ## Base de datos — PostgreSQL (media-db), única persistencia
 Ya NO se usa SQLite local. El daemon mantiene el estado en memoria y lo espeja a PG.
@@ -58,8 +59,9 @@ aparte que SÍ usa el monitor — no confundir.
 **mediaCAP (captura):**
 ```bash
 systemctl status stream-daemon mediadev-gateway-api mediadev-health-engine \
-                 mediadev-monitor video-segment-uploader nginx privoxy wg-quick@wg0
-supervisorctl status   # 12 procesos ffmpeg
+                 mediadev-monitor video-segment-uploader nginx privoxy wg-quick@wg0 \
+                 mediadev-ffmpeg-reaper.timer
+pgrep -af ffmpeg       # normal = 1 por estación activa (supervisor ya NO maneja streams)
 ```
 **mediaAPP (app/control):** `media-app`, `chihambot` (bot Telegram), `nginx`, MCP. La
 orquestación del Destroyer ya NO usa cron local — corre en **AWS** (EventBridge horario →
@@ -93,15 +95,26 @@ Honduras sin DST — offset fijo `-6h` para presentación.
 ## Principios arquitectónicos
 1. Un solo daemon de mantenimiento (evita condiciones de carrera).
 2. Estado operativo en memoria + filesystem (mtime); PG es espejo tolerante a fallos.
-3. Circuit Breaker (5 fallos → OPEN, reset 30 min) evita restart storms.
+3. Circuit Breaker (8 fallos → OPEN, backoff 5→10→20→60 min, en memoria del daemon) evita restart storms.
 4. Sin glob masivo en health check — solo lee el m3u8.
 5. Batch queries en el dashboard (GROUP BY), nunca loops por stream.
 6. Segmentos persistentes (8h) para auditoría y para el uploader de video.
+
+## Configuración de captura (fuente de verdad)
+- El `stream_daemon` lee `capture_config JOIN media_sources` (`load_config_from_db()`) y lo
+  relee cada 300 s (hot-add/remove sin restart). `is_enabled=false` apaga la estación.
+- `config/stations.json` y `stream_catalog.stream_url` están congelados y **mienten** sobre URLs.
+- Una bandera nueva (ej. `hls_live_restart`, `ffmpeg_extra`) debe existir como columna **y** en
+  ese `SELECT`; si no, el daemon cae al default en silencio.
+- La copia local de `daemon/stream_daemon.py` puede ir atrasada respecto a `/opt/media-ai` en
+  mediaCAP: leer siempre lo desplegado antes de proponer cambios.
+- Para diagnosticar captura (no graba, mudo, duplicados, load, banderas ffmpeg) usar el skill
+  `mediacap-ffmpeg` (`.claude/skills/mediacap-ffmpeg/`).
 
 ## Instrucciones para AI
 - Leer el CLAUDE.md más cercano a los archivos del task antes de explorar.
 - Inspeccionar solo lo relacionado con la tarea; evitar búsquedas globales salvo necesidad.
 - Preferir ediciones quirúrgicas; preservar la arquitectura (no cambiar infra sin pedido).
-- Para cambios en streams: verificar si usan SOCKS5 o conexión directa.
+- Para cambios en streams: verificar `route` (socks5/direct) en `capture_config`, no en `stations.json`.
 - No reducir intervalos del daemon sin justificación (2 vCPU).
 - Credenciales siempre en `/etc/*.env` fuera del repo, nunca hardcodeadas.
