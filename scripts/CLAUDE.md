@@ -1,78 +1,62 @@
-# Scripts de Stream — CLAUDE.md
+# Scripts — CLAUDE.md
 
-## Propósito
-La captura de los 13 streams la hace un **runner unificado** `stream_run.sh <stream_id>`,
-gestionado por supervisord (un `[program:stream_{id}]` por estación, todos invocan el runner).
-Captura el stream origen y lo recodifica a HLS: audio para radios, video preservado para TV.
+> Verificado contra `/opt/media-ai/scripts/` desplegado (9-oct-2026).
 
-## stream_run.sh — cómo decide
-Lee `url`, `type` y `route` de `config/stations.json` y resuelve tres ejes:
+**La captura no vive aquí.** Los ffmpeg los lanza `daemon/stream_daemon.py` (ver
+`daemon/CLAUDE.md`) con la config de `capture_config` en PG. Supervisor sigue activo pero sin
+programas.
 
-1. **Captura**: si la URL es `ice42.securenetsystems.net` (Icecast) → `curl` pipe con headers
-   `Icy-MetaData` (ffmpeg no puede mandar esos headers vía proxy). El resto → `ffmpeg -i` directo.
-2. **Transporte** (campo `route`):
-   - `gateway` → siempre por el gateway (curl `--socks5-hostname $GW_SOCKS5`, o ffmpeg `-http_proxy`).
-   - `direct` → siempre conexión directa.
-   - `auto` → `probe_direct()` prueba la URL; si responde 2xx va directo, si no usa gateway.
-     **Re-evalúa en cada arranque**, así que si bloquean una fuente directa, el reinicio de
-     supervisord cae solo al gateway. Este es el mecanismo de fallback.
-3. **Salida**: `type=radio` → `-vn -c:a aac -b:a 64k -ac 1 -ar 22050`;
-   `type=tv` → `-c:v copy -c:a aac -b:a 128k`.
+## Qué corre y cómo
+| Script | Cómo corre | Qué hace |
+|---|---|---|
+| `video_segment_uploader.py` | servicio `video-segment-uploader` | TV: sube `seg_*.ts` a `video_segments/<sid>/YYYY/MM/DD/<epoch_ini>_<epoch_fin>.ts` y los borra del disco. Además arma el audio horario de TV |
+| `ffmpeg_reaper.py` | `mediadev-ffmpeg-reaper.timer` (cada 5 min) | Si hay más de 1 ffmpeg escribiendo a `/var/www/streams/<sid>/`, deja el más nuevo |
+| `mediadev_logs.py` | servicio `mediadev-logs` | Journal y logs → CloudWatch Logs (claves en `/etc/mediadev-cw.env`) |
+| `mediadev_metrics.py` | servicio `mediadev-metrics` | Métricas de host/procesos → CloudWatch (`MediaDEV`) |
+| `tvprem_watch.py` | cron 21:00 HN (`/etc/cron.d/tvprem-watch`) | Consulta `player_api.php` de tvprem (no usa cupo de conexión). Avisa por Telegram si la cuenta vence o cambian los IDs. Nunca toca `capture_config` |
+| `gateway_switch.sh <id>` | manual o desde `health_engine` (failover) | Cambia el gateway activo (ver abajo) |
+| `sync_streams.py [--apply]` | manual | Regenera `stations.json` y `stream_catalog` desde `capture_config` (sin `--apply` es dry-run) |
+| `analyze_reencoding.py` | manual | Detecta fuentes re-encodeadas por corte espectral |
+| `stream_run.sh` | **no corre** | Runner legado de supervisor. Se conserva solo porque lo referencian las tools de acción de `mcp/` (rotas, ver `mcp/README.md`) |
 
-> `probe_direct()` usa el **código HTTP** (`curl -w %{http_code}`), NO range requests:
-> muchos Icecast ignoran `-r` y mandan stream continuo → el range daba falsos negativos.
+Con AWS suspendida (desde el 6-oct), `mediadev-logs` y `mediadev-metrics` fallan con `InvalidClientTokenId`.
 
-## route por estación (config/stations.json)
-- `gateway` (8): geo-bloqueadas (`ice42.securenetsystems.net`) o sin throughput directo —
-  xy_hrn, xy_tgu, xy_sps, radio_satelite, fm_941, suave_fm, radio_choluteca, **teleceiba**.
-- `auto` (5): radio_america, radio_globo, radio_el_patio, hch_tv, canal_11 — van directo
-  mientras puedan, con fallback automático a gateway.
+## video_segment_uploader.py — detalles que importan
+- **La lista de canales TV la lee de `config/stations.json`** (`type=tv` y `enabled`), no de
+  `capture_config`. Al dar de alta o baja un canal TV hay que correr `sync_streams.py --apply`; el uploader
+  relee `stations.json` en cada ciclo, así que no hace falta reiniciarlo. Si no se corre el sync, el daemon captura el canal y nadie sube el video.
+- Cada 15 s (`SCAN_INTERVAL`) sube todos los segmentos salvo los últimos `HLS_KEEP = 12`. El
+  epoch sale de `mtime`. Los segmentos inválidos van a `/var/www/streams/_invalid/<sid>/`.
+  En prod `VIDEO_VALIDATE_FFPROBE=0`.
+- Audio TV: por cada segmento extrae el audio (`-vn -c:a copy`) a
+  `/var/www/streams/_tv_audio/<sid>/<hora>/<epoch>.ts`. Al cambiar de hora, `flush_audio_hour`
+  concatena y sube `<sid>/YYYY/MM/<hora>.ts` más `<hora>.manifest.json`, que mapea la posición
+  acumulada al epoch real y corrige el drift audio/video.
+- Guardas: solo concatena archivos `{epoch}.ts` y aborta si la salida pesa más de
+  `CONCAT_MAX_RATIO = 3` veces la entrada. Así se cortó el self-concat que llenó el disco el 26-ago.
+- Registra en `recording_coverage` (audio y video) y en `s3_scan_log`.
 
-> `teleceiba` pasó a `gateway` fijo (su origen no entregaba throughput de segmentos por la
-> ruta directa). Los 3 TV son hch_tv, teleceiba y canal_11.
-
-## Parámetros ffmpeg
+## gateway_switch.sh
 ```bash
-# Comunes:
--hls_time 4 -hls_list_size 10 -hls_flags append_list   # SIN delete_segments (auditoría 8h)
--hls_segment_filename "$OUT_DIR/seg_%05d.ts"
-# Radio: -vn -c:a aac -b:a 64k -ac 1 -ar 22050  (codec antes de -ac)
-# TV:    -c:v copy -c:a aac -b:a 128k           (NO -vn — Destroyer necesita el video)
+sudo /opt/media-ai/scripts/gateway_switch.sh <gateway_id>   # hn01 | hn02 | hn03
 ```
+1. Reescribe `/etc/mediadev/gateway.conf` (fuente de verdad: `GW_ACTIVE_ID`, `GW_SOCKS5`).
+2. Reconfigura y recarga Privoxy.
+3. **No** toca `stations.json`: el estado de gateways vive en la DB y en `gateway.conf`.
+4. `systemctl restart stream-daemon` para que los streams socks5 tomen el nuevo gateway.
 
-## Cambiar gateway — usar gateway_switch.sh (NO editar a mano)
-```bash
-sudo /opt/media-ai/scripts/gateway_switch.sh <gateway_id>   # ej: hn02
+El failover normal lo decide `health_engine` (repo `destroyer`, `cap/gateway/engine/`). No
+editar `gateway.conf` a mano. Gateway activo hoy: `hn03` (RPi-Levi, `10.101.0.6`).
+
+## Cron de root (no está en este repo)
 ```
-Actualiza `/etc/mediadev/gateway.conf` (que leen los scripts SOCKS5), Privoxy y stations.json,
-y reinicia los streams. El failover normalmente es automático (health_engine).
-
-## Gateways (config/stations.json)
-- `hn01` 10.101.0.2 — RPi Honduras 01 (failover-1)
-- `hn02` 10.101.0.5 — PC-LCE (primary, activo)
-- `hn03` 10.101.0.6 — RPi-Levi (failover-2)
-
-## Otros scripts
-- `video_segment_uploader.py` — sube .ts de TV a S3 (servicio `video-segment-uploader`).
-- `gateway_switch.sh` — cambio de gateway (gateway_watchdog.py retirado 27 jun 2026).
-- `deploy_peer_b.sh` — configura un peer de respaldo.
-- `backup_healthcheck.py` — failover active-active de grabaciones en S3.
-
-## Agregar un stream
-1. Añadir entrada a `config/stations.json` (con `route`, normalmente `auto`).
-2. Añadir `[program:stream_{id}]` con `command=stream_run.sh {id}` a supervisor.
-3. `supervisorctl reread && supervisorctl update`.
-No se crea ningún script nuevo — el runner es compartido.
-
-## Supervisord
-```bash
-supervisorctl status                      # 13 streams
-supervisorctl restart all
-supervisorctl tail stream_fm_941 stdout   # ver decisión de routing (use_gateway=...)
-# Config: /etc/supervisor/conf.d/mediadev_streams.conf
+*/30 * * * * find /var/www/streams/ -maxdepth 2 -name "seg_*.ts" -not -path "*/hch_tv/*" \
+             -not -path "*/teleceiba/*" -not -path "*/canal_11/*" -mmin +120 -delete
 ```
+Este cron manda más que `KEEP_SEG_HOURS = 8` del daemon: los segmentos de radio viven unas 2 h.
 
-## Pitfalls
-- NO poner `-vn` en los TV (hch_tv/teleceiba/canal_11) — perdería el video que necesita Destroyer.
-- `route=auto` agrega ~5s al arranque (el probe espera respuesta). Es aceptable.
-- Si la fuente está caída, el Circuit Breaker (stream-daemon) la deshabilita tras 5 fallos.
+## Agregar o cambiar una estación
+1. Probar el origen y decidir `route` (`socks5` si es geo-restringido, `direct` si es CDN).
+2. Insertar o editar en `media_sources` + `capture_config`. El daemon la toma en ≤ 300 s.
+3. Si es **TV**: `python3 scripts/sync_streams.py --apply` (el uploader saca de `stations.json` la lista de canales TV).
+4. Validar: 1 ffmpeg nuevo, `index.m3u8` fresco y `.err` limpio. Ver el skill `mediacap-ffmpeg`.

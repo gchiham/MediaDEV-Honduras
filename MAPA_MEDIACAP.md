@@ -60,11 +60,12 @@ TV: video_segment_uploader sube video + audio horario
 
 ## Fuente de verdad (importante)
 
-- **Estaciones**: tabla `capture_config` en PostgreSQL. `config/stations.json` y
-  `stream_catalog.stream_url` están congelados y tienen URLs viejas; `stations.json` solo sirve
-  para la definición de gateways.
-- **Gateway activo**: `/etc/mediadev/gateway.conf`, se cambia solo con `scripts/gateway_switch.sh`
-  (lo invoca también `health_engine`).
+- **Estaciones**: tabla `capture_config` en PostgreSQL (hoy 19 habilitadas: 12 radios y 7 TV).
+  Las URLs de `config/stations.json` no se usan para capturar, pero el archivo sigue vivo: el
+  uploader de video saca de ahí **la lista de canales TV**. Lo regenera `scripts/sync_streams.py --apply`;
+  si se da de alta un TV sin correrlo, se captura y nadie sube el video.
+- **Gateway activo**: `/etc/mediadev/gateway.conf` (hoy `hn03`, RPi-Levi). Se cambia solo con
+  `scripts/gateway_switch.sh`, que también invoca `health_engine`, y reinicia `stream-daemon`.
 - **Bandera nueva de captura**: tiene que existir como columna en `capture_config` **y** en el
   `SELECT` de `load_config_from_db()`; si no, el daemon usa el default sin avisar.
 
@@ -96,15 +97,18 @@ TV: video_segment_uploader sube video + audio horario
   revirtió para validarlo junto con el Destroyer; el mecanismo quedó en `AUDIO_COPY_SIDS` (vacío).
 - **Reinicios del daemon dejan segmentos de 0 bytes y reinician el PTS**. Antes eso truncaba la
   hora; `build_hour_ts` (v2, 8-oct) lo corrige y ya funcionó en vivo, pero es código nuevo.
-- **Circuit breaker en memoria**: un reinicio lo resetea; PG solo es espejo.
+- **Circuit breaker en memoria** (8 fallos → OPEN, reset fijo a los 10 min): un reinicio lo resetea; PG solo es espejo.
+- **Retención local real ~2 h para radios**: un cron de root borra `seg_*.ts` de más de 120 min
+  (excepto hch_tv/teleceiba/canal_11), por encima de los 8 h que dice el daemon.
 - **AWS suspendida desde el 6-oct**: CloudWatch (logs y métricas) falla con
   `InvalidClientTokenId`; el bucket usa DO Spaces como interino; el Destroyer no está corriendo.
 - **Historial de git**: contiene dos tokens de Telegram y una contraseña IPTV antiguos. Los tokens
   están revocados y la contraseña ya no es la vigente; no se reescribió el historial.
 - **Restos en el servidor**: un PostgreSQL 16 local con una `destroyer_db` de 8 MB (no se usa) y
   `supervisor` activo sin programas.
-- **Código con deuda conocida**: `monitor/telegram_bot.py` tiene un `SyntaxError` y no corre;
-  `scripts/stream_run.sh` ya no lanza streams pero lo referencian herramientas de `mcp/`.
+- **Código con deuda conocida**: `monitor/telegram_bot.py` tiene un `SyntaxError` y no corre.
+  Las tools de acción del MCP (`restart_stream`, `add_stream`, `update_stream`) siguen usando
+  supervisor, `stations.json` y `stream_run.sh`, y **no funcionan** (ver `mcp/README.md`).
 
 ## Qué no es parte de mediaCAP
 

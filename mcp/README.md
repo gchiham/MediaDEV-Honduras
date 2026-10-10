@@ -1,51 +1,54 @@
-# mediadev-mcp — MCP Server
+# mediadev-mcp — MCP Server (mediaCAP)
 
-Servidor Model Context Protocol para MediaDEV (nodo **mediaCAP**, captura). Expone
-observabilidad, diagnóstico y acción del sistema a Claude Code y cualquier cliente MCP
-compatible. Corre como `FastMCP` con transport `stdio`; el acceso desde Windows es vía SSH.
+> Verificado contra `/opt/media-ai/mcp/` desplegado (9-oct-2026).
 
-> El nodo **mediaAPP** tiene su propio MCP (modular bajo `tools/`: system, workers, queue,
-> health, errors, logs, cost, capacity) — versionado en el repo `mediadev-infra`. Este README
-> es el del MCP de mediaCAP (repo `MediaDEV-Honduras`, `mcp/server.py`).
+Servidor Model Context Protocol del nodo **mediaCAP**. `FastMCP` con transport `stdio`: no es
+un servicio y no queda corriendo. El cliente lo lanza por SSH en cada sesión (`start.sh` →
+`venv/bin/python server.py`).
 
-## Herramientas (17 tools)
+> mediaAPP tiene su propio MCP, versionado en `mediadev-infra/mediaapp/mcp/`.
 
-### Observabilidad (lectura)
-| Tool | Descripción |
-|---|---|
-| `get_system_status()` | Estado de los 13 streams (OK/STALE/NO_M3U8/CB) |
-| `get_workers()` | Procesos ffmpeg (supervisord) + servicios systemd |
-| `get_queue_stats(limit)` | Motor Destroyer: corridas, detecciones, costos (DB) |
-| `get_service_health()` | Gateways, WireGuard, DB, Privoxy |
-| `get_recent_errors(stream_id, hours)` | Eventos DOWN/UP/CB_OPEN/CB_CLOSE + failovers + runs con error |
-| `get_host_resources()` | CPU, RAM, disco, load de mediaCAP + agregado ffmpeg |
-| `get_stream_bandwidth()` | Bitrate (Mbps) y GB/día por stream — el cuello al escalar TV es red/disco/S3 |
-| `get_destroyer_analytics(limit)` | Boot/work/costo por corrida + detección automática de cuelgues |
-| `get_droplets()` | Inventario de droplets DigitalOcean (los 2 nodos; el Destroyer ya no usa droplets — corre en AWS) |
+## Herramientas (17)
+
+**Estado real:** las tools se escribieron en junio, cuando supervisor manejaba los streams.
+Varias siguen leyendo supervisor o `stations.json`, y hoy dan datos vacíos o incorrectos.
+
+### Lectura
+| Tool | Fuente | Estado |
+|---|---|---|
+| `get_system_status()` | `mediadev_stream_status` (PG) | ✅ correcta |
+| `get_workers()` | `supervisorctl status` + systemd | ⚠️ la parte de ffmpeg sale vacía (supervisor ya no tiene programas). Para procesos: `pgrep -af ffmpeg` |
+| `get_queue_stats(limit)` | tablas del Destroyer (PG) | ✅ |
+| `get_service_health()` | gateways (DB, fallback `stations.json`), WireGuard, Privoxy | ✅ |
+| `get_recent_errors(stream_id, hours)` | `mediadev_events` + failovers + runs | ✅ |
+| `get_host_resources()` | `/proc`, ffmpeg | ✅ |
+| `get_stream_bandwidth()` | disco por stream | ✅ |
+| `get_destroyer_analytics(limit)` | corridas del Destroyer (PG) | ✅ (con AWS suspendida no hay corridas nuevas) |
+| `get_droplets()` | API de DigitalOcean | ✅ |
 
 ### Diagnóstico
-| Tool | Descripción |
+| Tool | Estado |
 |---|---|
-| `get_service_logs(service, lines, contains)` | Tail/grep del journal de un servicio (allowlist) |
-| `get_error_digest(hours)` | Escaneo consolidado de errores/tracebacks — "¿qué se rompe?" |
-| `verify_stream_url(url)` | Prueba una URL m3u8 — auto-detecta si necesita gateway |
-| `get_disk_usage()` | Uso de disco por stream en `/var/www/streams/` |
-| `get_uploader_status()` | Backlog TV/radio local + registros en `s3_scan_log` |
+| `get_service_logs(service, lines, contains)` | ✅ journal con allowlist |
+| `get_error_digest(hours)` | ✅ |
+| `verify_stream_url(url)` | ⚠️ sirve para probar la URL, pero `recommended_route` usa la lógica `auto` de `stream_run.sh`. Los valores reales en `capture_config` son `socks5` o `direct` |
+| `get_disk_usage()` | ✅ |
+| `get_uploader_status()` | ✅ (la lista TV/radio la saca de `stations.json`, igual que el uploader) |
 
-### Acción (escriben/ejecutan como root — usar con criterio)
-| Tool | Descripción |
+### Acción — ❌ NO USAR
+| Tool | Por qué está rota |
 |---|---|
-| `restart_stream(stream_id)` | Reinicia un stream vía `supervisorctl` |
-| `add_stream(...)` | Agrega canal nuevo (`stations.json` + supervisor + daemon) |
-| `update_stream(stream_id, fields)` | Modifica campos de un canal existente |
+| `restart_stream(stream_id)` | Hace `supervisorctl restart stream_<id>`, que ya no existe. Hoy: matar el ffmpeg del stream (el daemon lo respawnea en ≤ 15 s) o `systemctl restart stream-daemon` (reinicia todos) |
+| `add_stream(...)` | Escribe `stations.json` y un bloque de supervisor con `stream_run.sh`. El daemon no lee ninguno de los dos. Hoy: `media_sources` + `capture_config` (ver `scripts/CLAUDE.md`) |
+| `update_stream(stream_id, fields)` | Edita `stations.json`, que el daemon ignora. Hoy: `UPDATE capture_config` |
 
-## Uso con Claude Code (desde Windows)
+Pendiente: reescribir estas tres sobre `capture_config` o retirarlas.
 
-Wrapper local que hace SSH al nodo y proxea stdin/stdout del protocolo MCP:
+## Uso desde Claude Code (Windows)
+Wrapper local que hace SSH al nodo y pasa stdin/stdout del protocolo MCP:
 `C:\Users\Sedesol\.ssh\mediadev-mcp.py` (mediaCAP) · `mediadev-app-mcp.py` (mediaAPP).
 
 ```json
-// claude_desktop_config.json
 {
   "mcpServers": {
     "mediadev":     { "command": "python.exe", "args": ["C:\\Users\\Sedesol\\.ssh\\mediadev-mcp.py"] },
@@ -53,21 +56,19 @@ Wrapper local que hace SSH al nodo y proxea stdin/stdout del protocolo MCP:
   }
 }
 ```
-
-Flags críticos del wrapper para no corromper el protocolo: `-T` (sin pseudo-tty),
-`-o LogLevel=QUIET` (sin banners SSH), `stderr=DEVNULL` (SSH stderr no contamina JSON-RPC).
+Flags del wrapper que evitan corromper el protocolo: `-T`, `-o LogLevel=QUIET`, `stderr=DEVNULL`.
 
 ## Estructura
-
 ```
-/opt/media-ai/mcp/
-├── server.py    ← FastMCP, transport="stdio", 17 tools
-└── venv/        ← Python venv con mcp[server]
+mcp/
+├── server.py        FastMCP, registra las 17 tools
+├── db.py            conexión PG (lee /etc/mediadev-db.env)
+├── tools/           system, workers, queue, health, errors, logs, capacity, cost, diagnostics, actions
+├── start.sh         entrypoint que lanza el cliente por SSH
+├── install.sh       crea el venv
+└── requirements.txt
 ```
 
 ## Seguridad
-
-- Lectura de PG: solo `SELECT` en la conexión a la DB.
-- Herramientas de acción: ejecutan `supervisorctl`/edición de config como root — usar con criterio.
-- Credenciales desde `/etc/mediadev-db.env` (chmod 600), nunca hardcodeadas.
-- Transport `stdio` sobre SSH: la seguridad es la llave SSH (`keySED`).
+- Las lecturas de PG son solo `SELECT`. Las credenciales salen de `/etc/mediadev-db.env`.
+- Las tools corren como root en el nodo. La seguridad es la llave SSH (`keySED`).

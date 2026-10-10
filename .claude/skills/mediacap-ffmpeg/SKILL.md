@@ -13,18 +13,17 @@ nada de re-encodes largos en el nodo.
 
 1. **Quien lanza ffmpeg es `stream_daemon.py`**, con `subprocess.Popen` + `os.setsid` en
    `spawn_stream`. **Supervisor NO maneja los streams** (sus conf son `.bak`; `supervisorctl status`
-   sale vacío) y `scripts/stream_run.sh` ya no se usa. El CLAUDE.md raíz está desactualizado en eso.
+   sale vacío) y `scripts/stream_run.sh` ya no se usa.
 2. **La config real sale de la DB**: `capture_config JOIN media_sources` (`load_config_from_db()`).
-   `config/stations.json` y `stream_catalog.stream_url` están **congelados y mienten** (solo
-   `stations.json` sigue valiendo para la definición de gateways). Una bandera que no esté en ese
+   Las URLs de `config/stations.json` y `stream_catalog.stream_url` **no se usan para capturar**
+   (`stations.json` sí da la lista TV al uploader: lo regenera `sync_streams.py --apply`). Una bandera que no esté en ese
    `SELECT` **no existe**, aunque el código haga `cfg.get(...)` → cae al default en silencio.
    Para saber qué corre de verdad: `tr '\0' ' ' < /proc/<pid>/cmdline`.
 3. El daemon **relee `capture_config` cada 300 s** y hot-addea/quita streams sin restart.
    `is_enabled=false` es el interruptor maestro: el daemon mata el stream aunque el origen esté sano.
-4. **La copia local `daemon/stream_daemon.py` de este repo está atrasada** respecto a prod (le
-   falta el `killpg` de `spawn_stream`, el path resolver/streamlink, `ffmpeg_extra`, `-c:a copy`
-   por estación). Antes de proponer un cambio, leé el archivo desplegado en `/opt/media-ai/daemon/`.
-5. El **circuit breaker vive en memoria** del daemon (`CB_FAIL_OPEN=8`, backoff 5→10→20→60 min).
+4. El repo quedó igual a prod el 9-oct-2026, pero el deploy es manual por SSH: antes de proponer
+   un cambio, confirmá con `git status` en `/opt/media-ai` que no haya drift.
+5. El **circuit breaker vive en memoria** del daemon (`CB_FAIL_OPEN=8`, reset fijo `CB_RESET_SECS=600`).
    PG es espejo: no se resetea por SQL. Al cambiar una URL con el CB abierto, contá ~10 min extra.
 6. Antes/después de tocar prod: protocolo `CHANGES.log` (PLAN/DONE/FAILED) en `/opt/media-ai/CHANGES.log`.
 
@@ -41,8 +40,9 @@ nada de re-encodes largos en el nodo.
 - stderr por stream: `/var/log/streams/ffmpeg/<sid>.err`.
 - `route=socks5` → `-http_proxy http://127.0.0.1:<privoxy>` (ffmpeg) o `--socks5-hostname` (curl).
   CDNs globales (streamtheworld, etc.) van `route=direct`.
-- Radios: el MP3 horario lo hace `do_record` concatenando los `.ts` (viven 8 h, `KEEP_SEG_HOURS`),
-  con auto-backfill de 3 h deduplicado **contra S3**. TV: lo sube `video_segment_uploader.py`.
+- Radios: la hora la arma `do_record`/`build_hour_ts` concatenando los `.ts` con `-c copy` → `.ts`
+  crudo (`RAW_AUDIO_OFFLOAD=1`; el MP3 lo hace el Destroyer). Auto-backfill de 3 h deduplicado
+  **contra S3**. Ojo: un cron de root borra los segmentos de radio a los 120 min. TV: lo sube `video_segment_uploader.py`.
 - Audio de primera generación (`-c:a copy`) para estaciones donde el doble AAC dañaba el
   fingerprint (teleceiba, canal_5). El resto re-encoda.
 
@@ -61,7 +61,7 @@ nada de re-encodes largos en el nodo.
 
 Valores actuales en el daemon (referencia, verificá en prod): `_RECONNECT = -reconnect 1
 -reconnect_at_eof 0 -reconnect_streamed 1 -reconnect_delay_max 8 -rw_timeout 20000000 -timeout 15000000`,
-`STALE_SECS=45`. No bajar intervalos del daemon (`INTERVAL_HEALTH=15`, etc.) sin justificar: 2 vCPU.
+`STALE_SECS=90`. No bajar intervalos del daemon (`INTERVAL_HEALTH=15`, etc.) sin justificar: 2 vCPU.
 
 ## 3. Playbook "X no graba" (en este orden)
 
@@ -70,7 +70,7 @@ df -h /                                                    # 1. disco PRIMERO: t
 systemctl show stream-daemon -p ActiveState -p ExecMainStartTimestamp -p NRestarts
 systemctl show video-segment-uploader -p NRestarts         # TV: contador alto = crash-loop
 pgrep -af "ffmpeg.*<sid>"                                   # 2. ¿hay 1 ffmpeg? ¿0? ¿varios?
-ls -la --time-style=+%T /var/www/streams/<sid>/index.m3u8   # 3. frescura del HLS (> 45 s = stale)
+ls -la --time-style=+%T /var/www/streams/<sid>/index.m3u8   # 3. frescura del HLS (> 90 s = stale)
 tail -50 /var/log/streams/ffmpeg/<sid>.err                  # 4. 502/404 vs h264 corrupto vs timeout vs 407
 cat /etc/mediadev/gateway.conf                              # 5. si es socks5: gateway activo
 ```
@@ -164,7 +164,8 @@ ps -eo pid,ppid,args | awk '$2==1 && /ffmpeg/'          # huérfanos reparentado
    (que no sea un encoder conectado inyectando silencio, como los Shoutcast de Lempira).
 2. Decidir `route` (socks5 si es geo-restringido, direct si es CDN global) y si el origen tiene
    DVR largo (`hls_live_restart=false`).
-3. Cambiar **solo `capture_config`** (nunca `stations.json`). El daemon lo toma en ≤ 300 s.
+3. Cambiar **`capture_config`** (nunca editar `stations.json` a mano). El daemon lo toma en ≤ 300 s.
+   Si es TV nuevo o dado de baja: `sync_streams.py --apply` para que el uploader lo vea.
 4. Validar: 1 ffmpeg nuevo, `index.m3u8` fresco, `.err` limpio y nivel de audio en el HLS local.
 5. Con fuentes de cupo limitado (tvprem: 2 conexiones, el daemon ya ocupa 1) o de cliente único
    (RPi `-listen 1`), **no probar con el daemon corriendo** sin permiso del usuario.
