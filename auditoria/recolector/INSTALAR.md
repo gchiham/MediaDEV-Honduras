@@ -40,7 +40,7 @@ systemctl daemon-reload
 systemctl start mediacap-auditor-inventario.service
 systemctl enable --now mediacap-auditor-inventario.timer
 
-# 4. Llave: generarla EN mediaAPP (ssh-keygen -t ed25519 -f /root/.ssh/mediacap_auditor -N "" -C mediacap-auditor)
+# 4. Llave: generarla EN mediaAPP (ver auditoria/mediaapp/INSTALAR.md)
 #    y poner solo la pública con el prefijo de authorized_keys.ejemplo:
 install -d -o root -g root -m 755 /etc/ssh/authorized_keys
 install -o root -g root -m 644 /dev/null /etc/ssh/authorized_keys/auditor   # y pegar la línea
@@ -56,7 +56,7 @@ bash auditoria/recolector/instalar/verificar_mediacap.sh auditoria/recolector/in
 Desde mediaAPP, las pruebas negativas (todo pedido devuelve solo el inventario; sin TTY, túnel ni sftp):
 
 ```bash
-bash auditoria/recolector/instalar/probar_desde_mediaapp.sh /root/.ssh/mediacap_auditor
+bash auditoria/recolector/instalar/probar_desde_mediaapp.sh /var/lib/mediacap-auditor/.ssh/mediacap_auditor
 ```
 
 Después: entrada DONE en `CHANGES.log`.

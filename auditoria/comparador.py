@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Comparador de despliegue — inventario de mediaCAP vs GitHub. Solo lee: no hace fetch ni escribe repos.
 
-    ssh -i /root/.ssh/mediacap_auditor auditor@10.136.0.7 > inventario.json
+    ssh -i /var/lib/mediacap-auditor/.ssh/mediacap_auditor auditor@10.136.0.7 > inventario.json
     git -C <cada clon> fetch      # lo hace quien llama: el comparador nunca toca la red
     python auditoria/comparador.py --inventario inventario.json \
         --captura <clon MediaDEV-Honduras> --destroyer <clon destroyer> --infra <clon mediadev-infra> \

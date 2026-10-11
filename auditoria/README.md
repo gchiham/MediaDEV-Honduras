@@ -61,7 +61,7 @@ garantías, instalación y rollback en [`recolector/INSTALAR.md`](recolector/INS
 Solo lee: no hace `fetch` (lo hace quien llama) ni escribe en los clones.
 
 ```bash
-ssh -i /root/.ssh/mediacap_auditor auditor@10.136.0.7 > inventario.json      # desde mediaAPP
+ssh -i /var/lib/mediacap-auditor/.ssh/mediacap_auditor auditor@10.136.0.7 > inventario.json      # desde mediaAPP
 python auditoria/comparador.py --inventario inventario.json \
     --captura <clon MediaDEV-Honduras> --destroyer <clon destroyer> --infra <clon mediadev-infra>
 ```

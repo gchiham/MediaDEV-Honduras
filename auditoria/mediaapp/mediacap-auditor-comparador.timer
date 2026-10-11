@@ -1,0 +1,11 @@
+[Unit]
+Description=Comparador de despliegue mediaCAP cada 6 h (15 min después del recolector)
+
+[Timer]
+# mediaAPP está en UTC. El recolector de mediaCAP corre a las 00/6:35 hora de Honduras
+# (= 00:35, 06:35, 12:35, 18:35 UTC) con hasta 5 min de retraso aleatorio.
+OnCalendar=*-*-* 00/6:50:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

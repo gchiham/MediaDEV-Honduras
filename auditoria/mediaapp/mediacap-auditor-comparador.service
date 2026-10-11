@@ -1,0 +1,23 @@
+# mediaAPP: compara lo desplegado en mediaCAP contra GitHub (solo lectura de ambos lados).
+# Escribe solo en /var/lib/mediacap-auditor (clones y reportes). Sin sudo ni secretos de OpenAI
+# todavía: el EnvironmentFile se agrega cuando exista el paso de informe con IA.
+[Unit]
+Description=Auditor mediaCAP: comparador de despliegue vs GitHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=auditor
+Group=auditor
+ExecStart=/opt/mediacap-auditor/auditoria/mediaapp/correr_comparador.sh
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=50%
+MemoryMax=300M
+TimeoutStartSec=300
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/mediacap-auditor
