@@ -286,6 +286,9 @@ def cliente_openai():
 
 
 def procesar_cola() -> None:
+    if os.environ.get("VIGIA_AGENTE") != "1":         # fase 1: IA apagada en producción
+        print("agente apagado (VIGIA_AGENTE != 1): no se llama a la API")
+        return
     import fcntl
     ESTADO_DIR.mkdir(mode=0o750, parents=True, exist_ok=True)
     with open(ESTADO_DIR / "agente.lock", "w") as lock:

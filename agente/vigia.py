@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from comun import (COLA_DIR, ESTADO_DIR, ahora_hn, escribir_json, hora_hn, leer_json,
-                   ssh_mediacap, telegram)
+                   ssh_mediacap, telegram, telegram_getme)
 
 INTERVALO_AUDIO_MIN = 15          # el chequeo con volumedetect corre cada 15 min, no cada 5
 STALE_SECS = 90
@@ -117,6 +117,8 @@ def condiciones(foto: dict, db: dict | None, ignorar: dict, con_audio: bool,
 
     reinicios = {}
     for nombre, s in foto.get("servicios", {}).items():
+        if s.get("instalado") is False:               # unidad que no existe en el nodo: no es una caída
+            continue
         k = f"servicio_caido:{nombre}"
         evaluadas.add(k)
         if s.get("activo") not in ("active", None):
@@ -195,6 +197,11 @@ def mensaje(nuevas, recuperadas, repetidas, ahora, con_agente: bool = False) -> 
     return "\n".join(partes)
 
 
+def agente_habilitado() -> bool:
+    """La investigación con IA es opt-in: sin VIGIA_AGENTE=1 no se encola ni se llama a la API."""
+    return os.environ.get("VIGIA_AGENTE") == "1" and os.environ.get("VIGIA_SIMULAR") != "1"
+
+
 def encolar(incidente: dict) -> None:
     escribir_json(COLA_DIR / f"{int(time.time() * 1000)}.json", incidente)
 
@@ -202,7 +209,7 @@ def encolar(incidente: dict) -> None:
 def lanzar_agente() -> None:
     """Corre el agente al final y lo espera: un hijo en segundo plano moriría con el servicio
     oneshot (systemd mata el cgroup). Mientras corre, el timer no dispara otro chequeo."""
-    if os.environ.get("VIGIA_SIN_AGENTE") == "1":
+    if not agente_habilitado():
         return
     try:
         subprocess.run([sys.executable, str(Path(__file__).with_name("agente.py")), "--cola"],
@@ -211,8 +218,33 @@ def lanzar_agente() -> None:
         print("agente: superó 9 min; el incidente queda en la cola para la próxima vuelta")
 
 
-def main() -> None:
-    ahora = time.time()
+def latido(foto: dict, db: dict | None, estado: dict, ahora: float) -> str:
+    """Resumen diario determinista: prueba de que el vigía sigue vivo (en sano no manda nada más)."""
+    if "error" in foto:
+        grabando, total = "?", "?"
+    else:
+        est = foto.get("estaciones", {})
+        habilitadas = (db or {}).get("habilitadas") or {s for s, e in est.items() if e.get("habilitada")}
+        total = len(habilitadas)
+        grabando = sum(1 for s in habilitadas
+                       if (est.get(s, {}).get("edad_m3u8_s") or 1e9) <= STALE_SECS)
+    activas = estado.get("activas", {})
+    lineas = [f"🟢 Vigía activo · {hora_hn(ahora)} HN",
+              f"Estaciones grabando: {grabando} de {total}"]
+    if "error" not in foto:
+        d = foto.get("disco", {})
+        lineas.append(f"Disco: {d.get('usado_pct', '?')} % · load1 {(foto.get('carga') or ['?'])[0]}")
+    if activas:
+        lineas.append(f"Alertas activas ({len(activas)}):")
+        lineas += [f"• {a.get('sid') or k.split(':')[-1]} — {NOMBRE.get(a['tipo'], a['tipo'])} "
+                   f"desde {hora_hn(a['desde'])}" for k, a in sorted(activas.items())]
+    else:
+        lineas.append("Sin alertas activas.")
+    lineas.append(f"Agente IA: {'activo' if agente_habilitado() else 'apagado (fase 1)'}")
+    return "\n".join(lineas)
+
+
+def vuelta(ahora: float) -> None:
     estado = leer_json(ESTADO_DIR / "estado.json", {})
     ignorar = leer_json(ESTADO_DIR / "ignorar.json", {})
     con_audio = ahora - estado.get("ultimo_audio", 0) >= INTERVALO_AUDIO_MIN * 60 - 30
@@ -226,14 +258,16 @@ def main() -> None:
     nuevas, recuperadas, repetidas = evaluar(cond, evaluadas, estado, ahora,
                                              en_ventana_ignorada(ignorar, ahora))
     ult = estado.setdefault("agente_ultimo", {})
-    para_agente = [c for c in nuevas if ahora - ult.get(c.get("sid") or c["tipo"], 0) >= COOLDOWN_AGENTE_S]
-    if os.environ.get("VIGIA_SIN_AGENTE") == "1":
-        para_agente = []
+    para_agente = []
+    if agente_habilitado():
+        para_agente = [c for c in nuevas if ahora - ult.get(c.get("sid") or c["tipo"], 0) >= COOLDOWN_AGENTE_S]
     msg_id = None
     if nuevas or recuperadas or repetidas:
         msg_id = telegram(mensaje(nuevas, recuperadas, repetidas, ahora, con_agente=bool(para_agente)))
 
     lanzar = False
+    if os.environ.get("VIGIA_SIMULAR") == "1":
+        para_agente = []
     if para_agente:
         for c in para_agente:
             ult[c.get("sid") or c["tipo"]] = ahora
@@ -242,13 +276,63 @@ def main() -> None:
                                      if not any(k.endswith(f":{c.get('sid')}") for c in para_agente)]})
         lanzar = True
     hoy = ahora_hn(ahora).strftime("%Y-%m-%d")
-    if ahora_hn(ahora).hour == RESUMEN_HORA_HN and estado.get("resumen_fecha") != hoy             and os.environ.get("VIGIA_SIN_AGENTE") != "1":
+    if ahora_hn(ahora).hour == RESUMEN_HORA_HN and estado.get("resumen_fecha") != hoy:
         estado["resumen_fecha"] = hoy
-        encolar({"tipo": "resumen_diario", "creado": ahora, "activas": estado["activas"]})
-        lanzar = True
+        telegram(latido(foto, db, estado, ahora))
+        if agente_habilitado():
+            encolar({"tipo": "resumen_diario", "creado": ahora, "activas": estado["activas"]})
+            lanzar = True
+    if os.environ.get("VIGIA_SIMULAR") == "1":       # verificación: no altera la memoria ni la cola
+        return
+    estado.pop("fallo_vigia", None)
     escribir_json(ESTADO_DIR / "estado.json", estado)
     if lanzar:
         lanzar_agente()
+
+
+def avisar_fallo(e: Exception, ahora: float) -> None:
+    """Si el propio vigía revienta, avisar (una vez por hora) en vez de quedar callado."""
+    estado = leer_json(ESTADO_DIR / "estado.json", {})
+    if ahora - estado.get("fallo_vigia", 0) >= 3600:
+        telegram(f"⚠️ El vigía de mediaCAP falló ({type(e).__name__}) · {hora_hn(ahora)} HN. "
+                 f"Las alertas no están corriendo: revisar `journalctl -u mediadev-vigia`.")
+        estado["fallo_vigia"] = ahora
+        escribir_json(ESTADO_DIR / "estado.json", estado)
+
+
+def probar_telegram() -> int:
+    """Verifica el bot (getMe) y manda un mensaje de prueba al chat configurado."""
+    yo = telegram_getme()
+    if not yo:
+        print("Telegram: no responde o el token es inválido")
+        return 1
+    esperado = os.environ.get("VIGIA_BOT_USUARIO")
+    print(f"bot: @{yo.get('username')} (id {yo.get('id')})")
+    if esperado and yo.get("username") != esperado:
+        print(f"el bot no es el esperado ({esperado})")
+        return 1
+    mid = telegram(f"🔧 Prueba del vigía de mediaCAP · {hora_hn()} HN. Si lees esto, las alertas llegan aquí.")
+    print("mensaje de prueba enviado" if mid else "no se pudo enviar al chat configurado")
+    return 0 if mid else 1
+
+
+def main() -> None:
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--probar-telegram", action="store_true", help="getMe + mensaje de prueba")
+    ap.add_argument("--simular", action="store_true",
+                    help="una vuelta completa sin mandar nada a Telegram (imprime los mensajes)")
+    a = ap.parse_args()
+    if a.probar_telegram:
+        sys.exit(probar_telegram())
+    if a.simular:
+        os.environ["VIGIA_SIMULAR"] = "1"
+    ahora = time.time()
+    try:
+        vuelta(ahora)
+    except Exception as e:
+        avisar_fallo(e, ahora)
+        raise
 
 
 if __name__ == "__main__":
