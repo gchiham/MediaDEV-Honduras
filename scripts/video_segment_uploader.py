@@ -5,10 +5,16 @@ Usa mtime del archivo para calcular el epoch (sin SQLite).
 
 S3 path: video_segments/{stream_id}/{YYYY}/{MM}/{DD}/{epoch_start}_{epoch_end}.ts
 
-Además extrae audio por hora para alimentar el Destroyer:
-  s3://{bucket}/{stream_id}/{YYYY}/{MM}/{YYYY-MM-DD_HHh}.mp3
+Además arma el audio por hora para el Destroyer:
+  s3://{bucket}/{stream_id}/{YYYY}/{MM}/{YYYY-MM-DDTHHZ}.ts (+ .manifest.json)
+
+Audio: se extrae de cada segmento a _tv_audio/<sid>/<hora>/ (local); al cerrar la hora se sella
+en la bandeja _tv_audio/<sid>/.outbox/<hora>/ (atómico) y un hilo aparte la sube a S3 con
+reintentos. La vuelta principal nunca espera a S3 por el audio.
+`--drain-outbox`: sube lo pendiente de la bandeja una vez y sale (rollback/recuperación).
 """
-import os, time, json, logging, shutil, subprocess, boto3
+import os, sys, time, json, logging, queue, shutil, subprocess, threading, boto3
+from botocore.config import Config
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -23,7 +29,7 @@ HLS_KEEP       = int(os.environ.get("HLS_KEEP", "12"))
 SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", "15"))
 SEGMENT_DUR    = int(os.environ.get("SEGMENT_DUR", "4"))
 # Tope de cordura del concat: con -c copy la salida pesa aprox lo mismo que la suma
-# de sus entradas. Ver flush_audio_hour() y CHANGES.log (incidente 26 ago 2026).
+# de sus entradas. Ver build_audio_hour() y CHANGES.log (incidente 26 ago 2026).
 CONCAT_MAX_RATIO = float(os.environ.get("CONCAT_MAX_RATIO", "3"))
 S3_UPLOAD_RETRIES = int(os.environ.get("S3_UPLOAD_RETRIES", "3"))
 VIDEO_VALIDATE_FFPROBE = os.environ.get("VIDEO_VALIDATE_FFPROBE", "1") != "0"
@@ -62,8 +68,16 @@ def get_tv_streams() -> list:
         log.warning(f"No se pudo leer stations.json: {e}")
         return []
 
+# Timeouts acotados: un S3 lento (no caído) no debe colgar una vuelta ni el hilo de subida.
+_S3_CONFIG = Config(
+    connect_timeout=int(os.environ.get("S3_CONNECT_TIMEOUT", "5")),
+    read_timeout=int(os.environ.get("S3_READ_TIMEOUT", "60")),
+    retries={"max_attempts": 2, "mode": "standard"},
+)
+
+
 def get_s3():
-    return boto3.client("s3", region_name=S3_REGION)
+    return boto3.client("s3", region_name=S3_REGION, config=_S3_CONFIG)
 
 def s3_key(stream_id: str, epoch_start: int, epoch_end: int) -> str:
     dt = datetime.fromtimestamp(epoch_start, tz=timezone.utc)
@@ -439,31 +453,37 @@ def parse_hour_label(label: str) -> int | None:
             continue
     return None
 
-def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path) -> str:
-    """Concatena mini-segs de audio acumulados, sube TS raw a S3 para que Destroyer encode.
-    Devuelve 'uploaded' | 'skipped' (pocos segs, dir borrado) | 'invalid' (dir conservado) |
-    'upload_failed' (dir conservado, se reintenta)."""
+def _ffmpeg_concat(list_txt: Path, out: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-f", "concat", "-safe", "0", "-i", str(list_txt),
+         "-c", "copy", str(out)],
+        capture_output=True, text=True)
+
+
+def build_audio_hour(stream_id: str, hour_epoch: int, segs_dir: Path, out_dir: Path) -> tuple[str, dict]:
+    """Arma la hora de audio SOLO en local (sin S3): <hora>.ts + manifest.json + meta.json en
+    out_dir. meta.json se escribe al final: su presencia es la marca de "completo".
+    Devuelve ('sealed'|'skipped'|'invalid', meta)."""
     # Solo segmentos legitimos: se llaman {epoch:010d}.ts. Excluye explicitamente el
-    # <hora>.ts de salida, que se escribe en este mismo dir: si un flush previo murio
-    # antes del rmtree, incluirlo aqui realimenta el concat y el archivo crece sin fin
-    # (incidente 26 ago 2026: 126MB -> 41.8GB, disco lleno). Ver CHANGES.log.
+    # <hora>.ts de salida y los .part.ts: incluirlos realimenta el concat (incidente
+    # 26 ago 2026: 126MB -> 41.8GB, disco lleno). Ver CHANGES.log.
     segs    = sorted(q for q in segs_dir.glob("*.ts") if q.stem.isdigit())
     h_label = _hour_label(hour_epoch)
-    rec_day = datetime.fromtimestamp(hour_epoch, tz=timezone.utc).strftime("%Y-%m-%d")
 
     if len(segs) < 10:
-        log.warning(f"[{stream_id}] audio flush {h_label}: {len(segs)} segs — omitiendo")
+        log.warning(f"[{stream_id}] audio {h_label}: {len(segs)} segs — omitiendo")
         _coverage_upsert_audio(
             stream_id, hour_epoch, "skipped",
             actual_seconds=len(segs) * SEGMENT_DUR,
             local_path=segs_dir,
             reason=f"insufficient_segments_{len(segs)}",
         )
-        shutil.rmtree(segs_dir, ignore_errors=True)
-        return "skipped"
+        return "skipped", {"segments": len(segs)}
 
-    ts_path    = segs_dir / f"{h_label}.ts"
-    concat_txt = segs_dir / "list.txt"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts_path    = out_dir / f"{h_label}.ts"
+    concat_txt = out_dir / "list.txt"
     concat_txt.write_text("\n".join(concat_file_line(p) for p in segs) + "\n")
 
     # Manifiesto: mapeo (posicion acumulada real en el .ts concatenado -> epoch real
@@ -490,22 +510,17 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
         reason="building_ts",
     )
 
-    r = subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error",
-         "-f", "concat", "-safe", "0", "-i", str(concat_txt),
-         "-c", "copy", str(ts_path)],
-        capture_output=True, text=True
-    )
+    r = _ffmpeg_concat(concat_txt, ts_path)
     if r.returncode != 0:
-        log.error(f"[{stream_id}] audio flush ffmpeg error: {r.stderr[-300:]}")
+        log.error(f"[{stream_id}] audio {h_label} ffmpeg error: {(r.stderr or '')[-300:]}")
         _coverage_upsert_audio(
             stream_id, hour_epoch, "invalid",
             actual_seconds=len(segs) * SEGMENT_DUR,
             local_path=ts_path,
             reason="ffmpeg_failed",
-            last_error=r.stderr[-300:],
+            last_error=(r.stderr or "")[-300:],
         )
-        return "invalid"
+        return "invalid", {}
 
     # Guarda de cordura: con -c copy la salida debe pesar aproximadamente lo mismo que la
     # suma de sus entradas. Un desborde grosero significa que el concat se realimento (el
@@ -516,7 +531,7 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
     salida  = ts_path.stat().st_size if ts_path.exists() else 0
     if entrada and salida > CONCAT_MAX_RATIO * entrada:
         ratio = salida / entrada
-        log.error(f"[{stream_id}] audio flush {h_label} ABORTADO: salida {salida // 1048576}MB "
+        log.error(f"[{stream_id}] audio {h_label} ABORTADO: salida {salida // 1048576}MB "
                   f"vs entrada {entrada // 1048576}MB (ratio {ratio:.1f}x, tope "
                   f"{CONCAT_MAX_RATIO}x) - posible concat realimentado")
         ts_path.unlink(missing_ok=True)
@@ -527,51 +542,22 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
             reason="concat_runaway",
             last_error=f"ratio={ratio:.1f}x entrada={entrada} salida={salida}",
         )
-        return "invalid"
+        return "invalid", {}
+    if not salida:
+        _coverage_upsert_audio(stream_id, hour_epoch, "invalid", local_path=ts_path,
+                               reason="empty_output")
+        return "invalid", {}
 
-    key = _audio_s3_key(stream_id, hour_epoch)
-    hour_start_utc = datetime.fromtimestamp(hour_epoch, tz=timezone.utc)
-    size = ts_path.stat().st_size if ts_path.exists() else 0
-    actual_secs = len(segs) * SEGMENT_DUR
-
-    ok, err = upload_file_verified(s3_client, ts_path, key, "video/mp2t")
-    if not ok:
-        log.error(f"[{stream_id}] audio upload error: {err}")
-        _coverage_upsert_audio(
-            stream_id, hour_epoch, "upload_failed",
-            actual_seconds=actual_secs,
-            local_path=ts_path,
-            s3_key_value=key,
-            reason="upload_failed",
-            size_bytes=size,
-            upload_attempts=S3_UPLOAD_RETRIES,
-            last_error=err,
-        )
-        return "upload_failed"
-
-    log.info(f"[{stream_id}] {h_label}.ts → s3://{S3_BUCKET}/{key}  ({len(segs)} segs, {size//1024//1024}MB raw)")
-    try:
-        import json as _json
-        manifest_key = _manifest_s3_key(stream_id, hour_epoch)
-        manifest_path = segs_dir / "manifest.json"
-        manifest_path.write_text(_json.dumps(manifest))
-        s3_client.upload_file(str(manifest_path), S3_BUCKET, manifest_key,
-                               ExtraArgs={"ContentType": "application/json"})
-        log.info(f"[{stream_id}] manifest -> s3://{S3_BUCKET}/{manifest_key} ({len(manifest)} entradas)")
-    except Exception as e:
-        log.warning(f"[{stream_id}] manifest upload fallo (no bloqueante): {e}")
-    _db_register(key, stream_id, rec_day, hour_start_utc)
-    _coverage_upsert_audio(
-        stream_id, hour_epoch, "uploaded",
-        actual_seconds=actual_secs,
-        local_path=ts_path,
-        s3_key_value=key,
-        reason=None,
-        size_bytes=size,
-        upload_attempts=1,
-    )
-    shutil.rmtree(segs_dir, ignore_errors=True)
-    return "uploaded"
+    (out_dir / "manifest.json").write_text(json.dumps(manifest))
+    concat_txt.unlink(missing_ok=True)
+    meta = {
+        "stream_id": stream_id, "hour_epoch": hour_epoch, "label": h_label,
+        "segments": len(segs), "actual_seconds": len(segs) * SEGMENT_DUR,
+        "size": salida, "manifest_size": (out_dir / "manifest.json").stat().st_size,
+        "sealed_at": _now(), "attempts": 0,
+    }
+    (out_dir / "meta.json").write_text(json.dumps(meta))     # último: marca de completo
+    return "sealed", meta
 
 # ── Video upload ──────────────────────────────────────────────────────────────
 
@@ -602,7 +588,7 @@ S3_BACKOFF_MIN = int(os.environ.get("S3_BACKOFF_MIN", "60"))
 S3_BACKOFF_MAX = int(os.environ.get("S3_BACKOFF_MAX", "600"))
 UPLOAD_MAX_PER_CHANNEL = int(os.environ.get("UPLOAD_MAX_PER_CHANNEL", "40"))   # por vuelta
 EXTRACT_MAX_PER_LOOP = int(os.environ.get("EXTRACT_MAX_PER_LOOP", "300"))      # por canal y vuelta
-FLUSH_MAX_PER_LOOP = int(os.environ.get("FLUSH_MAX_PER_LOOP", "1"))            # horas por vuelta: cada flush tarda ~2.5 min (ffprobe x900)
+UPLOAD_TIME_BUDGET_S = float(os.environ.get("UPLOAD_TIME_BUDGET_S", "20"))     # tope de la subida de video por vuelta
 AUDIO_FLUSH_GRACE = int(os.environ.get("AUDIO_FLUSH_GRACE", "120"))            # s tras el fin de la hora
 AUDIO_EXTRACT_MAX_FAILS = int(os.environ.get("AUDIO_EXTRACT_MAX_FAILS", "3"))
 FLUSHED_MARKER_KEEP_H = int(os.environ.get("FLUSHED_MARKER_KEEP_H", "48"))
@@ -693,8 +679,8 @@ def _ffmpeg_extract(src: Path, dst: Path) -> bool:
 def extract_audio(stream_id: str, seg: Path, epoch: int) -> bool:
     """Extrae el audio del segmento a _tv_audio/<sid>/<hora>/<epoch>.ts. Idempotente y atómica
     (escribe .part y renombra): un corte a mitad no deja un archivo que parezca completo."""
-    if _flushed_marker(stream_id, _hour_of(epoch)).exists():
-        return True
+    if _flushed_marker(stream_id, _hour_of(epoch)).exists() or _is_sealing(stream_id, _hour_of(epoch)):
+        return True                                   # hora cerrada o en sellado: no recrear su dir
     out = _audio_seg_path(stream_id, epoch)
     if out.exists():
         return True
@@ -726,51 +712,244 @@ def _s3_size(s3_client, key: str) -> int | None:
         raise
 
 
-def flush_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path) -> str:
-    """flush_audio_hour con dos guardas: no reescribe en S3 una hora que ya está con un
-    archivo igual o más grande (un dir re-creado tras un flush previo sería parcial), y
-    deja marcador para no volver a armar una hora ya cerrada."""
-    key = _audio_s3_key(stream_id, hour_epoch)
-    local = sum(q.stat().st_size for q in segs_dir.glob("*.ts") if q.stem.isdigit())
-    try:
-        remote = _s3_size(s3_client, key)
-    except Exception as e:
-        s3_failed(str(e))
-        return "upload_failed"
-    if remote is not None and local and remote >= 0.9 * local:
-        log.info(f"[{stream_id}] {segs_dir.name}: ya en S3 ({remote} B >= local {local} B); no se reescribe")
-        _mark_flushed(stream_id, hour_epoch, "already_in_s3")
+def _outbox_root(stream_id: str) -> Path:
+    return AUDIO_DIR / stream_id / ".outbox"
+
+
+def seal_hour(stream_id: str, hour_epoch: int, segs_dir: Path) -> str:
+    """Sella la hora en la bandeja de salida local (sin S3). Atómico: se arma en
+    .outbox/.tmp-<hora>/ y se renombra a .outbox/<hora>/ con meta.json ya escrito.
+    Tras sellar, marcador 'sealed' (el audio está a salvo en disco) y se borran los
+    mini-segmentos de la hora. Idempotente ante cortes en cualquier punto."""
+    label = _hour_label(hour_epoch)
+    root = _outbox_root(stream_id)
+    final = root / label
+    if (final / "meta.json").exists():
+        # Corte entre el rename y el marcador: ya está sellada, solo completar.
+        _mark_flushed(stream_id, hour_epoch, "sealed")
         shutil.rmtree(segs_dir, ignore_errors=True)
-        return "already_in_s3"
-    status = flush_audio_hour(s3_client, stream_id, hour_epoch, segs_dir) or "upload_failed"
-    if status == "upload_failed":
-        s3_failed(f"flush {stream_id} {segs_dir.name}")
-    else:
-        if status == "uploaded":
-            s3_ok()
-        _mark_flushed(stream_id, hour_epoch, status)   # 'invalid' conserva el dir para revisión
+        return "sealed"
+    tmp = root / f".tmp-{label}"
+    shutil.rmtree(tmp, ignore_errors=True)          # resto de un sellado interrumpido
+    status, meta = build_audio_hour(stream_id, hour_epoch, segs_dir, tmp)
+    if status == "sealed":
+        shutil.rmtree(final, ignore_errors=True)     # dir sin meta.json = basura, nunca se sube
+        os.rename(tmp, final)
+        _mark_flushed(stream_id, hour_epoch, "sealed")
+        shutil.rmtree(segs_dir, ignore_errors=True)
+        _coverage_upsert_audio(stream_id, hour_epoch, "pending",
+                               actual_seconds=meta["actual_seconds"], local_path=final,
+                               reason="sealed_waiting_upload", size_bytes=meta["size"])
+        log.info(f"[{stream_id}] {label} sellada ({meta['segments']} segs, "
+                 f"{meta['size'] // 1048576}MB) -> bandeja de salida")
+    elif status == "skipped":
+        _mark_flushed(stream_id, hour_epoch, "skipped")
+        shutil.rmtree(segs_dir, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+    else:                                            # invalid: se conserva el dir para revisión
+        _mark_flushed(stream_id, hour_epoch, "invalid")
+        shutil.rmtree(tmp, ignore_errors=True)
     return status
 
 
-def flush_ready_hours(s3_client, stream_id: str, hold_hours: set, budget: int) -> int:
-    """Cierra horas de audio terminadas (fin + AUDIO_FLUSH_GRACE) cuyos segmentos ya se
-    extrajeron todos. Reemplaza a recover_stale_audio_dirs: reintenta solo, sin reiniciar."""
+# Sellado fuera de la vuelta principal: armar una hora de ~900 segmentos tarda decenas de
+# segundos (concat + manifest). La vuelta solo detecta las horas listas y las encola; un hilo
+# las sella. Mientras una hora está en _sealing, la extracción no recrea su directorio.
+_seal_q: "queue.Queue[tuple[str, int, Path]]" = queue.Queue()
+_sealing: set = set()
+_sealing_lock = threading.Lock()
+
+
+def _is_sealing(stream_id: str, hour_epoch: int) -> bool:
+    with _sealing_lock:
+        return (stream_id, hour_epoch) in _sealing
+
+
+def enqueue_ready_hours(stream_id: str, hold_hours: set) -> int:
+    """Encola las horas de audio terminadas (fin + AUDIO_FLUSH_GRACE) cuyos segmentos ya se
+    extrajeron todos. No sella ni toca S3: es barato y no frena la vuelta."""
     root = AUDIO_DIR / stream_id
-    if budget <= 0 or not root.is_dir():
+    if not root.is_dir():
         return 0
-    done = 0
+    n = 0
     for d in sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")):
         h = parse_hour_label(d.name)
         if h is None or h in hold_hours or _now() < h + 3600 + AUDIO_FLUSH_GRACE:
             continue
         if _flushed_marker(stream_id, h).exists():
             continue                                   # 'invalid': dir conservado a propósito
-        if done >= budget or not s3_available():
+        with _sealing_lock:
+            if (stream_id, h) in _sealing:
+                continue
+            _sealing.add((stream_id, h))
+        _seal_q.put((stream_id, h, d))
+        n += 1
+    return n
+
+
+def seal_pending(max_items: int | None = None) -> int:
+    """Sella lo encolado (lo corre el hilo de sellado). Un error deja la hora sin marcador:
+    la vuelta la vuelve a encolar y el sellado es idempotente."""
+    n = 0
+    while max_items is None or n < max_items:
+        try:
+            sid, h, d = _seal_q.get_nowait()
+        except queue.Empty:
             break
-        done += 1
-        if flush_hour(s3_client, stream_id, h, d) == "upload_failed":
-            break
-    return done
+        try:
+            seal_hour(sid, h, d)
+        except Exception as e:
+            log.error(f"[{sid}] sellado de {_hour_label(h)} falló, se reintenta: {e}")
+        finally:
+            with _sealing_lock:
+                _sealing.discard((sid, h))
+        n += 1
+    return n
+
+
+# ── Bandeja de salida: subida de horas de audio, desacoplada de la extracción ──
+# Un hilo aparte sube lo sellado. La vuelta principal nunca espera a S3 por el audio.
+OUTBOX_INTERVAL = float(os.environ.get("OUTBOX_INTERVAL", "5"))
+_ob_down_until = 0.0
+_ob_backoff = S3_BACKOFF_MIN
+_ob_lock = threading.Lock()                          # una sola subida de bandeja a la vez
+
+
+def outbox_entries() -> list[tuple[int, str, Path, dict]]:
+    """Horas selladas pendientes de subir, la más vieja primero. Un dir sin meta.json
+    (incompleto) o con meta ilegible no se sube."""
+    out = []
+    for mf in AUDIO_DIR.glob("*/.outbox/*/meta.json"):
+        d = mf.parent
+        if d.name.startswith("."):
+            continue
+        try:
+            m = json.loads(mf.read_text())
+            out.append((int(m["hour_epoch"]), m["stream_id"], d, m))
+        except Exception as e:
+            log.warning(f"bandeja: meta ilegible en {d}: {e}")
+    return sorted(out, key=lambda x: (x[0], x[1]))
+
+
+def _write_meta(d: Path, meta: dict) -> None:
+    tmp = d / "meta.json.tmp"
+    tmp.write_text(json.dumps(meta))
+    os.replace(tmp, d / "meta.json")
+
+
+def upload_outbox_entry(s3_client, d: Path, meta: dict) -> str:
+    """Sube una hora sellada: audio y después manifest; registra en s3_scan_log solo cuando
+    ambos están verificados en S3. Idempotente: lo que ya está en S3 con el mismo tamaño no
+    se vuelve a subir. Nunca reescribe una hora que ya está en S3 con un archivo distinto e
+    igual o mayor (>= 90 %). 'uploaded' | 'already_in_s3' | 'upload_failed' | 'corrupt'."""
+    sid, h, label = meta["stream_id"], int(meta["hour_epoch"]), meta["label"]
+    ts, man = d / f"{label}.ts", d / "manifest.json"
+    if (not ts.exists() or not man.exists() or ts.stat().st_size != meta["size"]
+            or man.stat().st_size != meta.get("manifest_size", man.stat().st_size)):
+        bad = d.with_name(f".corrupt-{label}")
+        shutil.rmtree(bad, ignore_errors=True)
+        os.rename(d, bad)
+        log.error(f"[{sid}] {label}: entrada de bandeja incompleta/alterada -> {bad.name} (no se sube)")
+        return "corrupt"
+    key, mkey = _audio_s3_key(sid, h), _manifest_s3_key(sid, h)
+    hour_start_utc = datetime.fromtimestamp(h, tz=timezone.utc)
+    try:
+        remote = _s3_size(s3_client, key)
+        if remote is not None and remote != meta["size"] and remote >= 0.9 * meta["size"]:
+            log.info(f"[{sid}] {label}: ya en S3 ({remote} B vs local {meta['size']} B); no se reescribe")
+            _mark_flushed(sid, h, "already_in_s3")
+            shutil.rmtree(d, ignore_errors=True)
+            return "already_in_s3"
+        if remote != meta["size"]:
+            ok, err = upload_file_verified(s3_client, ts, key, "video/mp2t", attempts=1)
+            if not ok:
+                raise RuntimeError(err or "upload audio")
+        if _s3_size(s3_client, mkey) != man.stat().st_size:
+            ok, err = upload_file_verified(s3_client, man, mkey, "application/json", attempts=1)
+            if not ok:
+                raise RuntimeError(err or "upload manifest")
+    except Exception as e:
+        meta["attempts"] = int(meta.get("attempts", 0)) + 1
+        _write_meta(d, meta)
+        _coverage_upsert_audio(sid, h, "upload_failed", actual_seconds=meta["actual_seconds"],
+                               local_path=ts, s3_key_value=key, reason="upload_failed",
+                               size_bytes=meta["size"], upload_attempts=1, last_error=str(e)[:300])
+        log.warning(f"[{sid}] {label}: subida fallida (intento {meta['attempts']}), queda en bandeja: {str(e)[:200]}")
+        return "upload_failed"
+    _db_register(key, sid, hour_start_utc.strftime("%Y-%m-%d"), hour_start_utc)
+    _coverage_upsert_audio(sid, h, "uploaded", actual_seconds=meta["actual_seconds"],
+                           local_path=ts, s3_key_value=key, reason=None,
+                           size_bytes=meta["size"], upload_attempts=1)
+    _mark_flushed(sid, h, "uploaded")
+    shutil.rmtree(d, ignore_errors=True)
+    log.info(f"[{sid}] {label}.ts → s3://{S3_BUCKET}/{key}  ({meta['segments']} segs, "
+             f"{meta['size'] // 1048576}MB raw) + manifest ({meta['segments']} entradas)")
+    return "uploaded"
+
+
+def process_outbox_once(s3_client, ignore_backoff: bool = False) -> dict:
+    """Sube lo sellado (más viejo primero). Al primer fallo corta y aplica backoff propio
+    (60 -> 600 s), independiente del breaker de la subida de video."""
+    global _ob_down_until, _ob_backoff
+    res = {"uploaded": 0, "already_in_s3": 0, "corrupt": 0, "failed": 0}
+    if not ignore_backoff and _now() < _ob_down_until:
+        res["pending"] = len(outbox_entries())
+        return res
+    with _ob_lock:
+        for _h, _sid, d, meta in outbox_entries():
+            st = upload_outbox_entry(s3_client, d, meta)
+            if st == "upload_failed":
+                res["failed"] += 1
+                _ob_down_until = _now() + _ob_backoff
+                log.warning(f"bandeja: S3 no disponible; reintento en {_ob_backoff}s")
+                _ob_backoff = min(_ob_backoff * 2, S3_BACKOFF_MAX)
+                break
+            _ob_backoff = S3_BACKOFF_MIN
+            res[st] = res.get(st, 0) + 1
+        res["pending"] = len(outbox_entries())
+    return res
+
+
+class OutboxWorker(threading.Thread):
+    """Hilo que vacía la bandeja de salida. Recupera solo tras reinicios: la bandeja vive en
+    disco. Usa su propio cliente S3."""
+
+    def __init__(self, s3_client=None, interval: float = OUTBOX_INTERVAL):
+        super().__init__(name="outbox-uploader", daemon=True)
+        self.s3_client, self.interval, self.stop_evt = s3_client, interval, threading.Event()
+
+    def run(self):
+        s3 = self.s3_client or get_s3()
+        while not self.stop_evt.is_set():
+            try:
+                process_outbox_once(s3)
+            except Exception as e:
+                log.error(f"bandeja: vuelta falló: {e}")
+            self.stop_evt.wait(self.interval)
+
+
+class SealWorker(threading.Thread):
+    """Hilo que sella las horas encoladas por la vuelta principal (trabajo local, sin S3)."""
+
+    def __init__(self, interval: float = 1.0):
+        super().__init__(name="audio-sealer", daemon=True)
+        self.interval, self.stop_evt = interval, threading.Event()
+
+    def run(self):
+        while not self.stop_evt.is_set():
+            try:
+                seal_pending()
+            except Exception as e:
+                log.error(f"sellado: vuelta falló: {e}")
+            self.stop_evt.wait(self.interval)
+
+
+def drain_outbox() -> int:
+    """--drain-outbox: intenta subir toda la bandeja una vez (ignora el backoff) y devuelve
+    cuántas horas quedan pendientes. Para rollback o recuperación manual."""
+    res = process_outbox_once(get_s3(), ignore_backoff=True)
+    log.info(f"drain: {res}")
+    return res.get("pending", 0)
 
 
 def upload_segment(s3_client, seg_path: Path, stream_id: str) -> str:
@@ -910,20 +1089,18 @@ def run_once(s3_client, tv_streams: list[str], free_fn=disk_free_bytes) -> dict:
         k = _loop_n % len(sids)
         sids = sids[k:] + sids[:k]
 
-    # 2) flush de horas de audio terminadas
-    flushed = 0
-    for sid in sids:
-        if flushed >= FLUSH_MAX_PER_LOOP or not s3_available():
-            break
-        flushed += flush_ready_hours(s3_client, sid, work[sid][1], FLUSH_MAX_PER_LOOP - flushed)
+    # 2) encolar horas de audio terminadas: las sella el hilo de sellado y las sube el hilo de
+    #    la bandeja. Esta vuelta nunca espera ni al concat ni a S3 por el audio.
+    flushed = sum(enqueue_ready_hours(sid, work[sid][1]) for sid in sids)
 
     # 3) subida de video round-robin, 1 intento por segmento, corta al primer fallo
     uploaded = {sid: 0 for sid in sids}
     order = [(sid, work[sid][0][i]) for i in range(UPLOAD_MAX_PER_CHANNEL)
              for sid in sids if i < len(work[sid][0])]
+    t_up = _now()
     for sid, seg in order:
-        if not s3_available():
-            break
+        if not s3_available() or _now() - t_up > UPLOAD_TIME_BUDGET_S:
+            break                                    # S3 caído o lento: la extracción no espera
         r = upload_segment(s3_client, seg, sid)
         if r == "uploaded":
             uploaded[sid] += 1
@@ -944,9 +1121,19 @@ def run():
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     INVALID_DIR.mkdir(parents=True, exist_ok=True)
     tv_streams = get_tv_streams()
-    log.info(f"Video uploader v2 iniciado — TV streams: {tv_streams} shed={TV_SHED_MODE}")
+    log.info(f"Video uploader v2 iniciado — TV streams: {tv_streams} shed={TV_SHED_MODE} "
+             f"bandeja_pendiente={len(outbox_entries())}")
     s3_client = get_s3()
+    workers = {"sellado": SealWorker, "bandeja": OutboxWorker}
+    alive = {name: cls() for name, cls in workers.items()}
+    for t in alive.values():
+        t.start()
     while True:
+        for name, t in list(alive.items()):          # los hilos no deberían morir; si mueren, se relanzan
+            if not t.is_alive():
+                log.error(f"hilo de {name} murió; relanzando")
+                alive[name] = workers[name]()
+                alive[name].start()
         refreshed = get_tv_streams()
         if refreshed and refreshed != tv_streams:
             tv_streams = refreshed
@@ -958,4 +1145,6 @@ def run():
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
+    if "--drain-outbox" in sys.argv[1:]:
+        sys.exit(1 if drain_outbox() else 0)
     run()
