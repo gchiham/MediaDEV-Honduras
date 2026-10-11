@@ -117,4 +117,6 @@ jobs:
           python-version: "3.12"
       - run: sudo apt-get install -y --no-install-recommends ffmpeg > /dev/null
       - run: pip install --quiet boto3 psycopg2-binary
-      - run: python -m unittest discover -s tests -v
+      # Como root: el vigía exige que sus archivos sean de root (en prod lo son) y sus tests de
+      # integración se saltan si no lo es. Mismo python de setup-python y mismas dependencias.
+      - run: sudo -E env "PATH=$PATH" python -m unittest discover -s tests -v
