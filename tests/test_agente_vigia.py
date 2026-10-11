@@ -260,11 +260,44 @@ class Vigia(unittest.TestCase):
         self.assertIn("disco", self.estado["activas"])
 
     def test_mensaje(self):
-        m = vigia.mensaje([{"tipo": "silencio", "sid": "hch_tv", "detalle": "mean -91"}], [], [], self.t)
-        self.assertIn("hch_tv — MUDO: mean -91", m)
-        self.assertNotIn("investigando", m)
-        self.assertIn("investigando", vigia.mensaje([{"tipo": "disco", "sid": None, "detalle": "x"}],
-                                                    [], [], self.t, con_agente=True))
+        m = vigia.mensaje([{"tipo": "silencio", "sid": "hch_tv", "detalle": "mean -91",
+                            "resumen": "hch_tv graba, pero sin sonido"}], [], [], self.t)
+        self.assertIn("• hch_tv graba, pero sin sonido", m)
+        self.assertNotIn("-91", m)                                     # lo técnico solo va a la IA
+        self.assertNotIn("IA", m.split("\n")[-2])
+        self.assertIn("La IA lo está revisando", vigia.mensaje([{"tipo": "disco", "sid": None, "detalle": "x"}],
+                                                              [], [], self.t, con_agente=True))
+
+    def test_mensajes_en_lenguaje_claro(self):
+        cond, _, _ = vigia.condiciones(foto(edad=70279), None, {}, False, {})
+        c = cond["sin_grabar:radio_america"]
+        self.assertEqual(c["resumen"], "radio_america no está grabando (lo último grabado es de hace 19 h)")
+        self.assertIn("CB", c["detalle"])                                  # el detalle técnico sigue para la IA
+        ahora = 1_791_741_300.0                                            # 2026-10-11 11:55 HN
+        rep = vigia.mensaje([], [], [{**c, "clave": "sin_grabar:radio_america", "desde": ahora - 70000}], ahora)
+        self.assertIn("🟠 Sigue pasando", rep)
+        self.assertIn("radio_america — sin grabar desde 10-oct 16:28 (19 h)", rep)
+        for txt in ("m3u8", "ffmpeg", "CB", "70279"):
+            self.assertNotIn(txt, rep)
+        volvio = vigia.mensaje([], [{"clave": "sin_grabar:radio_america", "sid": "radio_america",
+                                     "tipo": "sin_grabar", "duracion_min": 1150},
+                                    {"clave": "servicio_caido:nginx", "sid": None, "tipo": "servicio_caido",
+                                     "duracion_min": 3}, {"clave": "disco", "sid": None, "tipo": "disco",
+                                                          "duracion_min": 30}], [], ahora)
+        self.assertIn("• radio_america ya graba otra vez (duró 19 h)", volvio)
+        self.assertIn("• nginx volvió a funcionar (duró 3 min)", volvio)
+        self.assertIn("• El disco ya no está lleno (duró 30 min)", volvio)
+        self.assertNotIn("🔕", volvio)                                     # la recuperación no pide silenciar
+        self.assertEqual(vigia.duracion(30), "1 min")
+        self.assertEqual(vigia.duracion(3 * 86400), "3 días")
+
+    def test_teclado_silenciar(self):
+        t = vigia.teclado_silenciar([{"sid": "canal_10"}, {"sid": None, "tipo": "disco"}, {"sid": "canal_10"}])
+        self.assertEqual(t["inline_keyboard"], [[{"text": "🔕 Silenciar canal_10 hasta que vuelva",
+                                                  "callback_data": "sil:canal_10"}]])
+        self.assertIsNone(vigia.teclado_silenciar([{"sid": None, "tipo": "disco"}]))
+        muchas = vigia.teclado_silenciar([{"sid": f"radio_{i}"} for i in range(9)])
+        self.assertEqual(len(muchas["inline_keyboard"]), vigia.MAX_BOTONES)
 
 
 # ── SSH y secretos (mediaAPP) ─────────────────────────────────────────────────
@@ -850,7 +883,7 @@ class Fase1(unittest.TestCase):
     def vuelta(self, f, t):
         enviados = []
         with mock.patch.object(vigia, "ssh_mediacap", return_value=f), \
-                mock.patch.object(vigia, "telegram", side_effect=lambda txt, responder_a=None: enviados.append(txt) or 1), \
+                mock.patch.object(vigia, "telegram", side_effect=lambda txt, responder_a=None, teclado=None: enviados.append(txt) or 1), \
                 mock.patch.object(vigia.subprocess, "run", side_effect=AssertionError("no debe lanzar el agente")):
             vigia.vuelta(t)
         return enviados
@@ -860,7 +893,7 @@ class Fase1(unittest.TestCase):
         self.assertFalse(vigia.agente_habilitado())
         self.vuelta(foto(edad=900), t)
         enviados = self.vuelta(foto(edad=900), t + 300)
-        self.assertTrue(any("no graba" in m for m in enviados))
+        self.assertTrue(any("radio_america no está grabando" in m for m in enviados))
         self.assertFalse(any("investigando" in m for m in enviados))
         self.assertFalse((self.tmp / "cola").exists())                    # nada encolado
 
@@ -890,7 +923,7 @@ class Fase1(unittest.TestCase):
         estado = {"activas": {"sin_grabar:radio_x": {"desde": 1_791_600_000, "tipo": "sin_grabar", "sid": "radio_x"}}}
         txt = vigia.latido(foto(edad=900), None, estado, 1_791_603_600)
         self.assertIn("Estaciones grabando: 0 de 1", txt)
-        self.assertIn("radio_x — no graba", txt)
+        self.assertIn("radio_x — sin grabar desde", txt)
 
     def test_simular_no_guarda_ni_envia(self):
         with mock.patch.dict(os.environ, {"VIGIA_SIMULAR": "1"}), mock.patch("builtins.print") as pr, \
@@ -904,7 +937,7 @@ class Fase1(unittest.TestCase):
 
     def test_fallo_del_vigia_avisa_una_vez_por_hora(self):
         enviados = []
-        with mock.patch.object(vigia, "telegram", side_effect=lambda txt, responder_a=None: enviados.append(txt)):
+        with mock.patch.object(vigia, "telegram", side_effect=lambda txt, responder_a=None, teclado=None: enviados.append(txt)):
             for t in (1_000_000, 1_000_300, 1_003_700):
                 vigia.avisar_fallo(RuntimeError("x"), t)
         self.assertEqual(len(enviados), 2)
@@ -1075,12 +1108,12 @@ class Fase1Linux(unittest.TestCase):
         self.correr()
         textos = self.tg.textos()
         self.assertEqual(len(textos), 1)
-        self.assertIn("radio_a — no graba", textos[0])
+        self.assertIn("radio_a no está grabando", textos[0])
         self.assertNotIn("radio_b", textos[0])
         self.assertNotIn("investigando", textos[0])
         self.envejecer("radio_a", 0)
         self.correr()
-        self.assertIn("Recuperado", self.tg.textos()[-1])
+        self.assertIn("radio_a ya graba otra vez", self.tg.textos()[-1])
         self.assertFalse((self.estado / "cola").exists())                   # IA apagada: nada en cola
 
     def test_latido_y_simulacion(self):
@@ -1193,7 +1226,7 @@ class BotComandos(unittest.TestCase):
         bot.cmd_pausa(["1"], self.T)
         envios = []
         with mock.patch.object(vigia, "ssh_mediacap", return_value=foto(edad=900)), \
-                mock.patch.object(vigia, "telegram", side_effect=lambda t, responder_a=None: envios.append(t)):
+                mock.patch.object(vigia, "telegram", side_effect=lambda t, responder_a=None, teclado=None: envios.append(t)):
             vigia.vuelta(self.T + 10)
             vigia.vuelta(self.T + 310)
         self.assertEqual(envios, [])                                       # en pausa: no avisa
@@ -1581,6 +1614,232 @@ class BotCalificacionLinux(unittest.TestCase):
         self.assertIn("answerCallbackQuery", metodos)
         self.assertIn("editMessageReplyMarkup", metodos)
         self.assertIn("Comentario guardado", tg.textos()[0])
+
+# ── silenciar "hasta que vuelva" ─────────────────────────────────────────────
+
+def _res_nada(nada=True, lado="origen", titulo="canal_10 no transmite"):
+    r = _res(titulo=titulo, lado=lado)
+    r["reporte"]["nada_que_hacer"] = nada
+    return r
+
+
+def _inc(sid="canal_10", tipo="incidente"):
+    return {"tipo": tipo, "alertas": [{"tipo": "sin_grabar", "sid": sid}]}
+
+
+class Silencio(unittest.TestCase):
+    T = 1_791_720_000.0
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        for mod, nombre, valor in ((comun, "ESTADO_DIR", self.tmp), (comun, "CONTROL", self.tmp / "control.json")):
+            q = mock.patch.object(mod, nombre, valor)
+            q.start()
+            self.addCleanup(q.stop)
+
+    def test_regla_de_silencio(self):
+        desde = self.T - 3600
+        self.assertIsNone(diagnosticos.silencio("canal_10", desde, {}))
+        self.assertIsNone(diagnosticos.silencio(None, desde, {}))                  # alertas del nodo: nunca
+        # el operador: vale solo para la caída en curso (marca posterior al inicio)
+        self.assertEqual(diagnosticos.silencio("canal_10", desde, {"silenciadas": {"canal_10": self.T}}), "operador")
+        self.assertIsNone(diagnosticos.silencio("canal_10", desde, {"silenciadas": {"canal_10": desde - 1}}))
+        # la IA: el último diagnóstico de esa estación desde el inicio de la alerta manda
+        diagnosticos.guardar("1791719000000", _inc(), _res_nada(), 1, desde - 60)      # de una caída anterior
+        self.assertIsNone(diagnosticos.silencio("canal_10", desde, {}))
+        diagnosticos.guardar("1791719500000", _inc(), _res_nada(), 2, desde + 60)
+        self.assertEqual(diagnosticos.silencio("canal_10", desde, {}), "ia")
+        self.assertIsNone(diagnosticos.silencio("radio_x", desde, {}))
+        self.assertIsNone(diagnosticos.silencio("canal_10", desde, {"reactivadas": {"canal_10": desde + 120}}))
+        diagnosticos.guardar("1791719600000", _inc(), _res_nada(nada=False), 3, desde + 600)   # cambió la causa
+        self.assertIsNone(diagnosticos.silencio("canal_10", desde, {}))
+
+    def test_nada_que_hacer_exige_lado_origen(self):
+        self.assertTrue(diagnosticos.nada_que_hacer({"nada_que_hacer": True, "lado": "origen"}))
+        for r in ({"nada_que_hacer": True, "lado": "captura_mediacap"}, {"nada_que_hacer": True, "lado": "desconocido"},
+                  {"nada_que_hacer": "true", "lado": "origen"}, {"lado": "origen"}):
+            self.assertFalse(diagnosticos.nada_que_hacer(r), r)
+
+    def test_formatear_avisa_que_no_recuerda(self):
+        r = _res_nada()
+        self.assertNotIn("🔕", agente.formatear(r))                               # sin tipo (replay): nada
+        r["tipo"] = "incidente"
+        self.assertIn("🔕 No te lo vuelvo a recordar; te aviso cuando vuelva.", agente.formatear(r))
+        self.assertNotIn("🔕", agente.formatear({**_res_nada(nada=False), "tipo": "incidente"}))
+
+    def test_evaluacion_revisa_nada_que_hacer(self):
+        r = {**REPORTE, "lado": "origen", "nada_que_hacer": True}
+        self.assertTrue(agente.evaluar_reporte(r, {"nada_que_hacer": True})["ok"])
+        self.assertFalse(agente.evaluar_reporte(r, {"nada_que_hacer": False})["ok"])
+        self.assertFalse(agente.evaluar_reporte({**r, "nada_que_hacer": False}, {"nada_que_hacer": True})["ok"])
+
+    def test_esquema_de_reportar(self):
+        rep = next(t for t in herramientas.TOOLS if t["name"] == "reportar")["parameters"]
+        self.assertEqual(rep["properties"]["nada_que_hacer"]["type"], "boolean")
+        self.assertIn("nada_que_hacer", rep["required"])                           # strict: todos requeridos
+
+
+class SilencioEnVuelta(Fase1):
+    """El vigía completo: recordatorio cada 2 h salvo silencio; la recuperación y una caída nueva sí avisan."""
+    T0 = 1_791_720_000.0
+
+    def setUp(self):
+        super().setUp()
+        for mod, nombre, valor in ((comun, "ESTADO_DIR", self.tmp), (comun, "CONTROL", self.tmp / "control.json"),
+                                   (vigia, "RESUMEN_HORA_HN", 99)):        # sin latido diario en estas pruebas
+            q = mock.patch.object(mod, nombre, valor)
+            q.start()
+            self.addCleanup(q.stop)
+
+    def caer(self):
+        self.vuelta(foto(edad=900), self.T0)
+        enviados = self.vuelta(foto(edad=1200), self.T0 + 300)
+        self.assertIn("radio_america no está grabando", enviados[0])
+        return self.T0 + 300
+
+    def test_sin_silencio_recuerda_cada_2h(self):
+        desde = self.caer()
+        enviados = self.vuelta(foto(edad=9000), desde + vigia.REALERTA_S)
+        self.assertIn("🟠 Sigue pasando", enviados[0])
+
+    def test_silenciada_por_la_ia_no_recuerda_y_avisa_al_volver(self):
+        desde = self.caer()
+        diagnosticos.guardar("1791720400000", _inc("radio_america"), _res_nada(), 77, desde + 60)
+        for i in range(1, 4):
+            self.assertEqual(self.vuelta(foto(edad=9000), desde + i * vigia.REALERTA_S), [])
+        e = comun.leer_json(self.tmp / "estado.json", {})
+        self.assertGreaterEqual(sum(d.get("silenciadas", 0) for d in e["stats"].values()), 3)
+        volvio = self.vuelta(foto(), desde + 4 * vigia.REALERTA_S)
+        self.assertIn("radio_america ya graba otra vez", volvio[0])
+        # cae de nuevo: es una alerta nueva y avisa aunque el diagnóstico viejo decía "nada que hacer"
+        t = desde + 5 * vigia.REALERTA_S
+        self.vuelta(foto(edad=900), t)
+        self.assertIn("radio_america no está grabando", self.vuelta(foto(edad=1200), t + 300)[0])
+
+    def test_silenciada_por_el_operador_y_reactivada(self):
+        desde = self.caer()
+        comun.escribir_json(comun.CONTROL, {"silenciadas": {"radio_america": desde + 30}})
+        self.assertEqual(self.vuelta(foto(edad=9000), desde + vigia.REALERTA_S), [])
+        comun.escribir_json(comun.CONTROL, {"silenciadas": {}})
+        self.assertIn("🟠 Sigue pasando", self.vuelta(foto(edad=9000), desde + 2 * vigia.REALERTA_S)[0])
+
+    def test_revision_silenciosa_cada_6h(self):
+        desde = self.caer()
+        diagnosticos.guardar("1791720400000", _inc("radio_america"), _res_nada(), 77, desde + 60)
+        lanzados = []
+        with mock.patch.dict(os.environ, {"VIGIA_AGENTE": "1"}), \
+                mock.patch.object(vigia, "lanzar_agente", side_effect=lambda: lanzados.append(1)):
+            self.vuelta(foto(edad=9000), desde + 3600)
+            self.assertEqual(lanzados, [])                                 # todavía no toca
+            self.vuelta(foto(edad=9000), desde + 60 + vigia.REVISION_S)
+            self.vuelta(foto(edad=9000), desde + 360 + vigia.REVISION_S)     # no se encola dos veces
+        cola = sorted((self.tmp / "cola").glob("*.json"))
+        self.assertEqual(len(cola), 1)
+        inc = comun.leer_json(cola[0], {})
+        self.assertEqual((inc["tipo"], inc["alertas"][0]["sid"], inc["msg_id"]), ("revision", "radio_america", None))
+        self.assertEqual(lanzados, [1])
+
+    def test_sin_ia_no_hay_revision(self):
+        desde = self.caer()
+        diagnosticos.guardar("1791720400000", _inc("radio_america"), _res_nada(), 77, desde + 60)
+        self.vuelta(foto(edad=9000), desde + 60 + vigia.REVISION_S)
+        self.assertFalse((self.tmp / "cola").exists())
+
+
+class RevisionEnAgente(unittest.TestCase):
+    T = 1_791_720_000.0
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        q = mock.patch.object(comun, "ESTADO_DIR", self.tmp)
+        q.start()
+        self.addCleanup(q.stop)
+
+    def correr(self, res):
+        cola = self.tmp / "cola"
+        comun.escribir_json(cola / "1791720000123.json", {**_inc(tipo="revision"), "creado": self.T, "msg_id": None})
+        enviados = []
+        fcntl_falso = types.SimpleNamespace(flock=lambda *a: None, LOCK_EX=2, LOCK_NB=4)
+        with mock.patch.dict(sys.modules, {"fcntl": fcntl_falso}), mock.patch.dict(os.environ, {"VIGIA_AGENTE": "1"}), \
+                mock.patch.object(agente, "ESTADO_DIR", self.tmp), mock.patch.object(agente, "COLA_DIR", cola), \
+                mock.patch.object(agente, "cliente_openai", return_value=object()), \
+                mock.patch.object(herramientas, "Real", return_value=None), \
+                mock.patch.object(agente, "investigar", return_value=res), mock.patch("builtins.print"), \
+                mock.patch.object(agente, "telegram", side_effect=lambda t, responder_a=None, teclado=None:
+                                  enviados.append((t, teclado)) or 600):
+            agente.procesar_cola()
+        return enviados
+
+    def test_sigue_igual_no_avisa(self):
+        self.assertEqual(self.correr(_res_nada()), [])
+        d = comun.leer_json(self.tmp / "diagnosticos.json", {})["1791720000123"]
+        self.assertTrue(d["nada_que_hacer"])                              # renueva el silencio
+        self.assertIsNone(d["msg_id"])
+        self.assertEqual(diagnosticos.resumen(self.T + 60)["total"], 0)   # no cuenta como diagnóstico calificable
+
+    def test_si_cambio_avisa_con_botones(self):
+        enviados = self.correr(_res_nada(nada=False, lado="captura_mediacap", titulo="canal_10 ya transmite"))
+        self.assertEqual(len(enviados), 1)
+        self.assertTrue(enviados[0][0].startswith("🔔 Cambió lo de canal_10:"))
+        self.assertIn("fb:1791720000123:ok", json.dumps(enviados[0][1]))
+
+
+class BotSilenciar(BotComandos):
+    def setUp(self):
+        super().setUp()
+        q = mock.patch.object(comun, "ESTADO_DIR", self.tmp)
+        q.start()
+        self.addCleanup(q.stop)
+        comun.escribir_json(self.tmp / "estado.json", {"activas": {
+            "sin_grabar:canal_10": {"desde": self.T - 70000, "ultima_alerta": self.T, "tipo": "sin_grabar",
+                                    "sid": "canal_10"}}})
+        self.api = []
+        q = mock.patch.object(bot, "telegram_api", side_effect=lambda m, d=None, timeout=15: self.api.append((m, d)) or True)
+        q.start()
+        self.addCleanup(q.stop)
+
+    def test_silenciar_y_reactivar(self):
+        self.assertIn("🔕 canal_10: no te la vuelvo a recordar", bot.responder("/silenciar canal_10", self.T))
+        self.assertEqual(comun.leer_control()["silenciadas"], {"canal_10": self.T})
+        self.assertIn("🔕 (silenciada por ti)", bot.responder("/estado", self.T))
+        self.assertIn("Silenciadas ahora: canal_10", bot.responder("/silenciar", self.T))
+        self.assertIn("te la vuelvo a recordar", bot.responder("/reactivar canal_10", self.T + 5))
+        c = comun.leer_control()
+        self.assertEqual((c["silenciadas"], c["reactivadas"]), ({}, {"canal_10": self.T + 5}))
+        self.assertNotIn("🔕", bot.responder("/estado", self.T + 10))
+
+    def test_estado_muestra_silencio_de_la_ia(self):
+        diagnosticos.guardar("1791720000123", _inc(), _res_nada(), 900, self.T - 60)
+        self.assertIn("🔕 (la IA dijo que no hay nada que hacer)", bot.responder("/estado", self.T))
+        bot.responder("/reactivar canal_10", self.T)                        # el operador manda sobre la IA
+        self.assertNotIn("🔕", bot.responder("/estado", self.T + 1))
+
+    def test_silenciar_valida(self):
+        self.assertIn("no tiene alertas activas", bot.responder("/silenciar radio_x", self.T))
+        self.assertIn("Uso", bot.responder("/silenciar ../etc", self.T))
+        self.assertIn("Uso", bot.responder("/reactivar", self.T))
+        self.assertNotIn("silenciadas", comun.leer_control())
+        self.assertIn("silenciar", [c for c, _ in bot.MENU])
+
+    def boton(self, data, chat=42):
+        return {"update_id": 5, "callback_query": {"id": "cb1", "data": data, "from": {"id": chat},
+                                                   "message": {"message_id": 800, "chat": {"id": chat}}}}
+
+    def test_boton_silenciar(self):
+        bot.procesar([self.boton("sil:canal_10")], self.T)
+        self.assertEqual(comun.leer_control()["silenciadas"], {"canal_10": self.T})
+        self.assertEqual([m for m, _ in self.api], ["answerCallbackQuery"])
+        self.assertIn("canal_10", self.api[0][1]["text"])
+        self.assertIn("/reactivar canal_10", self.enviados[-1])
+        for data in ("sil:../x", "sil:", "sil:radio_x"):
+            self.api.clear()
+            bot.procesar([self.boton(data)], self.T)
+            self.assertEqual([m for m, _ in self.api], ["answerCallbackQuery"], data)
+        self.assertEqual(comun.leer_control()["silenciadas"], {"canal_10": self.T})
+        self.api.clear()
+        bot.procesar([self.boton("sil:canal_10", chat=999)], self.T)          # otro chat: ni responde
+        self.assertEqual(self.api, [])
+
 
 
 if __name__ == "__main__":

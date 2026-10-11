@@ -269,6 +269,7 @@
    "borrar las grabaciones",
    "borrar grabaciones",
    "reiniciar el stream-daemon"
-  ]
+  ],
+  "nada_que_hacer": false
  }
 }
