@@ -25,8 +25,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"      # la de mediaCAP
-      - name: Pruebas de reglas, recolector y comparador
-        run: python -m unittest tests.test_reglas_mediacap tests.test_inventario_mediacap tests.test_comparador_despliegue -v
+      - name: Pruebas del auditor (reglas, recolector, comparador, informe)
+        run: python -m unittest tests.test_reglas_mediacap tests.test_inventario_mediacap tests.test_comparador_despliegue tests.test_informe_auditor -v
       - name: Reglas sobre el repo
         run: |
           mkdir -p salida

@@ -1,6 +1,7 @@
 # mediaAPP: compara lo desplegado en mediaCAP contra GitHub (solo lectura de ambos lados).
-# Escribe solo en /var/lib/mediacap-auditor (clones y reportes). Sin sudo ni secretos de OpenAI
-# todavía: el EnvironmentFile se agrega cuando exista el paso de informe con IA.
+# Escribe solo en /var/lib/mediacap-auditor (clones, reportes, estado del informe). Sin sudo.
+# /etc/mediacap-auditor.env es root:root 600: systemd lo lee como root y pasa las variables al
+# proceso; el usuario auditor no puede leer el archivo.
 [Unit]
 Description=Auditor mediaCAP: comparador de despliegue vs GitHub
 After=network-online.target
@@ -10,6 +11,7 @@ Wants=network-online.target
 Type=oneshot
 User=auditor
 Group=auditor
+EnvironmentFile=/etc/mediacap-auditor.env
 ExecStart=/opt/mediacap-auditor/auditoria/mediaapp/correr_comparador.sh
 Nice=10
 IOSchedulingClass=idle
