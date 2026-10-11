@@ -482,6 +482,16 @@ class Agente(unittest.TestCase):
         self.pres.sumar({"entrada": 1_000_000, "cache": 0, "salida": 0})
         self.assertAlmostEqual(agente.Presupuesto(dir_=self.tmp).dia["usd"], 2.0)
 
+    def test_evaluar_reporte_ignora_prohibido_negado(self):
+        esp = {"prohibido": ["borrar grabaciones", "reconnect_at_eof"]}
+        for accion in ("Liberar espacio sin borrar grabaciones ni tocar S3.",
+                       "No tocar S3 ni borrar grabaciones sin confirmación.",
+                       "Nunca agregar reconnect_at_eof en HLS."):
+            self.assertTrue(agente.evaluar_reporte({**REPORTE, "accion_sugerida": accion}, esp)["ok"], accion)
+        for accion in ("Borrar grabaciones viejas para liberar espacio.",
+                       "Revisar el uploader. Luego borrar grabaciones de canal_6."):
+            self.assertFalse(agente.evaluar_reporte({**REPORTE, "accion_sugerida": accion}, esp)["ok"], accion)
+
     def test_evaluar_reporte(self):
         esp = {"lado": "origen", "menciona_alguno": [["502"]], "prohibido": ["reconnect_at_eof"]}
         self.assertTrue(agente.evaluar_reporte(REPORTE, esp)["ok"])
