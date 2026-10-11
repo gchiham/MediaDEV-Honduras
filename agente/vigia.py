@@ -13,8 +13,8 @@ import os, subprocess, sys, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from comun import (COLA_DIR, ESTADO_DIR, ahora_hn, escribir_json, hora_hn, leer_json,
-                   ssh_mediacap, telegram, telegram_getme)
+from comun import (COLA_DIR, ESTADO_DIR, ahora_hn, en_pausa, escribir_json, hora_hn, ia_detenida,
+                   leer_json, ssh_mediacap, telegram, telegram_getme)
 
 INTERVALO_AUDIO_MIN = 15          # el chequeo con volumedetect corre cada 15 min, no cada 5
 STALE_SECS = 90
@@ -198,8 +198,39 @@ def mensaje(nuevas, recuperadas, repetidas, ahora, con_agente: bool = False) -> 
 
 
 def agente_habilitado() -> bool:
-    """La investigación con IA es opt-in: sin VIGIA_AGENTE=1 no se encola ni se llama a la API."""
-    return os.environ.get("VIGIA_AGENTE") == "1" and os.environ.get("VIGIA_SIMULAR") != "1"
+    """La investigación con IA es opt-in: sin VIGIA_AGENTE=1 no se encola ni se llama a la API.
+    Desde Telegram (/ia_off) solo se puede apagar, nunca encender por encima del entorno."""
+    return (os.environ.get("VIGIA_AGENTE") == "1" and os.environ.get("VIGIA_SIMULAR") != "1"
+            and not ia_detenida())
+
+
+def estado_ia() -> str:
+    if os.environ.get("VIGIA_AGENTE") != "1":
+        return "apagado en la config del servidor"
+    return "detenido desde Telegram (/ia_on)" if ia_detenida() else "activo"
+
+
+def resumen_estaciones(foto: dict, db: dict | None) -> tuple:
+    """(grabando, total) de las estaciones habilitadas, o ('?', '?') si no hubo foto."""
+    if "error" in foto:
+        return "?", "?"
+    est = foto.get("estaciones", {})
+    habilitadas = (db or {}).get("habilitadas") or {s for s, e in est.items() if e.get("habilitada")}
+    grabando = sum(1 for s in habilitadas if (est.get(s, {}).get("edad_m3u8_s") or 1e9) <= STALE_SECS)
+    return grabando, len(habilitadas)
+
+
+DIAS_STATS = 7
+
+
+def contar(estado: dict, ahora: float, **sumas) -> None:
+    """Estadísticas por día HN (las lee /stats). Se guardan los últimos DIAS_STATS días."""
+    stats = estado.setdefault("stats", {})
+    dia = stats.setdefault(ahora_hn(ahora).strftime("%Y-%m-%d"), {})
+    for k, v in sumas.items():
+        dia[k] = dia.get(k, 0) + v
+    for viejo in sorted(stats)[:-DIAS_STATS]:
+        stats.pop(viejo)
 
 
 def encolar(incidente: dict) -> None:
@@ -220,14 +251,7 @@ def lanzar_agente() -> None:
 
 def latido(foto: dict, db: dict | None, estado: dict, ahora: float) -> str:
     """Resumen diario determinista: prueba de que el vigía sigue vivo (en sano no manda nada más)."""
-    if "error" in foto:
-        grabando, total = "?", "?"
-    else:
-        est = foto.get("estaciones", {})
-        habilitadas = (db or {}).get("habilitadas") or {s for s, e in est.items() if e.get("habilitada")}
-        total = len(habilitadas)
-        grabando = sum(1 for s in habilitadas
-                       if (est.get(s, {}).get("edad_m3u8_s") or 1e9) <= STALE_SECS)
+    grabando, total = resumen_estaciones(foto, db)
     activas = estado.get("activas", {})
     lineas = [f"🟢 Vigía activo · {hora_hn(ahora)} HN",
               f"Estaciones grabando: {grabando} de {total}"]
@@ -240,7 +264,10 @@ def latido(foto: dict, db: dict | None, estado: dict, ahora: float) -> str:
                    f"desde {hora_hn(a['desde'])}" for k, a in sorted(activas.items())]
     else:
         lineas.append("Sin alertas activas.")
-    lineas.append(f"Agente IA: {'activo' if agente_habilitado() else 'apagado (fase 1)'}")
+    pausa = en_pausa(ahora)
+    if pausa:
+        lineas.append(f"⏸ Alertas en pausa hasta las {hora_hn(pausa)} HN (/reanudar)")
+    lineas.append(f"Agente IA: {'apagado (fase 1)' if os.environ.get('VIGIA_AGENTE') != '1' else estado_ia()}")
     return "\n".join(lineas)
 
 
@@ -257,13 +284,22 @@ def vuelta(ahora: float) -> None:
     estado["reinicios"] = reinicios or estado.get("reinicios", {})
     nuevas, recuperadas, repetidas = evaluar(cond, evaluadas, estado, ahora,
                                              en_ventana_ignorada(ignorar, ahora))
+    pausa = en_pausa(ahora)
     ult = estado.setdefault("agente_ultimo", {})
     para_agente = []
-    if agente_habilitado():
+    if agente_habilitado() and not pausa:
         para_agente = [c for c in nuevas if ahora - ult.get(c.get("sid") or c["tipo"], 0) >= COOLDOWN_AGENTE_S]
     msg_id = None
     if nuevas or recuperadas or repetidas:
-        msg_id = telegram(mensaje(nuevas, recuperadas, repetidas, ahora, con_agente=bool(para_agente)))
+        if pausa:                                     # /pausa: se evalúa igual, pero no se avisa
+            contar(estado, ahora, suprimidas=len(nuevas) + len(recuperadas) + len(repetidas))
+        else:
+            msg_id = telegram(mensaje(nuevas, recuperadas, repetidas, ahora, con_agente=bool(para_agente)))
+            contar(estado, ahora, mensajes=1, alertas_nuevas=len(nuevas), recuperadas=len(recuperadas))
+    grabando, total = resumen_estaciones(foto, db)
+    estado["ultima_vuelta"] = {"ts": ahora, "grabando": grabando, "total": total, "error": foto.get("error"),
+                               "disco": foto.get("disco"), "carga": (foto.get("carga") or [None])[0]}
+    contar(estado, ahora, vueltas=1, errores=1 if "error" in foto else 0)
 
     lanzar = False
     if os.environ.get("VIGIA_SIMULAR") == "1":
@@ -278,8 +314,8 @@ def vuelta(ahora: float) -> None:
     hoy = ahora_hn(ahora).strftime("%Y-%m-%d")
     if ahora_hn(ahora).hour == RESUMEN_HORA_HN and estado.get("resumen_fecha") != hoy:
         estado["resumen_fecha"] = hoy
-        telegram(latido(foto, db, estado, ahora))
-        if agente_habilitado():
+        telegram(latido(foto, db, estado, ahora))     # el latido sale aun en pausa: dice que está pausado
+        if agente_habilitado() and not pausa:
             encolar({"tipo": "resumen_diario", "creado": ahora, "activas": estado["activas"]})
             lanzar = True
     if os.environ.get("VIGIA_SIMULAR") == "1":       # verificación: no altera la memoria ni la cola

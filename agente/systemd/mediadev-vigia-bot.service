@@ -1,0 +1,24 @@
+[Unit]
+Description=MediaDEV vigia: comandos de Telegram (/estado /stats /pausa /ia_off)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mediadev-vigia
+Group=mediadev-vigia
+EnvironmentFile=/etc/mediadev-agent.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/mediadev-agente/venv/bin/python /opt/mediadev-agente/bot_comandos.py
+Restart=always
+RestartSec=15
+Nice=10
+MemoryMax=96M
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/var/lib/mediadev-vigia
+
+[Install]
+WantedBy=multi-user.target

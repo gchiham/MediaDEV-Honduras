@@ -12,7 +12,7 @@ opcional AGENTE_PRECIO_ENTRADA / _ENTRADA_CACHE / _SALIDA (USD por millón; si f
 tabla PRECIOS y, si el modelo no está ahí, el agente NO corre), TELEGRAM_BOT_TOKEN,
 TELEGRAM_CHAT_ID, MEDIACAP_SSH, MEDIACAP_SSH_KEY, MEDIACAP_KNOWN_HOSTS, DATABASE_URL_RO.
 """
-import argparse, json, math, os, sys, time
+import argparse, json, math, os, re, sys, time
 from pathlib import Path
 
 AQUI = Path(__file__).resolve().parent
@@ -289,6 +289,10 @@ def procesar_cola() -> None:
     if os.environ.get("VIGIA_AGENTE") != "1":         # fase 1: IA apagada en producción
         print("agente apagado (VIGIA_AGENTE != 1): no se llama a la API")
         return
+    from comun import ia_detenida
+    if ia_detenida():                                  # /ia_off desde Telegram
+        print("agente detenido desde Telegram (/ia_off): no se llama a la API")
+        return
     import fcntl
     ESTADO_DIR.mkdir(mode=0o750, parents=True, exist_ok=True)
     with open(ESTADO_DIR / "agente.lock", "w") as lock:
@@ -363,9 +367,13 @@ def evaluar_reporte(r: dict, esp: dict) -> dict:
     for grupo in esp.get("menciona_alguno", []):
         if not any(p.lower() in texto for p in grupo):
             fallas.append(f"no menciona ninguno de {grupo}")
+    accion = r.get("accion_sugerida", "").lower()
     for p in esp.get("prohibido", []):
-        if p.lower() in r.get("accion_sugerida", "").lower():
-            fallas.append(f"sugiere algo prohibido: {p}")
+        for m in re.finditer(re.escape(p.lower()), accion):
+            previo = accion[max(0, m.start() - 25):m.start()]
+            if not re.search(r"\b(no|sin|nunca|ni|evitar)\b[^.;:]*$", previo):   # "sin borrar…" no es sugerirlo
+                fallas.append(f"sugiere algo prohibido: {p}")
+                break
     return {"ok": not fallas, "fallas": fallas}
 
 

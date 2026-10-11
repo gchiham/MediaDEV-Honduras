@@ -60,7 +60,7 @@ def _token_permitido(token: str) -> bool:
     return token.split(":", 1)[0] not in prohibidos
 
 
-def _llamar_telegram(metodo: str, datos: dict | None = None) -> dict | None:
+def _llamar_telegram(metodo: str, datos: dict | None = None, timeout: int = 15) -> dict | list | None:
     token, base = os.environ.get("TELEGRAM_BOT_TOKEN"), _api_telegram()
     if not token or not base:
         return None
@@ -70,7 +70,7 @@ def _llamar_telegram(metodo: str, datos: dict | None = None) -> dict | None:
     req = urllib.request.Request(f"{base}/bot{token}/{metodo}",
                                  data=urllib.parse.urlencode(datos).encode() if datos else None)
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             res = json.load(r)
         return res.get("result") if res.get("ok") else None
     except Exception as e:                                   # una alerta caída no tumba el vigía
@@ -97,6 +97,31 @@ def telegram(texto: str, responder_a: int | None = None) -> int | None:
 
 def telegram_getme() -> dict | None:
     return _llamar_telegram("getMe")
+
+
+def telegram_api(metodo: str, datos: dict | None = None, timeout: int = 15):
+    """Llamada genérica (getUpdates, setMyCommands) con las mismas reglas: https, bot no prohibido."""
+    return _llamar_telegram(metodo, datos, timeout)
+
+
+# Control desde Telegram (lo escribe bot_comandos.py, lo leen vigia.py y agente.py).
+# Solo puede APAGAR cosas: pausar alertas o detener la IA. Encender la IA sigue dependiendo de
+# VIGIA_AGENTE=1 en el entorno del servidor.
+CONTROL = ESTADO_DIR / "control.json"
+
+
+def leer_control() -> dict:
+    return leer_json(CONTROL, {})
+
+
+def en_pausa(ahora: float | None = None) -> float | None:
+    """Hasta cuándo están pausadas las alertas (epoch), o None si no hay pausa vigente."""
+    hasta = leer_control().get("pausa_hasta")
+    return hasta if isinstance(hasta, (int, float)) and (ahora or time.time()) < hasta else None
+
+
+def ia_detenida() -> bool:
+    return leer_control().get("ia_detenida") is True
 
 
 def leer_json(path: Path, defecto):
