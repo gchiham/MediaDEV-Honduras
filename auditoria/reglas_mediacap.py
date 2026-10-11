@@ -247,6 +247,10 @@ def auditar(raiz: Path):
     return {"alcance": ALCANCE, "archivos_revisados": len(revisados), "hallazgos": hallazgos}
 
 
+def _loc(h):
+    return f"{h['archivo']}:{h['linea']}" if h["linea"] else h["archivo"]
+
+
 def a_markdown(rep):
     from collections import Counter
     cnt = Counter(h["estado"] for h in rep["hallazgos"])
@@ -258,10 +262,10 @@ def a_markdown(rep):
         out += ["| Estado | Sev. | Regla | Ubicación | Hallazgo |", "|---|---|---|---|---|"]
         for h in rep["hallazgos"]:
             out.append(f"| {h['estado']} | {h['severidad']} | {h['regla']} | "
-                       f"`{h['archivo']}:{h['linea']}` | {h['titulo']} |")
+                       f"`{_loc(h)}` | {h['titulo']} |")
         out += ["", "<details><summary>Evidencia y cómo confirmar</summary>", ""]
         for h in rep["hallazgos"]:
-            out += [f"- **{h['regla']} `{h['archivo']}:{h['linea']}`** — {h['evidencia']} "
+            out += [f"- **{h['regla']} `{_loc(h)}`** — {h['evidencia']} "
                     f"*Confirmar:* {h['como_confirmar']}"]
         out += ["", "</details>"]
     return "\n".join(out) + "\n"

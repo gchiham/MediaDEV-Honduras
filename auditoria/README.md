@@ -54,3 +54,25 @@ el patrón del incidente y otra con la versión corregida.
 `recolector/` genera en mediaCAP un inventario de solo lectura de lo desplegado (git, hashes,
 units, cron, versiones, disco) que el auditor lee por SSH sin poder ejecutar nada. Diseño,
 garantías, instalación y rollback en [`recolector/INSTALAR.md`](recolector/INSTALAR.md).
+
+## Comparador (inventario vs GitHub)
+
+`comparador.py` cruza el inventario con los repos y reporta drift con el mismo formato de hallazgo.
+Solo lee: no hace `fetch` (lo hace quien llama) ni escribe en los clones.
+
+```bash
+ssh -i /root/.ssh/mediacap_auditor auditor@10.136.0.7 > inventario.json      # desde mediaAPP
+python auditoria/comparador.py --inventario inventario.json \
+    --captura <clon MediaDEV-Honduras> --destroyer <clon destroyer> --infra <clon mediadev-infra>
+```
+
+| Regla | Qué compara | Estado |
+|---|---|---|
+| DR001-DR004 | `/opt/media-ai`: commit desplegado vs `main` (detrás / divergido / inexistente) y `git status` | CONFIRMED / LIKELY |
+| DR010-DR012 | `/opt/destroyer` (sin git) vs `destroyer:cap/` por sha256: sobrante, faltante, distinto | POTENTIAL / CONFIRMED |
+| DR020-DR022 | units y drop-ins de `/etc/systemd/system` vs `mediadev-infra:mediacap/systemd/` (y las del vigía y el auditor en este repo) | POTENTIAL / CONFIRMED |
+| DR030-DR032 | crontab de root y `cron.d/tvprem-watch` vs `mediadev-infra:mediacap/cron/` | POTENTIAL / CONFIRMED |
+| IN001-IN040 | sobre el inventario solo: antigüedad, secciones con error, ffmpeg huérfanos, disco, permisos de `.env`/`.key`/`.pem` privados, units failed o con reinicios, venvs que nada usa | según el caso |
+
+Un archivo que difiere **solo** en valores redactados (el repo lleva placeholders) sale como
+FALSE_POSITIVE, no como drift. Las units de paquete (`/usr/lib/systemd`) no se comparan.

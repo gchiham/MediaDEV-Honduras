@@ -55,14 +55,16 @@ MAX_SALIDA = 2_000_000       # todo el JSON
 _REDACCIONES = [
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
      "<llave privada>"),
+    # Antes que los patrones específicos: así `X_TOKEN=<valor>` queda igual en el server y en el
+    # repo (que lleva placeholders), sea cual sea el formato del valor.
+    (re.compile(r"(\b[\w-]*(?:token|secret|passw(?:or)?d|pass|api[_-]?key|access[_-]?key)[\w-]*"
+                r"\s*[=:]\s*)[\"']?[^\s\"'&]+", re.I), r"\1***"),
     (re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{30,}\b"), "<token telegram>"),
     (re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b"), "<aws key id>"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"), "<api key>"),
     (re.compile(r"(\w+://)[^/\s:@]+:[^/\s@]+@"), r"\1***:***@"),
     (re.compile(r"(/live/)[^/\s]+/[^/\s]+/"), r"\1***/***/"),
     (re.compile(r"((?:authorization|cookie|x-api-key)\s*[:=]\s*)[^\r\n\"']+", re.I), r"\1***"),
-    (re.compile(r"(\b[\w-]*(?:token|secret|passw(?:or)?d|pass|api[_-]?key|access[_-]?key)[\w-]*"
-                r"\s*[=:]\s*)[\"']?[^\s\"'&]+", re.I), r"\1***"),
     (re.compile(r"((?<![A-Za-z0-9_])(?:token|key|sig|signature|auth|hash)=)[^&\s\"']+", re.I), r"\1***"),
 ]
 
