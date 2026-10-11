@@ -1,0 +1,120 @@
+# Auditoría de código de mediaCAP. Solo lee el repo: no tiene secretos, no toca servidores.
+#   Bloquea:  reglas mediaCAP CONFIRMED, secretos en el árbol actual.
+#   Informa:  ruff, bandit, secretos en el historial, tests existentes (no bloquean todavía).
+name: Auditoría mediaCAP
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  EXCLUIR: archive
+
+jobs:
+  reglas:
+    name: Reglas mediaCAP
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"      # la de mediaCAP
+      - name: Pruebas de las reglas
+        run: python -m unittest tests.test_reglas_mediacap -v
+      - name: Reglas sobre el repo
+        run: |
+          mkdir -p salida
+          python auditoria/reglas_mediacap.py --json salida/reglas.json --md salida/reglas.md \
+            > /dev/null || fallo=1
+          cat salida/reglas.md >> "$GITHUB_STEP_SUMMARY"
+          exit ${fallo:-0}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reglas
+          path: salida/
+
+  estatico:
+    name: Ruff + Bandit (informativo)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet ruff==0.6.9 bandit==1.7.10
+      - name: Ruff
+        run: |
+          mkdir -p salida
+          # E9/F: errores reales · B: bugbear · DTZ: fechas sin zona (backend es UTC)
+          # BLE/S110: excepciones tragadas · S113: requests sin timeout
+          ruff check . --exclude "$EXCLUIR" --select E9,F,B,DTZ,BLE,PLE,S110,S113 \
+            --output-format github --exit-zero
+          ruff check . --exclude "$EXCLUIR" --select E9,F,B,DTZ,BLE,PLE,S110,S113 \
+            --output-format json --exit-zero > salida/ruff.json
+          { echo "## Ruff"; echo '```';
+            ruff check . --exclude "$EXCLUIR" --select E9,F,B,DTZ,BLE,PLE,S110,S113 \
+              --statistics --exit-zero; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Bandit
+        run: |
+          bandit -q -r . -x ./archive,./tests -ll -f json -o salida/bandit.json --exit-zero
+          { echo "## Bandit (severidad media o alta)"; echo '```';
+            bandit -q -r . -x ./archive,./tests -ll -f screen --exit-zero \
+              | grep -E "Issue:|Location:" | paste - - | sed 's/  */ /g'; echo '```'; } \
+            >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: estatico
+          path: salida/
+
+  secretos:
+    name: Secretos (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0             # el historial también, para el reporte informativo
+      - name: Instalar gitleaks
+        run: |
+          v=8.24.0
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${v}/gitleaks_${v}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+      - name: Árbol actual (bloquea)
+        run: ./gitleaks dir . --redact --no-banner
+      - name: Historial (informativo)
+        if: always()
+        run: |
+          ./gitleaks git . --redact --no-banner --exit-code 0 \
+            --report-format json --report-path historial.json
+          n=$(python3 -c "import json;print(len(json.load(open('historial.json'))))")
+          { echo "## Secretos en el historial de git: $n"
+            echo "Ya no están en el código, pero siguen en commits viejos de un repo público."
+            echo "Si alguno no se rotó, rotarlo: borrar el historial no basta."
+            python3 -c "
+          import json
+          for f in json.load(open('historial.json')):
+              print(f\"- {f['RuleID']} en \`{f['File']}\` (commit {f['Commit'][:7]}, {f['Date'][:10]})\")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  tests:
+    name: Tests existentes (informativo)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true          # hasta ver que corren estables en CI
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get install -y --no-install-recommends ffmpeg > /dev/null
+      - run: pip install --quiet boto3 psycopg2-binary
+      - run: python -m unittest discover -s tests -v
