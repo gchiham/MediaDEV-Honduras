@@ -43,6 +43,11 @@ class TopeAlcanzado(Exception):
     pass
 
 
+class GastoNoMedido(Exception):
+    """La API respondió sin métricas de uso: no se puede saber cuánto costó. Se carga el peor
+    caso estimado y se bloquean llamadas nuevas hasta que una persona lo revise."""
+
+
 def instrucciones() -> str:
     """Prompt fijo: idéntico en cada llamada para que el prefijo se cachee. El conocimiento
     operativo que no va al repo público (proveedores, cupos) se agrega desde un archivo local."""
@@ -71,6 +76,8 @@ class Presupuesto:
     """Gasto en disco por día (hora HN). Antes de CADA llamada se verifica que el peor caso de esa
     llamada (entrada estimada sin caché + salida máxima) entre en los topes diario y mensual."""
 
+    BLOQUEO = "BLOQUEO.json"          # existe = no se llama a la API hasta que el operador lo borre
+
     def __init__(self, modelo: str = MODELO, dir_: Path = ESTADO_DIR / "gasto", ahora: float | None = None,
                  tope_usd_dia: float | None = None, tope_usd_mes: float | None = None):
         fecha = ahora_hn(ahora)
@@ -97,11 +104,21 @@ class Presupuesto:
         p_in, p_cache, p_out = self.precios
         return ((u["entrada"] - u["cache"]) * p_in + u["cache"] * p_cache + u["salida"] * p_out) / 1e6
 
+    def peor_caso(self, tokens_entrada: int) -> float | None:
+        return self.costo({"entrada": tokens_entrada, "cache": 0, "salida": MAX_SALIDA_TOKENS})
+
+    def bloqueo(self) -> dict | None:
+        return leer_json(self.dir / self.BLOQUEO, None)
+
     def autorizar(self, tokens_entrada: int, uso_incidente: dict) -> None:
         """Lanza TopeAlcanzado si la PRÓXIMA llamada, en el peor caso, podría pasar algún tope."""
+        b = self.bloqueo()
+        if b is not None:
+            raise TopeAlcanzado(f"llamadas bloqueadas desde {b.get('desde')}: {b.get('motivo')} "
+                                f"(revisar el gasto en OpenAI y borrar {self.dir / self.BLOQUEO})")
         if not self.precios:
             raise TopeAlcanzado(f"sin precios para {self.modelo}: el agente no corre sin poder medir el gasto")
-        peor = self.costo({"entrada": tokens_entrada, "cache": 0, "salida": MAX_SALIDA_TOKENS})
+        peor = self.peor_caso(tokens_entrada)
         if self.dia["usd"] + peor > self.tope_usd_dia:
             raise TopeAlcanzado(f"tope diario US${self.tope_usd_dia:.2f} (gastado {self.dia['usd']:.2f}, "
                                 f"esta llamada hasta {peor:.2f})")
@@ -117,6 +134,20 @@ class Presupuesto:
         """A partir del 60 % del tope por incidente se fuerza el cierre con `reportar`, para que la
         llamada de cierre todavía entre en el tope."""
         return uso_incidente["entrada"] + tokens_entrada > 0.6 * self.tope_tokens_inc
+
+    def cargar_estimado(self, tokens_entrada: int, motivo: str, bloquear: bool) -> float:
+        """Carga el peor caso de una llamada cuyo costo real no se conoce (nunca cero)."""
+        usd = self.peor_caso(tokens_entrada) or 0.0
+        self.dia["usd"] = round(self.dia["usd"] + usd, 6)
+        self.dia["usd_estimado_sin_medir"] = round(self.dia.get("usd_estimado_sin_medir", 0.0) + usd, 6)
+        self.dia["tokens"] += tokens_entrada + MAX_SALIDA_TOKENS
+        self.dia.setdefault("sin_medir", []).append({"ts": round(time.time()), "motivo": motivo[:200],
+                                                     "usd_estimado": round(usd, 4)})
+        escribir_json(self.path, self.dia)
+        if bloquear:
+            escribir_json(self.dir / self.BLOQUEO, {"desde": ahora_hn().isoformat(), "motivo": motivo[:200],
+                                                    "usd_estimado": round(usd, 4)})
+        return usd
 
     def sumar(self, u: dict) -> None:
         self.dia["tokens"] += u["entrada"] + u["salida"]
@@ -139,13 +170,21 @@ class Auditoria:
                                 **datos}, ensure_ascii=False, default=str) + "\n")
 
 
-def _usage(resp) -> dict:
+def _usage(resp) -> dict | None:
+    """Uso de la respuesta, o None si falta o está incompleto (entonces NO se asume cero)."""
     u = getattr(resp, "usage", None)
-    if not u:
-        return {"entrada": 0, "cache": 0, "salida": 0}
+    entrada, salida = getattr(u, "input_tokens", None), getattr(u, "output_tokens", None)
+    if not isinstance(entrada, int) or not isinstance(salida, int) or entrada <= 0:
+        return None
     det = getattr(u, "input_tokens_details", None)
-    return {"entrada": u.input_tokens or 0, "cache": (getattr(det, "cached_tokens", 0) or 0) if det else 0,
-            "salida": u.output_tokens or 0}
+    cache = getattr(det, "cached_tokens", 0) if det is not None else 0
+    return {"entrada": entrada, "cache": cache if isinstance(cache, int) else 0, "salida": salida}
+
+
+def _error_facturable(e: Exception) -> bool:
+    """Un 4xx (petición rechazada, auth, cupo) no se cobra; timeouts, cortes y 5xx podrían."""
+    codigo = getattr(e, "status_code", None)
+    return not (isinstance(codigo, int) and 400 <= codigo < 500)
 
 
 def texto_incidente(inc: dict) -> str:
@@ -179,12 +218,24 @@ def investigar(cliente, backend, inc: dict, presupuesto: Presupuesto, auditar,
         tokens = estimar_tokens(inst, herramientas.TOOLS, entrada)
         presupuesto.autorizar(tokens, uso)                   # corta ANTES de llamar
         forzar = forzar or turno == MAX_TURNOS - 1 or presupuesto.cerca_del_tope_incidente(tokens, uso)
-        resp = cliente.responses.create(
-            model=modelo, instructions=inst, input=entrada, tools=herramientas.TOOLS,
-            tool_choice={"type": "function", "name": "reportar"} if forzar else "auto",
-            reasoning={"effort": esfuerzo}, store=False, include=["reasoning.encrypted_content"],
-            prompt_cache_key="mediadev-vigia", max_output_tokens=MAX_SALIDA_TOKENS)
+        try:
+            resp = cliente.responses.create(
+                model=modelo, instructions=inst, input=entrada, tools=herramientas.TOOLS,
+                tool_choice={"type": "function", "name": "reportar"} if forzar else "auto",
+                reasoning={"effort": esfuerzo}, store=False, include=["reasoning.encrypted_content"],
+                prompt_cache_key="mediadev-vigia", max_output_tokens=MAX_SALIDA_TOKENS)
+        except Exception as e:
+            if _error_facturable(e):
+                usd = presupuesto.cargar_estimado(tokens, f"error de API {type(e).__name__}", bloquear=False)
+                auditar("error_api", error=type(e).__name__, usd_estimado=usd)
+            raise
         u = _usage(resp)
+        if u is None:
+            motivo = "la API respondió sin métricas de uso (usage)"
+            usd = presupuesto.cargar_estimado(tokens, motivo, bloquear=True)
+            auditar("uso_desconocido", turno=turno, usd_estimado=usd, bloqueo=str(presupuesto.dir / presupuesto.BLOQUEO))
+            raise GastoNoMedido(f"{motivo}; se cargó el peor caso estimado (US${usd:.2f}) y se bloquearon "
+                                f"llamadas nuevas hasta revisar")
         for k in uso:
             uso[k] += u[k]
         presupuesto.sumar(u)
@@ -230,7 +281,8 @@ def formatear(res: dict) -> str:
 
 def cliente_openai():
     from openai import OpenAI
-    return OpenAI(timeout=120, max_retries=2)
+    # sin reintentos automáticos: cada intento se autoriza y se contabiliza acá
+    return OpenAI(timeout=180, max_retries=0)
 
 
 def procesar_cola() -> None:
@@ -256,6 +308,11 @@ def procesar_cola() -> None:
                     cliente = cliente or cliente_openai()
                     res = investigar(cliente, backend, inc, Presupuesto(), Auditoria(f.stem))
                     telegram(formatear(res), responder_a=inc.get("msg_id"))
+                except GastoNoMedido as e:
+                    destino = "fallidos"
+                    Auditoria(f.stem)("gasto_no_medido", motivo=str(e))
+                    telegram(f"⚠️ Agente detenido: {e}. La alerta de arriba sigue válida.",
+                             responder_a=inc.get("msg_id"))
                 except TopeAlcanzado as e:
                     destino = "omitidos"
                     Auditoria(f.stem)("tope", motivo=str(e))
@@ -319,8 +376,8 @@ def evaluar(casos: list[Path], cliente, modelo: str, max_usd: float, salida: Pat
     for c in casos:
         try:
             res = correr_replay(c, cliente, pres, modelo=modelo)
-        except TopeAlcanzado as e:
-            print(f"\n===== {c.stem}: DETENIDO por presupuesto de la evaluación ({e})")
+        except (TopeAlcanzado, GastoNoMedido) as e:
+            print(f"\n===== {c.stem}: DETENIDO ({e})")
             break
         resultados.append({k: res[k] for k in ("caso", "evaluacion", "reporte", "llamadas", "uso", "usd", "turnos")})
         estado = "OK" if res["evaluacion"]["ok"] else "FALLA " + "; ".join(res["evaluacion"]["fallas"])

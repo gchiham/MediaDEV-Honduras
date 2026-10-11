@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """mediacap-vista — vista SANEADA de la config de captura para el usuario `vigia` (mediaCAP).
 
 Corre como root (timer cada 5 min). Es lo único que lee el cache del daemon
@@ -14,7 +14,7 @@ Corre como root (timer cada 5 min). Es lo único que lee el cache del daemon
 La lista de bloqueo (orígenes de cupo limitado o cliente único) vive fuera del repo, en
 /etc/mediadev/vigia-bloqueados.txt (un sufijo de host por línea).
 """
-import ipaddress, json, os, re, sys, tempfile
+import ipaddress, json, os, re, stat, sys, tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -40,7 +40,31 @@ def resumir_url(url: str | None) -> str | None:
     return f"{p.scheme}://{host}{puerto}{ruta}{'?…' if p.query else ''}"
 
 
+def inseguro(path: Path, es_dir: bool = False) -> str | None:
+    """Corre como root: no lee ni escribe donde otro usuario (p. ej. vigia) pueda meter mano."""
+    if os.name != "posix":
+        return None
+    try:
+        st = os.lstat(path)
+    except OSError as e:
+        return f"{path}: {e.strerror}"
+    if stat.S_ISLNK(st.st_mode):
+        return f"{path}: es un enlace simbólico"
+    if es_dir != stat.S_ISDIR(st.st_mode):
+        return f"{path}: tipo inesperado"
+    if st.st_uid != 0:
+        return f"{path}: el dueño no es root"
+    if st.st_mode & 0o022:
+        return f"{path}: escribible por grupo u otros"
+    return None
+
+
 def bloqueados() -> list[str]:
+    if not BLOQUEADOS.exists():
+        return []
+    motivo = inseguro(BLOQUEADOS)
+    if motivo:
+        sys.exit(f"lista de bloqueo no confiable ({motivo}): no se publica la vista")
     try:
         return [l.strip().lower() for l in BLOQUEADOS.read_text().splitlines()
                 if l.strip() and not l.startswith("#")]
@@ -96,13 +120,16 @@ def construir(cfgs: list[dict], lista: list[str]) -> dict:
 
 
 def main() -> None:
+    for p, es_dir in ((CACHE, False), (SALIDA.parent, True)):
+        motivo = inseguro(p, es_dir)
+        if motivo:
+            sys.exit(f"no confiable ({motivo}): no se publica la vista")
     try:
         cfgs = json.loads(CACHE.read_text())
     except (OSError, ValueError) as e:
         print(f"no se pudo leer {CACHE}: {e}", file=sys.stderr)
         sys.exit(1)
     datos = construir(cfgs, bloqueados())
-    SALIDA.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=SALIDA.parent, prefix=".vista-")    # nace 0600
     try:
         with os.fdopen(fd, "w") as f:

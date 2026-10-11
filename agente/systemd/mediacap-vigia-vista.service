@@ -5,7 +5,7 @@ Description=Vista saneada de capture_config para el vigia (solo lectura del cach
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /usr/local/bin/mediacap-vista
+ExecStart=/usr/bin/python3 -I /usr/local/bin/mediacap-vista
 Nice=19
 NoNewPrivileges=yes
 ProtectSystem=strict

@@ -55,6 +55,7 @@ class VistaSaneada(unittest.TestCase):
     def test_escribe_atomico_y_sin_permiso_de_mundo(self):
         tmp = Path(tempfile.mkdtemp())
         cache, salida = tmp / "cache.json", tmp / "v" / "vista.json"
+        salida.parent.mkdir(mode=0o750)                  # lo crea la instalación (root:vigia 750), no el script
         cache.write_text(json.dumps([{"slug": "radio_z", "media_type": "radio", "stream_url": URL_CRED}]))
         with mock.patch.object(vista, "CACHE", cache), mock.patch.object(vista, "SALIDA", salida), \
                 mock.patch.object(vista, "BLOQUEADOS", tmp / "no-existe"), mock.patch.object(vista, "GRUPO", "root"):
@@ -553,6 +554,238 @@ class Replay(unittest.TestCase):
                 mock.patch.object(agente, "telegram", side_effect=AssertionError("no debe avisar")):
             agente.procesar_cola()
         self.assertTrue((cola / "rechazados" / "1.json").exists())
+
+
+# ── gasto sin métricas de uso: nunca cero, bloquea y deja constancia ─────────
+
+class GastoSinUso(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        p = mock.patch.dict(os.environ, {"AGENTE_PRECIO_ENTRADA": "", "AGENTE_TOPE_USD_DIA": "3",
+                                         "AGENTE_TOPE_USD_MES": "40"})
+        p.start()
+        self.addCleanup(p.stop)
+        self.eventos = []
+        self.audit = lambda evento, **d: self.eventos.append((evento, d))
+        self.backend = herramientas.Replay({})
+        self.inc = {"tipo": "incidente", "creado": 1791634920, "alertas": []}
+
+    def pres(self):
+        return agente.Presupuesto(modelo="gpt-5.5", dir_=self.tmp)
+
+    def sin_uso(self, usage):
+        return SimpleNamespace(output=[llamada("estado_general", {})], usage=usage)
+
+    def comprobar_bloqueo(self, respuesta):
+        c = ClienteFalso([respuesta, resp(llamada("reportar", REPORTE))])
+        with self.assertRaises(agente.GastoNoMedido):
+            agente.investigar(c, self.backend, self.inc, self.pres(), self.audit, modelo="gpt-5.5")
+        self.assertEqual(len(c.pedidos), 1)                                  # no hubo 2ª llamada
+        dia = agente.Presupuesto(modelo="gpt-5.5", dir_=self.tmp).dia
+        self.assertGreater(dia["usd"], 0.2)                                  # peor caso, no cero
+        self.assertEqual(dia["usd"], dia["usd_estimado_sin_medir"])
+        self.assertEqual(len(dia["sin_medir"]), 1)
+        self.assertTrue((self.tmp / "BLOQUEO.json").exists())
+        self.assertIn("uso_desconocido", [e for e, _ in self.eventos])
+        c2 = ClienteFalso([resp(llamada("reportar", REPORTE))])              # incidente siguiente
+        with self.assertRaises(agente.TopeAlcanzado) as e:
+            agente.investigar(c2, self.backend, self.inc, self.pres(), self.audit, modelo="gpt-5.5")
+        self.assertIn("bloqueadas", str(e.exception))
+        self.assertEqual(c2.pedidos, [])
+
+    def test_sin_usage(self):
+        self.comprobar_bloqueo(self.sin_uso(None))
+
+    def test_usage_incompleto(self):
+        self.comprobar_bloqueo(self.sin_uso(SimpleNamespace(input_tokens=1200, output_tokens=None)))
+
+    def test_usage_en_cero(self):
+        self.comprobar_bloqueo(self.sin_uso(SimpleNamespace(input_tokens=0, output_tokens=0)))
+
+    def test_error_de_red_carga_estimado_sin_bloquear(self):
+        class Corte(Exception):
+            pass
+        c = SimpleNamespace(responses=SimpleNamespace(create=mock.Mock(side_effect=Corte())))
+        with self.assertRaises(Corte):
+            agente.investigar(c, self.backend, self.inc, self.pres(), self.audit, modelo="gpt-5.5")
+        self.assertGreater(self.pres().dia["usd"], 0.2)
+        self.assertFalse((self.tmp / "BLOQUEO.json").exists())
+        self.assertIn("error_api", [e for e, _ in self.eventos])
+
+    def test_error_4xx_no_se_cobra(self):
+        class Rechazo(Exception):
+            status_code = 400
+        c = SimpleNamespace(responses=SimpleNamespace(create=mock.Mock(side_effect=Rechazo())))
+        with self.assertRaises(Rechazo):
+            agente.investigar(c, self.backend, self.inc, self.pres(), self.audit, modelo="gpt-5.5")
+        self.assertEqual(self.pres().dia["usd"], 0.0)
+
+    def test_sin_reintentos_automaticos(self):
+        falso = types.ModuleType("openai")
+        falso.OpenAI = lambda **kw: kw
+        with mock.patch.dict(sys.modules, {"openai": falso}):
+            self.assertEqual(agente.cliente_openai()["max_retries"], 0)
+
+    def test_cola_avisa_y_frena_los_siguientes(self):
+        cola = self.tmp / "cola"
+        comun.escribir_json(cola / "1.json", {"tipo": "incidente", "msg_id": 7, "alertas": []})
+        comun.escribir_json(cola / "2.json", {"tipo": "incidente", "msg_id": 8, "alertas": []})
+        c = ClienteFalso([self.sin_uso(None)])
+        avisos = []
+        fcntl_falso = types.SimpleNamespace(flock=lambda *a: None, LOCK_EX=2, LOCK_NB=4)
+        pres_real = agente.Presupuesto
+        with mock.patch.dict(sys.modules, {"fcntl": fcntl_falso}), \
+                mock.patch.object(agente, "ESTADO_DIR", self.tmp), mock.patch.object(agente, "COLA_DIR", cola), \
+                mock.patch.object(agente, "AUDITORIA_DIR", self.tmp / "audit"), \
+                mock.patch.object(agente, "cliente_openai", return_value=c), \
+                mock.patch.object(agente, "Presupuesto", lambda: pres_real(modelo="gpt-5.5", dir_=self.tmp / "gasto")), \
+                mock.patch.object(herramientas, "Real", return_value=self.backend), \
+                mock.patch.object(agente, "telegram",
+                                  side_effect=lambda t, responder_a=None: avisos.append((responder_a, t))):
+            agente.procesar_cola()
+        self.assertEqual(len(c.pedidos), 1)                                  # el 2º no llamó a la API
+        self.assertTrue((cola / "fallidos" / "1.json").exists())
+        self.assertTrue((cola / "omitidos" / "2.json").exists())
+        self.assertIn("sin métricas de uso", avisos[0][1])
+        self.assertIn("bloqueadas", avisos[1][1])
+        auditoria = "".join(f.read_text(encoding="utf-8") for f in (self.tmp / "audit").glob("*.jsonl"))
+        self.assertIn("uso_desconocido", auditoria)
+        self.assertIn("gasto_no_medido", auditoria)
+
+    def test_evaluar_se_detiene(self):
+        c = ClienteFalso([self.sin_uso(None)] * 5)
+        with mock.patch("builtins.print"):
+            res = agente.evaluar(Replay.CASOS, c, "gpt-5.5", max_usd=3.0, salida=None)
+        self.assertEqual(res, [])
+        self.assertEqual(len(c.pedidos), 1)
+
+
+# ── forced command: vigia no puede modificarlo ni eludirlo ────────────────────
+
+AGENTE_DIR = Path(agente.AQUI)
+ES_ROOT = os.name == "posix" and os.geteuid() == 0
+
+
+class ForcedCommand(unittest.TestCase):
+    def test_scripts_en_modo_aislado(self):
+        for f in ("mediacap_ro.py", "mediacap_vista.py"):
+            primera = (AGENTE_DIR / f).read_text(encoding="utf-8").splitlines()[0]
+            self.assertEqual(primera, "#!/usr/bin/python3 -I")
+        unidad = (AGENTE_DIR / "systemd" / "mediacap-vigia-vista.service").read_text(encoding="utf-8")
+        self.assertIn("ExecStart=/usr/bin/python3 -I /usr/local/bin/mediacap-vista", unidad)
+
+    def test_candado_fuera_del_home(self):
+        self.assertEqual(str(ro.LOCK).replace("\\", "/"), "/var/lib/mediacap-ro/lock")
+
+    def test_sshd_fuerza_el_comando(self):
+        conf = (AGENTE_DIR / "instalar" / "sshd_vigia.conf").read_text(encoding="utf-8")
+        for linea in ("Match User vigia", "ForceCommand /usr/local/bin/mediacap-ro",
+                      "AuthorizedKeysFile /etc/ssh/authorized_keys/%u", "PermitUserRC no", "PermitTTY no",
+                      "AllowTcpForwarding no", "PermitTunnel no", "PasswordAuthentication no"):
+            self.assertIn(linea, conf)
+
+    def test_readme_llave_de_root_con_restricciones(self):
+        txt = (AGENTE_DIR / "README.md").read_text(encoding="utf-8")
+        self.assertIn('restrict,from="<IP_MEDIAAPP>",command="/usr/local/bin/mediacap-ro"', txt)
+        self.assertIn("/etc/ssh/authorized_keys/vigia", txt)
+        self.assertNotIn("~vigia/.ssh", txt)
+        self.assertIn("passwd -l vigia", txt)
+
+    def test_manifiesto_nada_escribible_por_vigia_salvo_su_candado(self):
+        filas = [l.split() for l in (AGENTE_DIR / "instalar" / "permisos_mediacap.txt").read_text().splitlines()
+                 if l.strip() and not l.startswith("#")]
+        rutas = {f[0]: f[1:] for f in filas}
+        for ruta in ("/usr/local/bin/mediacap-ro", "/usr/local/bin/mediacap-vista",
+                     "/etc/ssh/authorized_keys/vigia", "/var/lib/mediadev-vigia/vista.json"):
+            self.assertIn(ruta, rutas)
+        for ruta, (dueno, grupo, modo) in rutas.items():
+            if ruta == "/var/lib/mediacap-ro":
+                continue
+            m = int(modo, 8)
+            escribible = (dueno == "vigia" and m & 0o200) or (grupo == "vigia" and m & 0o020) or m & 0o002
+            self.assertFalse(escribible, ruta)
+            self.assertEqual(dueno, "root", ruta)
+        self.assertEqual(rutas["/etc/mediadev/stream_config.cache.json"], ["root", "root", "640"])
+
+    def test_verificador_es_solo_lectura(self):
+        import re
+        sh = (AGENTE_DIR / "instalar" / "verificar_mediacap.sh").read_text(encoding="utf-8")
+        codigo = "\n".join(l for l in sh.splitlines() if not l.lstrip().startswith("#"))
+        codigo = re.sub(r"<[A-Z_]+>", "", codigo)          # textos de ayuda como <IP_MEDIAAPP>
+        for prohibido in (r"\bchmod\b", r"\bchown\b", r"\brm\b", r"\bmv\b", r"\btee\b", r"\binstall\b",
+                          r"\buseradd\b", r"\bsystemctl\b", r"\bsed -i\b", r"(?<![2&])>(?!\s*/dev/null)(?!&)"):
+            self.assertIsNone(re.search(prohibido, codigo), prohibido)
+
+    def test_socks5_resuelve_local_y_fija_la_ip(self):
+        out = (0, "\n__M__ 200 10 10 0.1 0  text/plain")
+        with mock.patch.object(socket, "getaddrinfo", return_value=addr("93.184.216.34")), \
+                mock.patch.object(ro, "run", return_value=out) as run:
+            ro._curl("http://origen.example.com/a", "10.0.0.5:1080", 5)
+        cmd = run.call_args[0][0]
+        self.assertIn("--socks5", cmd)
+        self.assertNotIn("--socks5-hostname", cmd)
+        self.assertIn("origen.example.com:80:93.184.216.34", cmd)
+
+    def test_socks5_no_alcanza_la_lan_del_gateway(self):
+        with mock.patch.object(socket, "getaddrinfo", return_value=addr("192.168.1.1")), \
+                mock.patch.object(ro, "run") as run:
+            r = ro._curl("http://router.local.example/", "10.0.0.5:1080", 5)
+        run.assert_not_called()
+        self.assertIn("no público", r["bloqueado"])
+
+
+@unittest.skipUnless(ES_ROOT, "necesita Linux como root (chown)")
+class ArchivosConfiables(unittest.TestCase):
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        os.chmod(self.d, 0o750)
+        self.f = self.d / "vista.json"
+        self.f.write_text(json.dumps({"estaciones": {"radio_x": {"media_type": "radio"}}}))
+        os.chmod(self.f, 0o640)
+
+    def test_root_640_en_dir_750_es_confiable(self):
+        self.assertIsNone(ro.archivo_confiable(self.f))
+        with mock.patch.object(ro, "VISTA", self.f):
+            self.assertIn("radio_x", ro.cargar_vista())
+
+    def test_vista_manipulable_se_ignora(self):
+        casos = [lambda: os.chmod(self.f, 0o666), lambda: os.chmod(self.f, 0o660),
+                 lambda: os.chown(self.f, 65534, 65534), lambda: os.chmod(self.d, 0o777),
+                 lambda: os.chown(self.d, 65534, 0)]
+        for i, romper in enumerate(casos):
+            self.setUp()
+            romper()
+            with mock.patch.object(ro, "VISTA", self.f):
+                self.assertEqual(ro.cargar_vista(), {}, i)
+
+    def test_enlace_simbolico_se_ignora(self):
+        enlace = self.d / "enlace.json"
+        enlace.symlink_to(self.f)
+        self.assertIn("regular", ro.archivo_confiable(enlace))
+
+    def _vista_main(self, cache_modo=0o640, salida_modo=0o750, bloq_modo=0o644, bloq_dueno=0):
+        cache, salida_dir, bloq = self.d / "cache.json", self.d / "salida", self.d / "bloq.txt"
+        cache.write_text(json.dumps([{"slug": "radio_x", "media_type": "radio", "stream_url": "https://a.example/x"}]))
+        os.chmod(cache, cache_modo)
+        salida_dir.mkdir()
+        os.chmod(salida_dir, salida_modo)
+        bloq.write_text("iptv.example.net\n")
+        os.chmod(bloq, bloq_modo)
+        os.chown(bloq, bloq_dueno, 0)
+        with mock.patch.object(vista, "CACHE", cache), mock.patch.object(vista, "SALIDA", salida_dir / "vista.json"), \
+                mock.patch.object(vista, "BLOQUEADOS", bloq), mock.patch.object(vista, "GRUPO", "root"):
+            vista.main()
+        return salida_dir / "vista.json"
+
+    def test_vista_publica_con_entradas_de_root(self):
+        self.assertTrue(self._vista_main().exists())
+
+    def test_vista_se_niega_con_entradas_manipulables(self):
+        for kw in ({"salida_modo": 0o777}, {"salida_modo": 0o770}, {"cache_modo": 0o666},
+                   {"bloq_modo": 0o666}, {"bloq_dueno": 65534}):
+            self.setUp()
+            with self.assertRaises(SystemExit, msg=str(kw)):
+                self._vista_main(**kw)
 
 
 if __name__ == "__main__":

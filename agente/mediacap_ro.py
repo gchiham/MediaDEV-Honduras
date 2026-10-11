@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """mediacap-ro — comandos de SOLO LECTURA para el agente vigía (corre en mediaCAP).
 
 Se instala como forced command de la llave del usuario `vigia`:
@@ -12,7 +12,7 @@ no necesita ni debe poder leer el cache del daemon, que trae URLs con credencial
 
 Uso local (pruebas):  mediacap_ro.py estado_estacion radio_america
 """
-import ipaddress, json, os, re, shlex, socket, subprocess, sys, tempfile, time
+import ipaddress, json, os, re, shlex, socket, stat, subprocess, sys, tempfile, time
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
@@ -22,7 +22,7 @@ VISTA        = Path(os.environ.get("VIGIA_VISTA", "/var/lib/mediadev-vigia/vista
 GATEWAY_CONF = Path("/etc/mediadev/gateway.conf")
 CHANGES_LOG  = Path("/opt/media-ai/CHANGES.log")
 TV_AUDIO     = STREAMS_ROOT / "_tv_audio"
-LOCK         = Path(os.environ.get("MEDIACAP_RO_LOCK", str(Path.home() / ".mediacap-ro.lock")))
+LOCK         = Path(os.environ.get("MEDIACAP_RO_LOCK", "/var/lib/mediacap-ro/lock"))   # único dir escribible de vigia
 STALE_SECS   = 90
 
 SERVICIOS = ["stream-daemon", "video-segment-uploader", "mediadev-gateway-api",
@@ -79,8 +79,30 @@ def tail(path: Path, n: int, max_bytes: int = 256_000) -> list[str]:
     return [redactar(l)[:500] for l in data.splitlines()[-n:]]
 
 
+def archivo_confiable(path: Path) -> str | None:
+    """None si el archivo y su directorio son de root y nadie más puede escribirlos; si no, el
+    motivo. Así, ni vigia ni otro usuario pueden plantar una vista o una config a su gusto."""
+    if os.name != "posix":
+        return None
+    for p in (path, path.parent):
+        try:
+            st = os.lstat(p)
+        except OSError as e:
+            return f"{p}: {e.strerror}"
+        if p == path and not stat.S_ISREG(st.st_mode):
+            return f"{p}: no es un archivo regular"
+        if st.st_uid != 0:
+            return f"{p}: el dueño no es root"
+        if st.st_mode & 0o022:
+            return f"{p}: escribible por grupo u otros"
+    return None
+
+
 def cargar_vista() -> dict[str, dict]:
-    """Estaciones habilitadas según la vista saneada (no trae credenciales)."""
+    """Estaciones habilitadas según la vista saneada (no trae credenciales).
+    Si la vista no es confiable (dueño/permisos) se ignora entera."""
+    if archivo_confiable(VISTA) is not None:
+        return {}
     try:
         return json.loads(VISTA.read_text()).get("estaciones", {})
     except (OSError, ValueError, AttributeError):
@@ -244,10 +266,11 @@ def _curl(url: str, socks: str | None, max_time: int, cuerpo: bool = False,
         cmd = ["curl", "-sS", "--proto", "=http,https", "--max-time", str(max_time),
                "--max-filesize", "50000000", "-A", "Mozilla/5.0", "-w", fmt]
         if socks:
-            cmd += ["--socks5-hostname", socks]      # el gateway resuelve: validación best-effort
-        else:
-            ip_curl = f"[{ip}]" if ":" in ip else ip
-            cmd += ["--resolve", f"{p.hostname}:{p.port or (443 if p.scheme == 'https' else 80)}:{ip_curl}"]
+            # --socks5 (no -hostname): el DNS se resuelve acá y se fija la IP ya validada; el
+            # gateway solo recibe una IP pública, nunca un nombre que resuelva a su propia LAN
+            cmd += ["--socks5", socks]
+        ip_curl = f"[{ip}]" if ":" in ip else ip
+        cmd += ["--resolve", f"{p.hostname}:{p.port or (443 if p.scheme == 'https' else 80)}:{ip_curl}"]
         cmd += ["-o", "-" if cuerpo else (destino or "/dev/null"), url]
         rc, out = run(cmd, timeout=max_time + 5)
         body, _, m = out.rpartition("__M__ ")
@@ -516,6 +539,7 @@ def con_candado(fn, espera_s: int = 90):
 
 
 def main() -> None:
+    os.umask(0o077)                               # temporales de /tmp solo para vigia
     os.nice(10)
     linea = os.environ.get("SSH_ORIGINAL_COMMAND")
     if linea is None:

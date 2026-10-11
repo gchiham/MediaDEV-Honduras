@@ -22,18 +22,39 @@ mediaCAP: mediacap-vigia-vista.timer (root) → vista.json saneada (sin credenci
 
 ## Seguridad (resumen)
 
-- **Llave SSH con `restrict,from=,command=`**: solo ejecuta `mediacap-ro`, solo desde la IP privada
-  de mediaAPP, sin pty ni forwarding. `mediacap-ro` acepta 9 subcomandos con argumentos validados
-  (slug `^[a-z0-9][a-z0-9_]{0,39}$`, enteros acotados, servicios en lista) y nunca escribe.
+- **Forced command en dos capas**: `ForceCommand` en sshd (`Match User vigia`) y
+  `restrict,from=,command=` en la llave, que vive en `/etc/ssh/authorized_keys/vigia` (de root).
+  Sin pty, forwarding ni `~/.ssh/rc`; contraseña bloqueada; sin sudo. `mediacap-ro` acepta 9
+  subcomandos con argumentos validados y nunca escribe (salvo su candado y temporales propios).
+- **`vigia` no puede modificar ni eludir el comando**: código, configuración, vista y llave son de
+  root y no escribibles por `vigia` (`instalar/permisos_mediacap.txt`); Python corre con `-I`; los
+  scripts rechazan entradas que no sean de root o que otro usuario pueda escribir.
+  `instalar/verificar_mediacap.sh` lo comprueba (solo lectura), incluida la config efectiva de sshd.
 - **Sin credenciales para `vigia`**: el cache del daemon queda `0640 root:root`; `vigia` solo lee
   `vista.json` (URLs resumidas; `probar_url` solo si la URL no lleva nada que parezca credencial).
 - **Anti-SSRF**: `probar_origen` no sigue redirecciones solo; valida cada salto y cada segmento
-  (solo IPs públicas, sin 169.254.169.254, VPC, WireGuard ni localhost) y fija la IP con `--resolve`.
+  (solo IPs públicas, sin 169.254.169.254, VPC, WireGuard ni localhost) y fija la IP con `--resolve`,
+  también por SOCKS5 (`--socks5` con DNS local: el gateway solo recibe IPs públicas).
 - **ffmpeg sobre contenido externo**: `-protocol_whitelist file` y se descarta lo que sea texto/playlist.
 - **SQL**: consultas fijas parametrizadas, sesión read-only, `statement_timeout=5s`, URLs resumidas.
 - **Gasto**: antes de CADA llamada se verifica el peor caso contra los topes diario y mensual; sin
-  precios conocidos el agente no corre. Además conviene fijar un límite en el proyecto de OpenAI.
+  precios conocidos el agente no corre. Si la API responde **sin métricas de uso**, se carga el peor
+  caso (nunca cero), se registra en la auditoría y en el gasto del día, y se crea
+  `gasto/BLOQUEO.json`: no hay más llamadas hasta que una persona revise el gasto en OpenAI y lo
+  borre. Timeouts y 5xx cargan el peor caso sin bloquear; los 4xx no se cobran. Sin reintentos
+  automáticos del SDK. Además conviene fijar un límite en el proyecto de OpenAI.
 - **Secretos** solo en `/etc/mediadev-agent.env` (root 600); `ssh` corre con entorno mínimo.
+
+## Riesgos: estado
+
+| Riesgo | Estado |
+|---|---|
+| `/proc` sin `hidepid`: cualquier usuario local ve las cmdline de los ffmpeg (1 de 18 tiene una URL con credencial) | **Aceptado por el operador** (las credenciales del IPTV no son sensibles para él). `hidepid` además impediría que `vigia` cuente los ffmpeg (corren como root); si algún día se quiere, la vista (root) tendría que publicar también el conteo. `vigia` no puede ejecutar nada fuera de `mediacap-ro`, que redacta lo que muestra. |
+| `config/stations.json` (644) y 8 backups `.bak` en `/opt/media-ai` con la URL del IPTV (sin tokens de Telegram) | **Aceptado por el operador**. Limpieza opcional: mover los `.bak` a `/root/backups` (700). |
+| SOCKS5: el gateway resolvía el DNS y la validación anti-SSRF era parcial | **Resuelto**: DNS local, IP validada y fijada. Efecto lateral: un host que solo resuelva dentro de Honduras da error de DNS en la prueba (falso negativo, no inseguro). |
+| `vigia` en el grupo `systemd-journal` lee todo el journal | Aceptado: solo a través de `mediacap-ro`, con servicios en lista y salida redactada. |
+| `Match User vigia` debe quedar al final de `sshd_config` | Pendiente para la fase 1: validar con `sshd -t` y `verificar_mediacap.sh` con una sesión de root abierta. |
+| Llamada real a la API (`include=reasoning.encrypted_content`, forma de `usage`) | Pendiente: verificado contra el SDK `openai` 3.5.0, no contra la API en vivo. Lo confirma la primera evaluación. |
 
 ## Fase 0 — pruebas (sin producción)
 
@@ -61,25 +82,38 @@ Valores de ejemplo: `<IP_MEDIACAP>` y `<IP_MEDIAAPP>` son las IPs **privadas de 
 
 ### mediaCAP
 
+Todo lo que define o ejecuta el forced command es de root y `vigia` no puede escribirlo
+(manifiesto: `instalar/permisos_mediacap.txt`). `vigia` solo escribe su candado
+(`/var/lib/mediacap-ro`) y temporales propios en `/tmp`.
+
 ```bash
-chmod 640 /etc/mediadev/stream_config.cache.json            # el daemon lo reescribe conservando el modo
-useradd --system --create-home --shell /bin/sh vigia         # shell necesario para el forced command
-usermod -aG systemd-journal vigia                            # journalctl sin sudo
+chmod 640 /etc/mediadev/stream_config.cache.json            # el daemon (root) lo reescribe conservando el modo
+useradd --system --home-dir /var/lib/mediacap-ro --create-home --shell /bin/sh vigia
+chmod 700 /var/lib/mediacap-ro && passwd -l vigia            # sin contraseña usable
+usermod -aG systemd-journal vigia                            # journalctl sin sudo (ver riesgos)
 install -d -m 750 -o root -g vigia /var/lib/mediadev-vigia
-install -m 755 mediacap_ro.py /usr/local/bin/mediacap-ro
-install -m 755 mediacap_vista.py /usr/local/bin/mediacap-vista
-install -m 644 <archivo local> /etc/mediadev/vigia-bloqueados.txt   # orígenes de cupo / cliente único (fuera del repo)
-cp systemd/mediacap-vigia-vista.* /etc/systemd/system/ && systemctl daemon-reload
-systemctl enable --now mediacap-vigia-vista.timer
-install -d -m 700 -o vigia -g vigia ~vigia/.ssh
-echo 'restrict,from="<IP_MEDIAAPP>",command="/usr/local/bin/mediacap-ro" ssh-ed25519 AAAA... mediadev-vigia' \
-  > ~vigia/.ssh/authorized_keys && chown vigia:vigia ~vigia/.ssh/authorized_keys && chmod 600 ~vigia/.ssh/authorized_keys
+install -m 755 -o root -g root mediacap_ro.py /usr/local/bin/mediacap-ro
+install -m 755 -o root -g root mediacap_vista.py /usr/local/bin/mediacap-vista
+install -m 644 -o root -g root <archivo local> /etc/mediadev/vigia-bloqueados.txt   # fuera del repo
+install -m 644 -o root -g root systemd/mediacap-vigia-vista.* /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now mediacap-vigia-vista.timer
+install -d -m 755 -o root -g root /etc/ssh/authorized_keys
+echo 'restrict,from="<IP_MEDIAAPP>",command="/usr/local/bin/mediacap-ro" ssh-ed25519 AAAA... mediadev-vigia'   > /etc/ssh/authorized_keys/vigia && chmod 644 /etc/ssh/authorized_keys/vigia
+cat instalar/sshd_vigia.conf >> /etc/ssh/sshd_config            # AL FINAL; con otra sesión root abierta
+sshd -t && systemctl reload ssh
+bash instalar/verificar_mediacap.sh <IP_MEDIAAPP>              # solo lectura; debe decir TODO OK
 ```
 
-Verificar: `sudo -u vigia cat /etc/mediadev/stream_config.cache.json` debe fallar con "Permission denied".
-Rollback: `systemctl disable --now mediacap-vigia-vista.timer; userdel -r vigia;
-rm -r /usr/local/bin/mediacap-ro /usr/local/bin/mediacap-vista /var/lib/mediadev-vigia;
-chmod 644 /etc/mediadev/stream_config.cache.json`.
+Por qué así: la llave vive en `/etc/ssh/authorized_keys/vigia` (de root), no en el home de
+`vigia`; `ForceCommand` en sshd manda aunque alguien edite esa llave; `restrict` apaga
+forwarding, pty y `~/.ssh/rc`; `python3 -I` ignora variables `PYTHON*`, paquetes del usuario y
+la carpeta del script; los dos scripts se niegan a usar archivos de entrada que no sean de root
+o que otro usuario pueda escribir.
+
+Rollback: `systemctl disable --now mediacap-vigia-vista.timer`; quitar el bloque `Match User vigia`
+de `sshd_config` y `systemctl reload ssh`; `userdel -r vigia`; `rm -r /usr/local/bin/mediacap-ro
+/usr/local/bin/mediacap-vista /var/lib/mediadev-vigia /etc/ssh/authorized_keys/vigia`;
+`chmod 644 /etc/mediadev/stream_config.cache.json`.
 
 ### mediaAPP
 
