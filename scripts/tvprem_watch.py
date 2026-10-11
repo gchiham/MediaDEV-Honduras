@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""tvprem_watch.py — chequeo diario de la cuenta tvprem y de los IDs que usamos.
+"""tvprem_watch.py — chequeo diario de las cuentas IPTV (Xtream), de los IDs que usamos y guia HN.
 
-Corre desde cron (21:00 hora Honduras). Solo CONSULTA player_api.php (no abre conexiones de
-stream, no gasta el cupo de 2) y NOTIFICA por Telegram. NUNCA modifica capture_config: un
-cambio de ID puede ser legitimo o un error, y decidirlo es del operador.
+Corre desde cron (03:00 hora Honduras). Solo CONSULTA player_api.php (no abre conexiones de
+stream, no gasta cupo) y NOTIFICA por Telegram. NUNCA modifica capture_config: un cambio de ID
+puede ser legitimo o un error, y decidirlo es del operador.
 
-Que "usamos": cada ID de tvprem en capture_config.stream_url / fallback_url de los canales
-habilitados (se lee de la DB en cada corrida: si se suma un canal nuevo queda cubierto solo).
+Cuentas: /etc/mediadev-iptv-accounts.json (600, fuera de git)
+  [{"id": "tvprem1", "base": "http://tvprem.pro:8080", "user": "..", "pass": ".."}, ...]
+
+Que "usamos": cada /live/<user>/<pass>/<id> de capture_config.stream_url / fallback_url de los
+canales habilitados cuyo <user> sea una de las cuentas (se lee de la DB en cada corrida).
 
 Alertas (silencio si todo esta sano):
   - cuenta no Active / auth != 1 / API inalcanzable
@@ -14,9 +17,14 @@ Alertas (silencio si todo esta sano):
   - max_connections cambio
   - un ID en uso ya no existe en el catalogo (sugiere IDs con el mismo nombre)
   - un ID en uso cambio de nombre (posible reasignacion a otro canal)
+Freno anti falso positivo: si el catalogo viene vacio o recortado (< MIN_KEEP_RATIO del previo)
+NO se evaluan los IDs de esa cuenta ni se pisa su guia; solo se avisa que el panel respondio mal.
 
-Estado: /opt/media-ai/config/tvprem_watch.json (snapshot id -> nombre; se refresca en cada corrida).
-Uso: tvprem_watch.py [--dry-run] [--snapshot RUTA]   (--dry-run imprime en vez de enviar a Telegram)
+Salida (config/):
+  tvprem_watch.json       estado: cuentas, IDs en uso con nombre esperado, guia HN por cuenta
+  IPTV_GUIDE.md           guia humana: estacion -> IDs por cuenta + listado completo HN
+  iptv_guide_changes.log  historial de altas/bajas/renombres de canales HN entre corridas
+Uso: tvprem_watch.py [--dry-run] [--snapshot RUTA]   (--dry-run imprime y no escribe nada)
 """
 import argparse
 import json
@@ -30,12 +38,22 @@ from datetime import datetime, timezone
 import psycopg2
 import requests
 
+ACCOUNTS_FILE = os.environ.get("IPTV_ACCOUNTS", "/etc/mediadev-iptv-accounts.json")
 DB_ENV = "/etc/mediadev-db.env"
 TG_ENV = os.environ.get("TG_ENV_FILE", "/opt/destroyer/.env")
 SNAP_DEFAULT = "/opt/media-ai/config/tvprem_watch.json"
 WARN_DAYS = 7
-HOST = "http://tvprem.pro:8080"
-URL_RE = re.compile(r"tvprem\.pro(?::\d+)?/live/([^/]+)/([^/]+)/(\d+)\.(?:ts|m3u8)")
+MIN_KEEP_RATIO = 0.5
+URL_RE = re.compile(r"/live/([^/]+)/([^/]+)/(\d+)\.(?:ts|m3u8)")
+HN_CAT = re.compile(r"hondur", re.I)
+HN_NAME = re.compile(r"^\s*(hn|hon|hond)\b", re.I)
+
+# estacion de capture_config -> regex sobre el nombre del canal (ya filtrado a Honduras)
+STATIONS = {
+    "canal_5": r"\bcanal ?5\b", "canal_6": r"\bcanal ?6\b", "canal_10": r"\bcanal ?10\b",
+    "canal_11": r"\bcanal ?11\b", "hch_tv": r"\bhch\b", "tsi": r"\btsi\b",
+    "teleceiba": r"\bteleceiba\b", "telecadena": r"\btelecadena\b", "tnh": r"\btnh\b",
+}
 
 
 def load_env(path):
@@ -57,8 +75,12 @@ def norm(s):
     return re.sub(r"[^a-z0-9]+", "", s.lower())
 
 
-def used_ids():
-    """{(user, pass): {id: [(slug, rol), ...]}} desde capture_config (solo habilitados)."""
+def low(s):
+    return unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
+
+
+def used_ids(accounts):
+    """{acc_id: {id: [(slug, rol), ...]}} desde capture_config (solo habilitados)."""
     env = load_env(DB_ENV)
     conn = psycopg2.connect(
         host=env["PG_HOST"], port=env.get("PG_PORT", "5432"), dbname=env["PG_DB"],
@@ -69,29 +91,28 @@ def used_ids():
                 SELECT ms.slug, cc.stream_url, cc.fallback_url
                 FROM capture_config cc JOIN media_sources ms ON ms.id = cc.media_source_id
                 WHERE cc.is_enabled = true
-                  AND (cc.stream_url ILIKE '%tvprem.pro%' OR cc.fallback_url ILIKE '%tvprem.pro%')
             """)
             rows = cur.fetchall()
     finally:
         conn.close()
+    by_user = {a["user"]: a["id"] for a in accounts}
     acc = {}
     for slug, url, fb in rows:
         for rol, u in (("primaria", url), ("fallback", fb)):
             m = URL_RE.search(u or "")
-            if m:
-                user, pw, sid = m.group(1), m.group(2), m.group(3)
-                acc.setdefault((user, pw), {}).setdefault(sid, []).append((slug, rol))
+            if m and m.group(1) in by_user:
+                acc.setdefault(by_user[m.group(1)], {}).setdefault(m.group(3), []).append((slug, rol))
     return acc
 
 
-def api(user, pw, action=None):
-    q = f"{HOST}/player_api.php?username={user}&password={pw}"
+def api(acc, action=None):
+    q = f"{acc['base']}/player_api.php?username={acc['user']}&password={acc['pass']}"
     if action:
         q += f"&action={action}"
     last = None
     for _ in range(3):
         try:
-            r = requests.get(q, timeout=60)
+            r = requests.get(q, timeout=90)
             r.raise_for_status()
             return r.json()
         except Exception as e:  # noqa: BLE001
@@ -117,6 +138,50 @@ def tg_send(text, dry):
         print(f"tg_send error: {e}", file=sys.stderr)
 
 
+def migrate(snap, accounts):
+    """Snapshot v1 (una cuenta: {"ids":{..}, "account":{user:{..}}}) -> v2 por cuenta."""
+    if "accounts" in snap or not snap:
+        return snap
+    by_user = {a["user"]: a["id"] for a in accounts}
+    out = {"accounts": {}}
+    for user, info in snap.get("account", {}).items():
+        aid = by_user.get(user)
+        if aid:
+            out["accounts"][aid] = {"account": info, "ids": snap.get("ids", {}), "guide": {}}
+    return out
+
+
+def write_md(path, stamp, state, accounts):
+    L = [f"# Guia IPTV — canales de Honduras\n\nActualizada: {stamp} (`tvprem_watch.py`, cron 03:00 HN)\n",
+         "## Cuentas\n\n| id | host | usuario | estado | max_con | vence (UTC) | canales HN |\n|---|---|---|---|---|---|---|"]
+    for a in accounts:
+        s = state["accounts"].get(a["id"], {})
+        ac, exp = s.get("account", {}), ""
+        if ac.get("exp_date"):
+            exp = datetime.fromtimestamp(int(ac["exp_date"]), timezone.utc).strftime("%Y-%m-%d")
+        L.append(f"| {a['id']} | {a['base']} | {a['user']} | {ac.get('status', '?')} | "
+                 f"{ac.get('max_connections', '?')} | {exp} | {len(s.get('guide', {}))} |")
+    L.append("\n## Estaciones de captura -> IDs por cuenta\n")
+    L.append("| estacion | " + " | ".join(a["id"] for a in accounts) + " |\n|---|" + "---|" * len(accounts))
+    for slug, rx in STATIONS.items():
+        pat, cells = re.compile(rx), []
+        for a in accounts:
+            g = state["accounts"].get(a["id"], {}).get("guide", {})
+            ids = sorted(i for i, c in g.items() if pat.search(low(c["name"])))
+            cells.append("<br>".join(f"`{i}` {g[i]['name'].replace('|', '/')}" for i in ids) or "—")
+        L.append(f"| {slug} | " + " | ".join(cells) + " |")
+    L.append("\nLos IDs son propios de cada cuenta (no se reutilizan entre cuentas). Variantes "
+             "OP1/OP2/HD pueden ser fuentes distintas: verificar la senal antes de usarla de respaldo.\n")
+    for a in accounts:
+        g = state["accounts"].get(a["id"], {}).get("guide", {})
+        L.append(f"## Listado completo — {a['id']} ({len(g)})\n\n| id | nombre | categoria |\n|---|---|---|")
+        for sid, c in sorted(g.items(), key=lambda kv: low(kv[1]["name"])):
+            L.append(f"| {sid} | {c['name'].replace('|', '/')} | {c['cat']} |")
+        L.append("")
+    open(path + ".tmp", "w", encoding="utf-8").write("\n".join(L))
+    os.replace(path + ".tmp", path)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -125,81 +190,116 @@ def main():
 
     now = datetime.now(timezone.utc)
     stamp = now.strftime("%Y-%m-%d %H:%M UTC")
+    accounts = json.load(open(ACCOUNTS_FILE, encoding="utf-8"))
     try:
         snap = json.load(open(a.snapshot, encoding="utf-8"))
     except (OSError, ValueError):
         snap = {}
-    ids_snap = snap.get("ids", {})
-    alerts = []
-    new_snap = {"updated": stamp, "ids": {}, "account": snap.get("account", {})}
+    snap = migrate(snap, accounts)
+    prev = snap.get("accounts", {})
+    state = {"updated": stamp, "accounts": {}}
+    alerts, changes = [], []
 
     try:
-        accounts = used_ids()
+        used = used_ids(accounts)
     except Exception as e:  # noqa: BLE001
         tg_send(f"⚠️ tvprem_watch: no pude leer capture_config ({e})", a.dry_run)
         print(f"{stamp} ERROR db: {e}")
         return 2
 
-    if not accounts:
-        print(f"{stamp} sin canales tvprem habilitados en capture_config — nada que vigilar")
-        return 0
-
-    for (user, pw), by_id in accounts.items():
+    for acc in accounts:
+        aid, user = acc["id"], acc["user"]
+        old = prev.get(aid, {})
+        ids_snap, old_guide = old.get("ids", {}), old.get("guide", {})
+        state["accounts"][aid] = dict(old)  # si algo falla, se conserva lo anterior
         try:
-            info = api(user, pw)
-            ui = info.get("user_info", {})
-            catalog = api(user, pw, "get_live_streams")
+            ui = api(acc).get("user_info", {})
+            cats = {str(c["category_id"]): (c.get("category_name") or "").strip()
+                    for c in api(acc, "get_live_categories")}
+            catalog = api(acc, "get_live_streams")
         except Exception as e:  # noqa: BLE001
-            alerts.append(f"No pude consultar el panel tvprem ({user}) tras 3 intentos: {e}")
+            alerts.append(f"No pude consultar el panel {aid} ({user}) tras 3 intentos: {e}")
             continue
 
         # --- cuenta ---
         if ui.get("auth") != 1 or ui.get("status") != "Active":
-            alerts.append(f"Cuenta {user}: auth={ui.get('auth')} status={ui.get('status')} "
-                          "(esperado auth=1, Active). La captura de tvprem se va a caer.")
+            alerts.append(f"Cuenta {aid} ({user}): auth={ui.get('auth')} status={ui.get('status')} "
+                          "(esperado auth=1, Active). La captura de esa cuenta se va a caer.")
         try:
             exp = datetime.fromtimestamp(int(ui["exp_date"]), timezone.utc)
             days = (exp - now).total_seconds() / 86400
             if days <= WARN_DAYS:
-                alerts.append(f"La suscripción tvprem ({user}) vence en {days:.1f} días "
-                              f"({exp:%Y-%m-%d %H:%M} UTC). Renovar o canal_5 deja de grabar.")
+                alerts.append(f"La suscripción {aid} ({user}) vence en {days:.1f} días "
+                              f"({exp:%Y-%m-%d %H:%M} UTC). Renovar.")
         except (KeyError, ValueError, TypeError):
-            alerts.append(f"Cuenta {user}: exp_date ilegible ({ui.get('exp_date')!r})")
+            alerts.append(f"Cuenta {aid}: exp_date ilegible ({ui.get('exp_date')!r})")
         mc = str(ui.get("max_connections"))
-        prev_mc = new_snap["account"].get(user, {}).get("max_connections")
+        prev_mc = old.get("account", {}).get("max_connections")
         if prev_mc and prev_mc != mc:
-            alerts.append(f"Cuenta {user}: max_connections cambió {prev_mc} -> {mc}")
-        new_snap["account"][user] = {"max_connections": mc, "exp_date": ui.get("exp_date"),
-                                     "status": ui.get("status")}
+            alerts.append(f"Cuenta {aid}: max_connections cambió {prev_mc} -> {mc}")
+        state["accounts"][aid]["account"] = {"max_connections": mc, "exp_date": ui.get("exp_date"),
+                                             "status": ui.get("status")}
+
+        # --- freno: catalogo vacio o recortado = panel respondiendo mal, no conclusiones ---
+        by_catalog = {str(s["stream_id"]): s.get("name", "") for s in catalog}
+        guide = {}
+        for s in catalog:
+            cat, name = cats.get(str(s.get("category_id")), ""), (s.get("name") or "").strip()
+            if HN_CAT.search(cat) or HN_NAME.search(name):
+                guide[str(s["stream_id"])] = {"name": name, "cat": cat}
+        if not guide or (old_guide and len(guide) < MIN_KEEP_RATIO * len(old_guide)):
+            alerts.append(f"Panel {aid}: catálogo HN vacío/recortado ({len(guide)} vs {len(old_guide)} "
+                          f"previos, {len(by_catalog)} canales totales). No evalúo IDs hoy; se conserva la guía.")
+            continue
+
+        # --- guia HN ---
+        if old_guide:
+            for sid, c in guide.items():
+                if sid not in old_guide:
+                    changes.append(f"{aid} ALTA   {sid} {c['name']}")
+                elif norm(old_guide[sid]["name"]) != norm(c["name"]):
+                    changes.append(f"{aid} RENOMB {sid} '{old_guide[sid]['name']}' -> '{c['name']}'")
+            changes += [f"{aid} BAJA   {sid} {c['name']}" for sid, c in old_guide.items() if sid not in guide]
+        state["accounts"][aid]["guide"] = guide
 
         # --- IDs en uso ---
-        by_catalog = {str(s["stream_id"]): s.get("name", "") for s in catalog}
-        for sid, uses in sorted(by_id.items()):
+        new_ids = {}
+        for sid, uses in sorted(used.get(aid, {}).items()):
             who = ", ".join(f"{slug}/{rol}" for slug, rol in uses)
-            old = ids_snap.get(sid, {}).get("name")
+            old_name = ids_snap.get(sid, {}).get("name")
             cur = by_catalog.get(sid)
             if cur is None:
                 cands = [f"{i} ({n})" for i, n in by_catalog.items()
-                         if old and norm(n) == norm(old)][:5]
-                alerts.append(f"ID {sid} ({old or '?'}) usado por {who} YA NO EXISTE en tvprem."
+                         if old_name and norm(n) == norm(old_name)][:5]
+                alerts.append(f"ID {sid} ({old_name or '?'}) de {aid}, usado por {who}, YA NO EXISTE en el panel."
                               + (f" Candidatos con el mismo nombre: {', '.join(cands)}" if cands else ""))
-                if old:  # conservar el nombre esperado para seguir alertando
-                    new_snap["ids"][sid] = ids_snap[sid]
+                if old_name:  # conservar el nombre esperado para seguir alertando
+                    new_ids[sid] = ids_snap[sid]
             else:
-                if old and norm(old) != norm(cur):
-                    alerts.append(f"ID {sid} usado por {who} cambió de nombre: "
-                                  f"'{old}' -> '{cur}'. Posible reasignación a otro canal: verificar.")
-                new_snap["ids"][sid] = {"name": cur, "uses": [f"{s}/{r}" for s, r in uses],
-                                        "seen": now.strftime("%Y-%m-%d")}
+                if old_name and norm(old_name) != norm(cur):
+                    alerts.append(f"ID {sid} de {aid}, usado por {who}, cambió de nombre: "
+                                  f"'{old_name}' -> '{cur}'. Posible reasignación a otro canal: verificar.")
+                new_ids[sid] = {"name": cur, "uses": [f"{s}/{r}" for s, r in uses],
+                                "seen": now.strftime("%Y-%m-%d")}
+        state["accounts"][aid]["ids"] = new_ids
 
-    os.makedirs(os.path.dirname(a.snapshot), exist_ok=True)
-    json.dump(new_snap, open(a.snapshot, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+    if not a.dry_run:
+        out_dir = os.path.dirname(a.snapshot)
+        os.makedirs(out_dir, exist_ok=True)
+        json.dump(state, open(a.snapshot + ".tmp", "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+        os.replace(a.snapshot + ".tmp", a.snapshot)
+        write_md(os.path.join(out_dir, "IPTV_GUIDE.md"), stamp, state, accounts)
+        if changes:
+            with open(os.path.join(out_dir, "iptv_guide_changes.log"), "a", encoding="utf-8") as f:
+                f.write(f"## {stamp}\n" + "\n".join(changes) + "\n")
 
-    n_ids = len(new_snap["ids"])
     if alerts:
         tg_send("🔔 tvprem_watch\n\n" + "\n\n".join(f"• {x}" for x in alerts), a.dry_run)
-    print(f"{stamp} ids_vigilados={n_ids} alertas={len(alerts)}"
-          + ("".join(f"\n  - {x}" for x in alerts) if alerts else " OK"))
+    n_ids = sum(len(s.get("ids", {})) for s in state["accounts"].values())
+    hn = ",".join(f"{k}:{len(v.get('guide', {}))}" for k, v in state["accounts"].items())
+    print(f"{stamp} ids_vigilados={n_ids} guia_HN={hn} cambios={len(changes)} alertas={len(alerts)}"
+          + ("".join(f"\n  - {x}" for x in alerts) if alerts else " OK")
+          + "".join(f"\n  ~ {x}" for x in changes[:40]))
     return 1 if alerts else 0
 
 

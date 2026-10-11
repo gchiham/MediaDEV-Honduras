@@ -58,3 +58,4 @@ config/stations.json
 *.bak-*
 config/*.bak*
 config/tvprem_watch.json
+config/IPTV_GUIDE.md
