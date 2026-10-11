@@ -60,7 +60,9 @@ echo "$r" | grep -q '"estaciones"' && ok "chequeo por ssh responde" || mal "cheq
 r="$(sudo -u "$USR" "${SSH[@]}" "$dest" bash 2>&1)"
 echo "$r" | grep -q 'comando no permitido' && ok "un shell es rechazado" || mal "un shell no fue rechazado: ${r:0:200}"
 r="$(sudo -u "$USR" "${SSH[@]}" -tt "$dest" 2>&1 < /dev/null)"
-echo "$r" | grep -q '"error"' && ok "sin pty ni shell interactivo" || mal "sesión interactiva: ${r:0:200}"
+# seguro = sshd niega la pty (el cliente corta sin ejecutar nada) o el comando forzado responde error
+echo "$r" | grep -qE 'PTY allocation request failed|"error"' && ! echo "$r" | grep -qE '\$ |# ' \
+  && ok "sin pty ni shell interactivo" || mal "sesión interactiva: ${r:0:200}"
 sudo -u "$USR" "${SSH[@]}" -o ExitOnForwardFailure=yes -R 127.0.0.1:0:127.0.0.1:22 "$dest" chequeo \
   </dev/null >/dev/null 2>&1 && mal "el reenvío de puertos fue aceptado" || ok "reenvío de puertos rechazado"
 
