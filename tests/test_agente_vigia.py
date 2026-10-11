@@ -475,8 +475,40 @@ class Agente(unittest.TestCase):
 
     def test_precios_del_modelo_por_defecto(self):
         with mock.patch.dict(os.environ, {"AGENTE_PRECIO_ENTRADA": ""}):
-            self.assertEqual(agente.precios_de("gpt-5.5"), (5.00, 0.50, 30.00))
-        self.assertEqual(agente.precios_de("gpt-5.5"), (2.0, 0.2, 10.0))     # el entorno manda
+            self.assertEqual(agente.precios_de("gpt-5.5"), (5.00, 0.50, 5.00, 30.00))
+            self.assertEqual(agente.precios_de("gpt-5.6-terra"), (2.00, 0.20, 2.50, 12.00))
+        self.assertEqual(agente.precios_de("gpt-5.5"), (2.0, 0.2, 2.0, 10.0))  # el entorno manda
+        with mock.patch.dict(os.environ, {"AGENTE_PRECIO_ESCRITURA_CACHE": "2.5"}):
+            self.assertEqual(agente.precios_de("x"), (2.0, 0.2, 2.5, 10.0))
+
+    def test_concilia_con_el_panel_de_openai(self):
+        """Tokens reales de la evaluación del 11-oct-2026 contra lo que facturó OpenAI (panel de uso)."""
+        with mock.patch.dict(os.environ, {"AGENTE_PRECIO_ENTRADA": ""}):
+            casos = [  # modelo, entrada, lectura caché, salida, total del panel
+                ("gpt-5.5", 133248, 94208, 5802, 0.047 + 0.195 + 0.174),
+                ("gpt-5.4-mini", 110899, 87552, 7756, 0.007 + 0.018 + 0.035),
+                ("gpt-5.6-luna", 92859, 76134, 4584, 0.004 + 0.002 + 0.006)]
+            for modelo, e, c, s, panel in casos:
+                usd = agente.Presupuesto(modelo=modelo, dir_=self.tmp / modelo).costo(
+                    {"entrada": e, "cache": c, "salida": s, "escritura": None})
+                self.assertAlmostEqual(usd, panel, delta=0.0015, msg=modelo)   # el panel redondea a 0.001
+
+    def test_escritura_de_cache_informada_y_sin_informar(self):
+        with mock.patch.dict(os.environ, {"AGENTE_PRECIO_ENTRADA": ""}):
+            p = agente.Presupuesto(modelo="gpt-5.6-terra", dir_=self.tmp / "t")
+        # 10k nuevos (8k como escritura), 30k leídos de caché, 1k de salida
+        informada = p.costo({"entrada": 40000, "cache": 30000, "salida": 1000, "escritura": 8000})
+        self.assertAlmostEqual(informada, (2000 * 2.00 + 8000 * 2.50 + 30000 * 0.20 + 1000 * 12) / 1e6)
+        sin_dato = p.costo({"entrada": 40000, "cache": 30000, "salida": 1000, "escritura": None})
+        self.assertAlmostEqual(sin_dato, (10000 * 2.50 + 30000 * 0.20 + 1000 * 12) / 1e6)  # el precio alto
+        self.assertGreaterEqual(sin_dato, informada)
+        self.assertAlmostEqual(p.peor_caso(10000), (10000 * 2.50 + agente.MAX_SALIDA_TOKENS * 12) / 1e6)
+
+    def test_usage_lee_cache_write_tokens(self):
+        r = SimpleNamespace(usage=SimpleNamespace(input_tokens=500, output_tokens=20,
+                            input_tokens_details=SimpleNamespace(cached_tokens=100, cache_write_tokens=400)))
+        self.assertEqual(agente._usage(r), {"entrada": 500, "cache": 100, "salida": 20, "escritura": 400})
+        self.assertIsNone(agente._usage(resp())["escritura"])
 
     def test_gasto_persiste_en_el_dia(self):
         self.pres.sumar({"entrada": 1_000_000, "cache": 0, "salida": 0})

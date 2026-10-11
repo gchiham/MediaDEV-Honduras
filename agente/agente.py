@@ -27,14 +27,17 @@ MAX_SALIDA_TOKENS = 8000
 CONOCIMIENTO_PRIVADO = Path(os.environ.get("AGENTE_CONOCIMIENTO_PRIVADO",
                                            "/etc/mediadev-vigia/conocimiento_privado.md"))
 
-# USD por millón de tokens (entrada, entrada en caché, salida), tier Standard, contexto ≤ 272K.
-# Verificado el 11-oct-2026 en https://developers.openai.com/api/docs/pricing. Si cambia el
-# precio o el modelo, actualizar acá o fijar AGENTE_PRECIO_* en el entorno.
+# USD por millón de tokens: (entrada, lectura de caché, escritura de caché, salida), tier Standard,
+# contexto ≤ 272K. Verificado el 11-oct-2026 en https://developers.openai.com/api/docs/pricing y
+# conciliado con el panel de uso. Los gpt-5.6 cobran la entrada nueva como "cache writes" a 1.25x
+# la entrada; los demás no tienen escritura aparte (escritura = entrada). Si cambia el precio o el
+# modelo, actualizar acá o fijar AGENTE_PRECIO_* en el entorno.
 PRECIOS = {
-    "gpt-5.5": (5.00, 0.50, 30.00),
-    "gpt-5.4": (2.50, 0.25, 15.00),
-    "gpt-5.4-mini": (0.75, 0.075, 4.50),
-    "gpt-5.6-terra": (2.00, 0.20, 12.00),
+    "gpt-5.5": (5.00, 0.50, 5.00, 30.00),
+    "gpt-5.4": (2.50, 0.25, 2.50, 15.00),
+    "gpt-5.4-mini": (0.75, 0.075, 0.75, 4.50),
+    "gpt-5.6-terra": (2.00, 0.20, 2.50, 12.00),
+    "gpt-5.6-luna": (0.20, 0.02, 0.25, 1.20),
 }
 CONTEXTO_MAX_PRECIO_BASE = 272_000      # por encima el precio sube: el tope por incidente lo evita
 
@@ -59,10 +62,14 @@ def instrucciones() -> str:
     return "".join(partes)
 
 
-def precios_de(modelo: str) -> tuple[float, float, float] | None:
+def precios_de(modelo: str) -> tuple[float, float, float, float] | None:
+    """(entrada, lectura de caché, escritura de caché, salida). En el entorno, la escritura es
+    opcional (AGENTE_PRECIO_ESCRITURA_CACHE); si falta, vale lo mismo que la entrada."""
     env = [os.environ.get(f"AGENTE_PRECIO_{k}") for k in ("ENTRADA", "ENTRADA_CACHE", "SALIDA")]
     if all(env):
-        return tuple(float(x) for x in env)          # type: ignore[return-value]
+        p_in, p_cache, p_out = (float(x) for x in env)
+        p_esc = float(os.environ.get("AGENTE_PRECIO_ESCRITURA_CACHE") or p_in)
+        return (p_in, p_cache, p_esc, p_out)
     return PRECIOS.get(modelo)
 
 
@@ -99,10 +106,19 @@ class Presupuesto:
         return total + self.dia["usd"]
 
     def costo(self, u: dict) -> float | None:
+        """Costo de una llamada. La entrada que no se leyó de caché se cobra como escritura de caché
+        si la API lo informa (cache_write_tokens); si no lo informa, toda al precio más alto de los
+        dos (nunca se subestima)."""
         if not self.precios:
             return None
-        p_in, p_cache, p_out = self.precios
-        return ((u["entrada"] - u["cache"]) * p_in + u["cache"] * p_cache + u["salida"] * p_out) / 1e6
+        p_in, p_cache, p_esc, p_out = self.precios
+        nueva = u["entrada"] - u["cache"]
+        escritura = u.get("escritura")
+        if isinstance(escritura, int) and 0 <= escritura <= nueva:
+            entrada_usd = (nueva - escritura) * p_in + escritura * p_esc
+        else:
+            entrada_usd = nueva * max(p_in, p_esc)
+        return (entrada_usd + u["cache"] * p_cache + u["salida"] * p_out) / 1e6
 
     def peor_caso(self, tokens_entrada: int) -> float | None:
         return self.costo({"entrada": tokens_entrada, "cache": 0, "salida": MAX_SALIDA_TOKENS})
@@ -178,7 +194,9 @@ def _usage(resp) -> dict | None:
         return None
     det = getattr(u, "input_tokens_details", None)
     cache = getattr(det, "cached_tokens", 0) if det is not None else 0
-    return {"entrada": entrada, "cache": cache if isinstance(cache, int) else 0, "salida": salida}
+    escritura = getattr(det, "cache_write_tokens", None) if det is not None else None
+    return {"entrada": entrada, "cache": cache if isinstance(cache, int) else 0, "salida": salida,
+            "escritura": escritura if isinstance(escritura, int) else None}
 
 
 def _error_facturable(e: Exception) -> bool:
@@ -212,6 +230,7 @@ def investigar(cliente, backend, inc: dict, presupuesto: Presupuesto, auditar,
     inst = instrucciones()
     entrada: list = [{"role": "user", "content": texto_incidente(inc)}]
     uso = {"entrada": 0, "cache": 0, "salida": 0}
+    usd = 0.0
     llamadas: list[str] = []
     forzar = False
     for turno in range(MAX_TURNOS):
@@ -238,6 +257,7 @@ def investigar(cliente, backend, inc: dict, presupuesto: Presupuesto, auditar,
                                 f"llamadas nuevas hasta revisar")
         for k in uso:
             uso[k] += u[k]
+        usd += presupuesto.costo(u) or 0.0
         presupuesto.sumar(u)
         auditar("turno", turno=turno, uso=u, estimado=tokens, forzado=forzar)
         salida = list(resp.output or [])
@@ -253,7 +273,7 @@ def investigar(cliente, backend, inc: dict, presupuesto: Presupuesto, auditar,
                 if reporte is not None:
                     auditar("reporte", reporte=reporte)
                     return {"reporte": reporte, "turnos": turno + 1, "uso": uso, "modelo": modelo,
-                            "usd": presupuesto.costo(uso), "llamadas": llamadas}
+                            "usd": usd if presupuesto.precios else None, "llamadas": llamadas}
                 out = json.dumps({"error": f"reporte rechazado: {error}; vuelve a llamar a reportar"})
                 forzar = True
             else:
