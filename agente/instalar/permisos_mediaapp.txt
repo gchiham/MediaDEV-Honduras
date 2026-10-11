@@ -7,6 +7,7 @@
 /opt/mediadev-agente/agente.py                root            root            644
 /opt/mediadev-agente/herramientas.py          root            root            644
 /opt/mediadev-agente/bot_comandos.py          root            root            644
+/opt/mediadev-agente/diagnosticos.py          root            root            644
 /opt/mediadev-agente/venv                     root            root            755
 /etc/mediadev-agent.env                       root            root            600
 /etc/mediadev-vigia                           root            mediadev-vigia  750

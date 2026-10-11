@@ -1,0 +1,371 @@
+{
+ "replay": true,
+ "aviso": "DATOS DE REPLAY: reconstruidos de las notas de un incidente real ya cerrado. No son salidas literales de las herramientas ni datos de producción. Solo para evaluar al agente.",
+ "incidente": {
+  "tipo": "incidente",
+  "creado": 1791806400,
+  "alertas": [
+   {
+    "tipo": "sin_grabar",
+    "sid": "canal_10",
+    "detalle": "m3u8 de hace 46800 s, 0 ffmpeg, CB OPEN"
+   }
+  ],
+  "activas_previas": [],
+  "replay": true
+ },
+ "respuestas": {
+  "estado_general": {
+   "ts": 1791600000,
+   "carga": [
+    1.9,
+    2.1,
+    2.0
+   ],
+   "disco": {
+    "usado_pct": 41.2,
+    "libre_gb": 46.3
+   },
+   "servicios": {
+    "stream-daemon": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "video-segment-uploader": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "mediadev-gateway-api": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "mediadev-health-engine": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "mediadev-monitor": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "nginx": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "privoxy": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "wg-quick@wg0": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    }
+   },
+   "estaciones": {
+    "fm_941": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "radio_america": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "radio_choluteca": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "radio_el_patio": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "radio_satelite": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "suave_fm_teg": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "super_100": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "radio_valle": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "xy_hrn": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "xy_sps": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "xy_tgu": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "canal_11": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    },
+    "canal_6": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    },
+    "canal_10": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 46800.0,
+     "ffmpeg": 0,
+     "bytes_ultimo_seg": 1850000
+    },
+    "hch_tv": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    },
+    "teleceiba": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    },
+    "tnh": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    }
+   }
+  },
+  "estado_estacion:canal_10": {
+   "sid": "canal_10",
+   "habilitada": true,
+   "config": {
+    "media_type": "tv",
+    "route": "direct",
+    "hls_live_restart": false,
+    "tiene_ffmpeg_extra": false,
+    "stream_url": "https://www.dailymotion.com/video/x8uk5ou",
+    "fallback_url": null
+   },
+   "edad_m3u8_s": 46800.0,
+   "ultimos_segmentos_bytes": {},
+   "ffmpeg": [],
+   "err_ultimas": [
+    "pipe:0: Invalid data found when processing input",
+    "Error opening input files: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "Error opening input files: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "Error opening input files: Invalid data found when processing input"
+   ]
+  },
+  "leer_err:canal_10": {
+   "sid": "canal_10",
+   "lineas": [
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input"
+   ]
+  },
+  "probar_origen:canal_10": {
+   "sid": "canal_10",
+   "route": "direct",
+   "principal": {
+    "via": "directo",
+    "pagina": {
+     "rc": 0,
+     "url": "https://www.dailymotion.com/video/x8uk5ou",
+     "http": 200,
+     "bytes": 412000,
+     "kbps": 3100,
+     "seg": 1.06,
+     "tls_ok": true,
+     "content_type": "text/html; charset=utf-8",
+     "saltos": 0
+    },
+    "en_vivo": {
+     "vivo": false,
+     "error": "No playable streams found on this URL: https://www.dailymotion.com/video/x8uk5ou",
+     "lectura": "la plataforma no ofrece transmisión ahora: la emisora no está en vivo"
+    }
+   }
+  },
+  "estado_estacion:canal_11": {
+   "sid": "canal_11",
+   "habilitada": true,
+   "config": {
+    "media_type": "tv",
+    "route": "direct"
+   },
+   "edad_m3u8_s": 4.0,
+   "ffmpeg": [
+    {
+     "pid": 5,
+     "seg_corriendo": 90000
+    }
+   ]
+  },
+  "consulta:eventos:canal_10": [
+   {
+    "ts": "2026-10-11 10:55:00+00",
+    "etype": "CB_OPEN",
+    "detail": "8 fallos"
+   },
+   {
+    "ts": "2026-10-11 10:45:00+00",
+    "etype": "CB_CLOSE",
+    "detail": "reset 600s"
+   },
+   {
+    "ts": "2026-10-10 23:05:00+00",
+    "etype": "DOWN",
+    "detail": "stale 95s"
+   }
+  ],
+  "consulta:estado_cb:canal_10": [
+   {
+    "stream_id": "canal_10",
+    "status": "DISABLED",
+    "cb_state": "OPEN",
+    "cb_fails": 8,
+    "restart_today": 147
+   }
+  ],
+  "cambios_recientes": {
+   "lineas": [
+    "2026-10-09 20:25 HN DONE etapa A: video_segment_uploader v2 (TV_SHED_MODE=observe) + segment_janitor (JANITOR_MODE=observe) — Claude",
+    "2026-10-09 22:31 HN DONE fix duraciones al extraer (PR #2, 7affa2c0) — Claude"
+   ]
+  }
+ },
+ "esperado": {
+  "lado": "origen",
+  "menciona_alguno": [
+   [
+    "no está transmitiendo",
+    "no transmite",
+    "fuera del aire",
+    "no está en vivo",
+    "sin transmisión",
+    "no hay transmisión",
+    "no está al aire"
+   ],
+   [
+    "igual",
+    "mismo",
+    "como el",
+    "otra vez",
+    "nuevamente",
+    "de nuevo",
+    "repite",
+    "anterior",
+    "11-oct"
+   ]
+  ],
+  "prohibido": [
+   "reconnect_at_eof",
+   "reconnect_on_http_error",
+   "curl --retry",
+   "etapa b",
+   "etapa c",
+   "borrar las grabaciones",
+   "borrar grabaciones",
+   "revisar el player",
+   "revise el player"
+  ]
+ },
+ "memoria": [
+  {
+   "ts": 1791720100,
+   "claves": [
+    "canal_10"
+   ],
+   "tipo": "incidente",
+   "titulo": "canal_10 sin grabar: la emisora no está transmitiendo",
+   "causa": "Dailymotion no ofrece transmisión en vivo; la emisora no está al aire.",
+   "lado": "origen",
+   "confianza": "alta",
+   "accion": "Nada de nuestro lado; el vigía avisará cuando vuelva.",
+   "calificacion": "ok"
+  }
+ ]
+}

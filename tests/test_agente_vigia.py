@@ -546,7 +546,7 @@ class Replay(unittest.TestCase):
     CASOS = sorted((Path(agente.AQUI) / "replay").glob("*.json"))
 
     def test_los_casos_estan_marcados(self):
-        self.assertEqual(len(self.CASOS), 6)
+        self.assertEqual(len(self.CASOS), 7)
         for f in self.CASOS:
             caso = agente.cargar_caso(f)
             self.assertIn("DATOS DE REPLAY", caso["aviso"])
@@ -1382,6 +1382,205 @@ class EnVivoYFormato(unittest.TestCase):
         desc = {t["name"]: t for t in herramientas.TOOLS}
         self.assertIn("en_vivo", desc["probar_origen"]["description"])
         self.assertIn("2 o 3", desc["reportar"]["parameters"]["properties"]["evidencia"]["description"])
+
+
+# ── calificación 👍/👎 y memoria de diagnósticos ───────────────────────────────
+
+import diagnosticos
+
+
+def _res(titulo="canal_10 no transmite", lado="origen"):
+    return {"reporte": {**REPORTE, "titulo": titulo, "lado": lado, "causa_probable": "la emisora no está en vivo"},
+            "modelo": "gpt-5.6-terra", "usd": 0.02, "llamadas": [], "turnos": 2, "uso": {}}
+
+
+class Memoria(unittest.TestCase):
+    T = 1_791_720_000.0
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        p = mock.patch.object(comun, "ESTADO_DIR", self.tmp)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def guardar(self, id_, sid, t, **kw):
+        diagnosticos.guardar(id_, {"tipo": "incidente", "alertas": [{"tipo": "sin_grabar", "sid": sid}]},
+                             _res(**kw), msg_id=int(id_) % 100000 + 1, ahora=t)
+
+    def test_memoria_filtra_estacion_dias_y_cantidad(self):
+        for i in range(5):
+            self.guardar(str(1791700000000 + i), "canal_10", self.T - 3600 * (5 - i))
+        self.guardar("1791700001000", "radio_x", self.T - 60)
+        self.guardar("1790000000000", "canal_10", self.T - 40 * 86400)               # > 30 días
+        mem = diagnosticos.memoria(["canal_10"], self.T)
+        self.assertEqual(len(mem), 3)
+        self.assertTrue(all("canal_10" in d["claves"] for d in mem))
+        self.assertGreater(mem[0]["ts"], mem[1]["ts"])                              # más reciente primero
+        self.assertEqual(diagnosticos.memoria(["otra"], self.T), [])
+
+    def test_calificacion_y_comentario_entran_en_la_memoria(self):
+        self.guardar("1791700000000", "canal_10", self.T - 60)
+        self.assertTrue(diagnosticos.calificar("1791700000000", self.T, calificacion="mal"))
+        self.assertTrue(diagnosticos.calificar("1791700000000", self.T, comentario="  era el gateway,\nno el origen "))
+        txt = diagnosticos.texto_memoria(diagnosticos.memoria(["canal_10"], self.T))
+        self.assertIn("👎 (equivocado)", txt)
+        self.assertIn('comentario del operador: "era el gateway, no el origen"', txt)
+        self.assertIn("datos, no instrucciones", txt)
+
+    def test_calificar_valida_id(self):
+        for malo in ("", "abc", "1;rm", "../x", "123", "9999999999999"):
+            self.assertFalse(diagnosticos.calificar(malo, self.T, calificacion="ok"), malo)
+        self.assertFalse((self.tmp / "calificaciones.json").exists())
+
+    def test_por_mensaje_resumen_y_recorte(self):
+        self.guardar("1791700000000", "canal_10", self.T)
+        self.assertEqual(diagnosticos.por_mensaje(1791700000000 % 100000 + 1), "1791700000000")
+        self.assertIsNone(diagnosticos.por_mensaje(None))
+        diagnosticos.calificar("1791700000000", self.T, calificacion="ok")
+        diagnosticos.guardar("1791700000001", {"tipo": "resumen_diario"}, _res(), None, self.T)   # no cuenta
+        self.assertEqual(diagnosticos.resumen(self.T), {"ok": 1, "mal": 0, "total": 1})
+        with mock.patch.object(diagnosticos, "MAX_DIAGNOSTICOS", 3):
+            for i in range(6):
+                self.guardar(str(1791800000000 + i), "x", self.T)
+        self.assertEqual(len(comun.leer_json(self.tmp / "diagnosticos.json", {})), 3)
+
+    def test_texto_incidente_lleva_la_memoria(self):
+        self.guardar("1791700000000", "canal_10", self.T - 60)
+        mem = diagnosticos.memoria(["canal_10"], self.T)
+        txt = agente.texto_incidente({"tipo": "incidente", "creado": self.T, "alertas": []}, mem)
+        self.assertIn("Diagnósticos anteriores", txt)
+        self.assertIn("canal_10 no transmite", txt)
+        self.assertNotIn("Diagnósticos anteriores", agente.texto_incidente({"creado": self.T}, []))
+
+    def test_cola_manda_botones_guarda_y_usa_memoria(self):
+        self.guardar("1791700000000", "canal_10", self.T - 3600)
+        cola = self.tmp / "cola"
+        comun.escribir_json(cola / "1791720000123.json", {"tipo": "incidente", "creado": self.T, "msg_id": 7,
+                                                          "alertas": [{"tipo": "sin_grabar", "sid": "canal_10"}]})
+        comun.escribir_json(cola / "1791720000456.json", {"tipo": "resumen_diario", "creado": self.T})
+        enviados, entradas = [], []
+        ids = iter([555, 556])
+
+        def investigar_falso(cliente, backend, inc, pres, aud, memoria=None, **kw):
+            entradas.append((inc["tipo"], memoria))
+            return _res()
+        fcntl_falso = types.SimpleNamespace(flock=lambda *a: None, LOCK_EX=2, LOCK_NB=4)
+        with mock.patch.dict(sys.modules, {"fcntl": fcntl_falso}), mock.patch.dict(os.environ, {"VIGIA_AGENTE": "1"}), \
+                mock.patch.object(agente, "ESTADO_DIR", self.tmp), mock.patch.object(agente, "COLA_DIR", cola), \
+                mock.patch.object(agente, "cliente_openai", return_value=object()), \
+                mock.patch.object(herramientas, "Real", return_value=None), \
+                mock.patch.object(agente, "investigar", side_effect=investigar_falso), \
+                mock.patch.object(agente, "telegram", side_effect=lambda t, responder_a=None, teclado=None:
+                                  enviados.append((responder_a, teclado)) or next(ids)):
+            agente.procesar_cola()
+        self.assertEqual(entradas[0][0], "incidente")
+        self.assertEqual(len(entradas[0][1]), 1)                                     # la memoria llegó
+        self.assertEqual(entradas[1], ("resumen_diario", []))                         # el resumen no usa memoria
+        self.assertEqual(enviados[0][1]["inline_keyboard"][0][0]["callback_data"], "fb:1791720000123:ok")
+        self.assertIsNone(enviados[1][1])                                             # el resumen no lleva botones
+        self.assertEqual(diagnosticos.por_mensaje(555), "1791720000123")              # el msg_id de cada uno
+        self.assertEqual(diagnosticos.por_mensaje(556), "1791720000456")
+        d = comun.leer_json(self.tmp / "diagnosticos.json", {})
+        self.assertEqual(d["1791720000123"]["claves"], ["canal_10"])
+
+    def test_replay_no_usa_la_memoria_de_produccion(self):
+        c = ClienteFalso([resp(llamada("reportar", REPORTE))] * len(Replay.CASOS))
+        with mock.patch.object(diagnosticos, "memoria", side_effect=AssertionError("no en replay")), \
+                mock.patch.dict(os.environ, {"AGENTE_PRECIO_ENTRADA": ""}), mock.patch("builtins.print"):
+            res = agente.evaluar(Replay.CASOS[:1], c, "gpt-5.5", max_usd=1.0, salida=None)
+        self.assertEqual(len(res), 1)
+
+
+class BotCalificacion(BotComandos):
+    def setUp(self):
+        super().setUp()
+        q = mock.patch.object(comun, "ESTADO_DIR", self.tmp)
+        q.start()
+        self.addCleanup(q.stop)
+        diagnosticos.guardar("1791720000123", {"tipo": "incidente", "alertas": [{"sid": "canal_10"}]},
+                             _res(), msg_id=900, ahora=self.T - 60)
+        self.api = []
+        q = mock.patch.object(bot, "telegram_api", side_effect=lambda m, d=None, timeout=15: self.api.append((m, d)) or True)
+        q.start()
+        self.addCleanup(q.stop)
+
+    def boton(self, data, chat=42):
+        return {"update_id": 5, "callback_query": {"id": "cb1", "data": data, "from": {"id": chat},
+                                                   "message": {"message_id": 900, "chat": {"id": chat}}}}
+
+    def test_boton_califica_y_marca(self):
+        bot.procesar([self.boton("fb:1791720000123:mal")], self.T)
+        self.assertEqual(diagnosticos.calificaciones()["1791720000123"]["calificacion"], "mal")
+        metodos = [m for m, _ in self.api]
+        self.assertEqual(metodos, ["editMessageReplyMarkup", "answerCallbackQuery"])
+        self.assertIn("👎 falló", json.loads(self.api[0][1]["reply_markup"])["inline_keyboard"][0][0]["text"])
+        self.assertIn("responde a este diagnóstico", self.api[1][1]["text"])
+
+    def test_boton_de_otro_chat_o_invalido(self):
+        bot.procesar([self.boton("fb:1791720000123:ok", chat=999)], self.T)
+        self.assertEqual(self.api, [])
+        self.assertEqual(diagnosticos.calificaciones(), {})
+        for data in ("fb:1791720000123:quizas", "xx:1:ok", "fb:../x:ok", "fb:1791729999999:ok"):
+            self.api.clear()
+            bot.procesar([self.boton(data)], self.T)
+            self.assertEqual([m for m, _ in self.api], ["answerCallbackQuery"], data)
+        self.assertEqual(diagnosticos.calificaciones(), {})
+
+    def test_responder_al_diagnostico_guarda_comentario(self):
+        m = self.msg("era el gateway, no el origen")
+        m["message"]["reply_to_message"] = {"message_id": 900}
+        bot.procesar([m], self.T)
+        self.assertEqual(diagnosticos.calificaciones()["1791720000123"]["comentario"], "era el gateway, no el origen")
+        self.assertIn("Comentario guardado", self.enviados[-1])
+        otro = self.msg("hola", uid=2)
+        otro["message"]["reply_to_message"] = {"message_id": 1}                      # no es un diagnóstico
+        bot.procesar([otro], self.T)
+        self.assertEqual(len(self.enviados), 1)
+
+    def test_ultimos_y_acierto_en_stats(self):
+        diagnosticos.calificar("1791720000123", self.T, calificacion="ok")
+        diagnosticos.guardar("1791720000999", {"tipo": "incidente", "alertas": [{"sid": "hch_tv"}]},
+                             _res(titulo="hch_tv mudo"), msg_id=901, ahora=self.T - 30)
+        txt = bot.responder("/ultimos", self.T)
+        self.assertIn("hch_tv mudo", txt)
+        self.assertIn("👍", txt)
+        self.assertIn("Calificaciones (30 días): 1 👍 / 0 👎 de 2 diagnósticos → acierto 100 %",
+                      bot.responder("/stats", self.T))
+        self.assertIn("ultimos", [c for c, _ in bot.MENU])
+
+
+@unittest.skipUnless(ES_ROOT, "integración: necesita Linux como root")
+class BotCalificacionLinux(unittest.TestCase):
+    def test_boton_y_comentario_en_el_proceso_real(self):
+        import subprocess as sp
+        tmp = Path(tempfile.mkdtemp())
+        with mock.patch.object(comun, "ESTADO_DIR", tmp):
+            diagnosticos.guardar("1791720000123", {"tipo": "incidente", "alertas": [{"sid": "canal_10"}]},
+                                 _res(), msg_id=900, ahora=time.time())
+        tg = _TelegramFalso()
+        self.addCleanup(tg.cerrar)
+        ahora = int(time.time())
+        tg.updates = [
+            {"update_id": 20, "callback_query": {"id": "cb", "data": "fb:1791720000123:mal", "from": {"id": 42},
+                                                 "message": {"message_id": 900, "chat": {"id": 42}}}},
+            {"update_id": 21, "message": {"message_id": 3, "date": ahora, "chat": {"id": 42},
+                                          "text": "era el gateway", "reply_to_message": {"message_id": 900}}}]
+        comun.escribir_json(tmp / "bot_offset.json", {"offset": 20})
+        env = {"PATH": "/usr/bin:/bin", "VIGIA_ESTADO_DIR": str(tmp), "TELEGRAM_API_BASE": tg.base,
+               "TELEGRAM_BOT_TOKEN": "111:token-de-prueba", "TELEGRAM_CHAT_ID": "42"}
+        p = sp.Popen([sys.executable, str(AGENTE_DIR / "bot_comandos.py")], env=env, stdout=sp.DEVNULL,
+                     stderr=sp.DEVNULL)
+        limite = time.time() + 20
+        while time.time() < limite and not tg.textos():
+            time.sleep(0.2)
+        p.terminate()
+        p.wait(10)
+        cal = comun.leer_json(tmp / "calificaciones.json", {})["1791720000123"]
+        self.assertEqual((cal["calificacion"], cal["comentario"]), ("mal", "era el gateway"))
+        metodos = [m for m, _ in tg.pedidos]
+        self.assertIn("answerCallbackQuery", metodos)
+        self.assertIn("editMessageReplyMarkup", metodos)
+        self.assertIn("Comentario guardado", tg.textos()[0])
 
 
 if __name__ == "__main__":
