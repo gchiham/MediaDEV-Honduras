@@ -1,0 +1,18 @@
+[Unit]
+Description=MediaDEV vigia: chequeos de mediaCAP + agente de diagnostico (solo lectura)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=mediadev-vigia
+Group=mediadev-vigia
+EnvironmentFile=/etc/mediadev-agent.env
+ExecStart=/opt/mediadev-agente/venv/bin/python /opt/mediadev-agente/vigia.py
+TimeoutStartSec=600
+Nice=10
+# endurecimiento: solo escribe su estado y su log de auditoria
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/var/lib/mediadev-vigia /var/log/mediadev-agent

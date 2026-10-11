@@ -1,0 +1,330 @@
+{
+ "replay": true,
+ "aviso": "DATOS DE REPLAY: reconstruidos de las notas de un incidente real ya cerrado. No son salidas literales de las herramientas ni datos de producción. Solo para evaluar al agente.",
+ "incidente": {
+  "tipo": "incidente",
+  "creado": 1789998600,
+  "alertas": [
+   {
+    "tipo": "sin_grabar",
+    "sid": "radio_globo",
+    "detalle": "m3u8 de hace 3900 s, 0 ffmpeg, CB OPEN"
+   }
+  ],
+  "activas_previas": [],
+  "replay": true
+ },
+ "respuestas": {
+  "estado_general": {
+   "ts": 1791600000,
+   "carga": [
+    1.9,
+    2.1,
+    2.0
+   ],
+   "disco": {
+    "usado_pct": 41.2,
+    "libre_gb": 46.3
+   },
+   "servicios": {
+    "stream-daemon": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "video-segment-uploader": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "mediadev-gateway-api": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "mediadev-health-engine": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "mediadev-monitor": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "nginx": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "privoxy": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "wg-quick@wg0": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    }
+   },
+   "estaciones": {
+    "fm_941": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "radio_america": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "radio_choluteca": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "radio_el_patio": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "radio_satelite": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "suave_fm_teg": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "super_100": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "radio_valle": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "xy_hrn": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "xy_sps": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "xy_tgu": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "canal_11": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    },
+    "canal_6": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    },
+    "canal_10": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    },
+    "hch_tv": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    },
+    "teleceiba": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    },
+    "tnh": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    },
+    "radio_globo": {
+     "edad_m3u8_s": 3900.0,
+     "ffmpeg": 0
+    }
+   }
+  },
+  "estado_estacion:radio_globo": {
+   "sid": "radio_globo",
+   "habilitada": true,
+   "config": {
+    "media_type": "radio",
+    "route": "direct",
+    "stream_url": "https://radiosmundiales.com:8443/radioglobo",
+    "fallback_url": "None",
+    "ffmpeg_extra": "None",
+    "hls_live_restart": "None"
+   },
+   "edad_m3u8_s": 3900.0,
+   "ultimos_segmentos_bytes": {},
+   "ffmpeg": [],
+   "err_ultimas": [
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input"
+   ]
+  },
+  "leer_err:radio_globo": {
+   "sid": "radio_globo",
+   "lineas": [
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input",
+    "pipe:0: Invalid data found when processing input"
+   ]
+  },
+  "probar_origen:radio_globo": {
+   "sid": "radio_globo",
+   "route": "direct",
+   "principal": {
+    "via": "directo",
+    "stream": {
+     "rc": 22,
+     "url": "https://radiosmundiales.com:8443/radioglobo",
+     "http": 404,
+     "bytes": 0,
+     "kbps": 0,
+     "seg": 0.3,
+     "tls_ok": true,
+     "content_type": "text/html",
+     "vivo": false
+    }
+   }
+  },
+  "estado_estacion:radio_america": {
+   "sid": "radio_america",
+   "habilitada": true,
+   "config": {
+    "media_type": "radio",
+    "route": "direct"
+   },
+   "edad_m3u8_s": 2.9,
+   "ffmpeg": [
+    {
+     "pid": 2,
+     "seg_corriendo": 86000,
+     "cmd": "ffmpeg -i pipe:0 ..."
+    }
+   ]
+  },
+  "consulta:eventos:radio_globo": [
+   {
+    "ts": "2026-09-21 13:40:00+00",
+    "etype": "CB_OPEN",
+    "detail": "8 fallos"
+   }
+  ],
+  "cambios_recientes": {
+   "lineas": [
+    "2026-09-18 10:02 HN DONE gateway gw03 activo — Claude"
+   ]
+  }
+ },
+ "esperado": {
+  "lado": "origen",
+  "menciona_alguno": [
+   [
+    "404"
+   ],
+   [
+    "capture_config",
+    "url",
+    "proveedor"
+   ]
+  ],
+  "prohibido": [
+   "reconnect_at_eof",
+   "reconnect_on_http_error",
+   "curl --retry",
+   "etapa b",
+   "etapa c",
+   "borrar las grabaciones",
+   "borrar grabaciones"
+  ]
+ }
+}
