@@ -545,8 +545,8 @@ class Agente(unittest.TestCase):
 class Replay(unittest.TestCase):
     CASOS = sorted((Path(agente.AQUI) / "replay").glob("*.json"))
 
-    def test_los_cinco_casos_estan_marcados(self):
-        self.assertEqual(len(self.CASOS), 5)
+    def test_los_casos_estan_marcados(self):
+        self.assertEqual(len(self.CASOS), 6)
         for f in self.CASOS:
             caso = agente.cargar_caso(f)
             self.assertIn("DATOS DE REPLAY", caso["aviso"])
@@ -568,21 +568,21 @@ class Replay(unittest.TestCase):
         self.assertNotIn("10 oct", txt)
 
     def test_evaluar_usa_replay_y_presupuesto_propio(self):
-        respuestas = [resp(llamada("estado_general", {})), resp(llamada("reportar", REPORTE, "c2"))] * 5
+        respuestas = [resp(llamada("estado_general", {})), resp(llamada("reportar", REPORTE, "c2"))] * len(self.CASOS)
         c = ClienteFalso(respuestas)
         with mock.patch.object(herramientas, "Real", side_effect=AssertionError("nunca Real en replay")), \
                 mock.patch.object(agente, "telegram", side_effect=AssertionError("nunca Telegram en replay")), \
                 mock.patch.dict(os.environ, {"AGENTE_PRECIO_ENTRADA": ""}), \
                 mock.patch("builtins.print"):
             res = agente.evaluar(self.CASOS, c, "gpt-5.5", max_usd=1.0, salida=None)
-        self.assertEqual(len(res), 5)
+        self.assertEqual(len(res), len(self.CASOS))
         self.assertTrue(all(r["llamadas"] == ["estado_general({})"] for r in res))
 
     def test_evaluar_se_detiene_al_tope(self):
-        c = ClienteFalso([resp(llamada("reportar", REPORTE), entrada=200_000)] * 5)
+        c = ClienteFalso([resp(llamada("reportar", REPORTE), entrada=200_000)] * len(self.CASOS))
         with mock.patch.dict(os.environ, {"AGENTE_PRECIO_ENTRADA": ""}), mock.patch("builtins.print"):
             res = agente.evaluar(self.CASOS, c, "gpt-5.5", max_usd=1.2, salida=None)
-        self.assertLess(len(res), 5)                                        # cada caso cuesta ~1.0
+        self.assertLess(len(res), len(self.CASOS))                                        # cada caso cuesta ~1.0
 
     def test_cola_rechaza_incidentes_de_replay(self):
         tmp = Path(tempfile.mkdtemp())
@@ -1312,6 +1312,76 @@ class BotLinux(unittest.TestCase):
         self.assertNotIn("ia_detenida", control)
         self.assertEqual(comun.leer_json(tmp / "bot_offset.json", {})["offset"], 13)
         self.assertIn("setMyCommands", [m for m, _ in tg.pedidos])
+
+
+# ── ¿la emisora está en vivo? y formato corto del reporte ─────────────────────
+
+class EnVivoYFormato(unittest.TestCase):
+    URL = "https://www.dailymotion.com/video/x8uk5ou"
+
+    def streamlink(self, stdout, rc=0):
+        return mock.patch.object(ro.subprocess, "run", return_value=SimpleNamespace(returncode=rc, stdout=stdout))
+
+    def test_en_vivo_con_streams_no_filtra_urls(self):
+        salida = json.dumps({"plugin": "dailymotion", "metadata": {"title": "Canal 10 en vivo"},
+                             "streams": {"720p": {"url": "https://x.dmcdn.net/live/ABC.m3u8?sec=SECRETO"},
+                                         "best": {"url": "https://x.dmcdn.net/b.m3u8?sec=SECRETO"}}})
+        with mock.patch.object(socket, "getaddrinfo", return_value=addr("93.184.216.34")), \
+                self.streamlink(salida) as run:
+            r = ro.en_vivo_resolver(self.URL)
+        self.assertEqual((r["vivo"], r["calidades"], r["titulo"]), (True, ["720p", "best"], "Canal 10 en vivo"))
+        self.assertNotIn("SECRETO", json.dumps(r))
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[-3:], [ro.STREAMLINK, "--json", self.URL])
+        self.assertIn("timeout", cmd)
+
+    def test_sin_transmision(self):
+        salida = json.dumps({"error": f"No playable streams found on this URL: {self.URL}"})
+        with mock.patch.object(socket, "getaddrinfo", return_value=addr("93.184.216.34")), self.streamlink(salida, rc=1):
+            r = ro.en_vivo_resolver(self.URL)
+        self.assertIs(r["vivo"], False)
+        self.assertIn("no está en vivo", r["lectura"])
+
+    def test_respuestas_raras_y_destino_interno(self):
+        with mock.patch.object(socket, "getaddrinfo", return_value=addr("93.184.216.34")), self.streamlink("no json"):
+            self.assertIsNone(ro.en_vivo_resolver(self.URL)["vivo"])
+        with mock.patch.object(socket, "getaddrinfo", return_value=addr("10.0.0.1")), self.streamlink("{}") as run:
+            r = ro.en_vivo_resolver("https://evil.dailymotion.com/x")
+        run.assert_not_called()
+        self.assertIsNone(r["vivo"])
+
+    def test_solo_se_usa_en_plataformas_con_resolver(self):
+        with mock.patch.object(ro, "_curl", return_value={"http": 200}), \
+                mock.patch.object(ro, "en_vivo_resolver", return_value={"vivo": False}) as ev:
+            r = ro.probar_url({"probar_url": self.URL}, "direct", "tv")
+            self.assertEqual(r["en_vivo"], {"vivo": False})
+            r = ro.probar_url({"probar_url": "https://tnh.example.com/envivo"}, "direct", "tv")
+        self.assertEqual(ev.call_count, 1)
+        self.assertNotIn("en_vivo", r)
+
+    def test_formato_corto(self):
+        rep = {"severidad": "media", "titulo": "canal_10 no graba: la emisora no está transmitiendo " + "x" * 80,
+               "causa_probable": "Dailymotion no ofrece transmisión en vivo ahora.", "confianza": "alta",
+               "lado": "origen", "evidencia": [f"hecho {i}" for i in range(5)],
+               "accion_sugerida": "Nada de nuestro lado; el vigía avisará cuando vuelva."}
+        txt = agente.formatear({"reporte": rep, "usd": 0.021, "llamadas": ["a", "b"], "turnos": 2,
+                                "uso": {}, "modelo": "gpt-5.6-terra"})
+        lineas = txt.splitlines()
+        self.assertLessEqual(len(lineas[0]), 92)
+        self.assertEqual(sum(l.startswith("• hecho") for l in lineas), 3)
+        self.assertIn("• (+2 en la auditoría)", txt)
+        self.assertIn("(problema del origen; confianza alta)", txt)
+        self.assertIn("👉 Nada de nuestro lado", txt)
+        self.assertIn("— IA gpt-5.6-terra · US$0.02 · 2 herramientas", txt)
+        self.assertLessEqual(len(lineas), 9)
+
+    def test_prompt_pide_formato_corto_y_usar_en_vivo(self):
+        txt = agente.instrucciones()
+        self.assertIn("Formato corto", txt)
+        self.assertIn("la emisora no está transmitiendo", txt)
+        desc = {t["name"]: t for t in herramientas.TOOLS}
+        self.assertIn("en_vivo", desc["probar_origen"]["description"])
+        self.assertIn("2 o 3", desc["reportar"]["parameters"]["properties"]["evidencia"]["description"])
 
 
 if __name__ == "__main__":

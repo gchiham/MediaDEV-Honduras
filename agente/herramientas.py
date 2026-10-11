@@ -40,8 +40,9 @@ TOOLS = [
         {"sid": SID, "segmentos": {"type": "integer", "description": "1-5"}}),
     _fn("probar_origen", "Prueba la URL de origen (y la de respaldo si hay) desde mediaCAP por la misma "
         "ruta que la captura (socks5 o directo): código HTTP, TLS, throughput de UN segmento y su volumen "
-        "(audio_origen: distingue origen mudo de pipeline nuestro). Los orígenes de cupo limitado o "
-        "cliente único se omiten solos.", {"sid": SID}),
+        "(audio_origen: distingue origen mudo de pipeline nuestro). Para orígenes que son una página "
+        "(Dailymotion, kick, mdstrm) trae en_vivo: si vivo=false la emisora NO está transmitiendo. "
+        "Los orígenes de cupo limitado o cliente único se omiten solos.", {"sid": SID}),
     _fn("estado_uploader", "Uploader de video TV: estado del servicio, horas de audio abiertas por canal con "
         "tamaño de las últimas horas (archivos, MB, archivo más grande), archivos sueltos > 50 MB, "
         "bandeja de salida y últimas 40 líneas de log.", {}),
@@ -57,13 +58,16 @@ TOOLS = [
     _fn("reportar", "Termina la investigación con el diagnóstico. Es la ÚNICA salida que ve el operador.",
         {"severidad": {"type": "string", "enum": ["critica", "alta", "media", "info"]},
          "estaciones": {"type": "array", "items": {"type": "string"}},
-         "titulo": {"type": "string", "description": "una línea, p. ej. 'teleceiba no graba desde 06:11 HN'"},
-         "causa_probable": {"type": "string"},
+         "titulo": {"type": "string",
+                    "description": "una línea de hasta 80 caracteres, p. ej. 'teleceiba no graba desde 06:11 HN'"},
+         "causa_probable": {"type": "string", "description": "UNA frase, hasta 200 caracteres"},
          "confianza": {"type": "string", "enum": ["alta", "media", "baja"]},
          "evidencia": {"type": "array", "items": {"type": "string"},
-                       "description": "hechos observados con las herramientas, 2-6 viñetas"},
+                       "description": "2 o 3 hechos DECISIVOS observados con las herramientas, una línea "
+                                      "corta cada uno (hasta 120 caracteres); sin repetir la causa"},
          "accion_sugerida": {"type": "string",
-                             "description": "qué debería hacer el operador; 'ninguna' si no hay nada de nuestro lado"},
+                             "description": "1 o 2 frases concretas. Si no hay nada de nuestro lado, decirlo "
+                                            "(p. ej. 'Nada de nuestro lado; el vigía avisará cuando vuelva')"},
          "lado": {"type": "string", "enum": ["origen", "captura_mediacap", "gateway_red", "uploader_s3",
                                              "base_datos", "sin_problema", "desconocido"]}}),
 ]

@@ -29,6 +29,14 @@ El operador lee tu reporte en Telegram, muchas veces desde el teléfono y de mad
    baja en TODAS las estaciones en la misma hora = restart del daemon, no caída.
 8. Horarios: el backend está en UTC; al operador muéstrale hora de Honduras (UTC−6, sin DST).
 9. Escribe en español neutro, frases cortas, sin jerga innecesaria.
+10. **Formato corto: se lee en el teléfono.** Título de una línea; causa en UNA frase; 2 o 3
+    evidencias, solo las decisivas (las que distinguen esta causa de las otras), sin repetir la
+    causa; acción en 1 o 2 frases concretas. El detalle completo queda en la auditoría.
+11. **¿La emisora está transmitiendo?** Para orígenes que son una página (Dailymotion, kick,
+    mdstrm), `probar_origen` trae `en_vivo`. Si `vivo` es false y el resto del nodo está sano, la
+    causa es que **la emisora no está transmitiendo**: dilo así, `lado: origen`, confianza alta, y
+    en la acción "Nada de nuestro lado; el vigía avisará cuando vuelva". No pidas al operador que
+    revise el player: eso ya lo hiciste.
 
 # Resumen diario
 

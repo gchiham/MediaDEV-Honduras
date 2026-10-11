@@ -287,15 +287,31 @@ def investigar(cliente, backend, inc: dict, presupuesto: Presupuesto, auditar,
 ICONO = {"critica": "🔴", "alta": "🔴", "media": "🟠", "info": "🔵"}
 
 
+LADO = {"origen": "problema del origen", "captura_mediacap": "problema de la captura",
+        "gateway_red": "problema del gateway o la red", "uploader_s3": "problema del uploader",
+        "base_datos": "problema de la base de datos", "sin_problema": "sin problema",
+        "desconocido": "causa no confirmada"}
+MAX_EVIDENCIA = 3
+
+
+def _corto(texto, n: int) -> str:
+    texto = " ".join(str(texto or "").split())
+    return texto if len(texto) <= n else texto[:n - 1].rstrip() + "…"
+
+
 def formatear(res: dict) -> str:
+    """Mensaje corto para leer en el teléfono; el reporte completo queda en la auditoría."""
     r = res["reporte"]
-    lineas = [f"{ICONO.get(r.get('severidad'), '⚪')} {r.get('titulo', '(sin título)')}",
-              f"Causa probable: {r.get('causa_probable')} (confianza {r.get('confianza')}; lado: {r.get('lado')})",
-              "Evidencia:"]
-    lineas += [f" • {e}" for e in r.get("evidencia", [])]
-    lineas.append(f"Acción sugerida: {r.get('accion_sugerida')}")
+    evid = r.get("evidencia") or []
+    lineas = [f"{ICONO.get(r.get('severidad'), '⚪')} {_corto(r.get('titulo') or '(sin título)', 90)}",
+              f"{_corto(r.get('causa_probable'), 240)}",
+              f"({LADO.get(r.get('lado'), r.get('lado'))}; confianza {r.get('confianza')})"]
+    lineas += [f"• {_corto(e, 160)}" for e in evid[:MAX_EVIDENCIA]]
+    if len(evid) > MAX_EVIDENCIA:
+        lineas.append(f"• (+{len(evid) - MAX_EVIDENCIA} en la auditoría)")
+    lineas.append(f"👉 {_corto(r.get('accion_sugerida'), 300)}")
     usd = f"US${res['usd']:.2f}" if res.get("usd") is not None else f"{res['uso']['entrada'] + res['uso']['salida']:,} tokens"
-    lineas.append(f"— agente: {usd} · {len(res['llamadas'])} herramientas · {res['turnos']} turnos · {res.get('modelo', MODELO)}")
+    lineas.append(f"— IA {res.get('modelo', MODELO)} · {usd} · {len(res['llamadas'])} herramientas")
     return "\n".join(lineas)
 
 
