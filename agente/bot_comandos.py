@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """bot_comandos — comandos de Telegram del vigía (corre en mediaAPP como servicio).
 
-/estado  /stats  /ultimos  /pausa [horas]  /reanudar  /ia_off  /ia_on  /ayuda
-Además: botones 👍/👎 bajo cada diagnóstico de la IA, y responder a un diagnóstico con un texto
-lo guarda como comentario (sirve de memoria al agente y para medir su acierto).
+/estado  /stats  /ultimos  /silenciar [estación]  /reactivar <estación>  /pausa [horas]  /reanudar
+/ia_off  /ia_on  /ayuda
+Además: botones 👍/👎 bajo cada diagnóstico de la IA (responder a un diagnóstico con un texto lo
+guarda como comentario) y botón 🔕 bajo cada alerta de estación (= /silenciar <estación>).
 
 Reglas:
 - Solo obedece al chat TELEGRAM_CHAT_ID; a cualquier otro lo ignora sin responder.
-- Solo puede APAGAR: pausar alertas (máx. 24 h) o detener la IA. /ia_on no enciende nada que el
-  servidor tenga apagado (VIGIA_AGENTE=1 sigue mandando).
+- Solo puede APAGAR: pausar alertas (máx. 24 h), silenciar los recordatorios de una estación hasta
+  que vuelva, o detener la IA. /ia_on no enciende nada que el servidor tenga apagado
+  (VIGIA_AGENTE=1 sigue mandando). Silenciar nunca oculta la recuperación ni una caída nueva.
 - Ignora comandos viejos (al arrancar y los de más de 10 min): una /pausa de ayer no se aplica hoy.
 """
 import json, os, re, sys, time
@@ -17,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import comun
 import diagnosticos
+import vigia
 from comun import (COLA_DIR, ESTADO_DIR, ahora_hn, en_pausa, escribir_json, hora_hn, ia_detenida,
                    leer_control, leer_json, telegram, telegram_api)
 
@@ -28,15 +31,16 @@ VUELTA_ATRASADA_S = 15 * 60            # sin vuelta del vigía en 15 min = algo 
 MENU = [("estado", "Alertas activas y última vuelta del vigía"),
         ("stats", "Vueltas, alertas y uso de IA de hoy"),
         ("ultimos", "Últimos diagnósticos de la IA y su calificación"),
+        ("silenciar", "No recordar una estación hasta que vuelva: /silenciar canal_10"),
+        ("reactivar", "Volver a recordar una estación silenciada: /reactivar canal_10"),
         ("pausa", "Pausar alertas N horas (1 por defecto, máx. 24)"),
         ("reanudar", "Quitar la pausa de alertas"),
         ("ia_off", "Detener la IA (interruptor de emergencia)"),
         ("ia_on", "Volver a permitir la IA (si el servidor la tiene habilitada)"),
         ("ayuda", "Lista de comandos")]
 
-NOMBRE = {"sin_grabar": "no graba", "ffmpeg_duplicado": "ffmpeg duplicado", "silencio": "MUDO",
-          "carga": "carga alta", "disco": "disco", "servicio_caido": "servicio caído",
-          "mediacap_inalcanzable": "mediaCAP no responde", "db_inalcanzable": "DB no responde"}
+SID_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+MOTIVO = {"operador": "silenciada por ti", "ia": "la IA dijo que no hay nada que hacer"}
 
 
 # ── textos ───────────────────────────────────────────────────────────────────
@@ -47,13 +51,23 @@ def estado_ia() -> str:
     return "detenida desde Telegram" if ia_detenida() else "activa"
 
 
-def lineas_activas(estado: dict) -> list[str]:
+def lineas_activas(estado: dict, ahora: float | None = None) -> list[str]:
     activas = estado.get("activas", {})
     if not activas:
         return ["Sin alertas activas."]
-    return [f"Alertas activas ({len(activas)}):"] + [
-        f"• {a.get('sid') or k.split(':')[-1]} — {NOMBRE.get(a.get('tipo'), a.get('tipo'))} "
-        f"desde {hora_hn(a['desde'])}" for k, a in sorted(activas.items())]
+    ahora = ahora or time.time()
+    control = leer_control()
+    lineas = [f"Alertas activas ({len(activas)}):"]
+    for k, a in sorted(activas.items()):
+        motivo = diagnosticos.silencio(a.get("sid"), a["desde"], control)
+        lineas.append(f"• {a.get('sid') or k.split(':')[-1]} — {vigia.NOMBRE.get(a.get('tipo'), a.get('tipo'))} "
+                      f"desde {vigia.cuando(a['desde'], ahora)}" + (f" 🔕 ({MOTIVO[motivo]})" if motivo else ""))
+    return lineas
+
+
+def activas_de(sid: str) -> list[dict]:
+    return [a for a in leer_json(ESTADO_DIR / "estado.json", {}).get("activas", {}).values()
+            if a.get("sid") == sid]
 
 
 def cmd_estado(ahora: float) -> str:
@@ -72,7 +86,7 @@ def cmd_estado(ahora: float) -> str:
             lineas.append(f"Disco: {u['disco'].get('usado_pct')} % · load1 {u.get('carga')}")
     else:
         lineas.append("Todavía no hay vueltas registradas.")
-    lineas += lineas_activas(e)
+    lineas += lineas_activas(e, ahora)
     pausa = en_pausa(ahora)
     lineas.append(f"⏸ Alertas en pausa hasta las {hora_hn(pausa)} HN" if pausa else "🔔 Alertas activas")
     lineas.append(f"IA: {estado_ia()}")
@@ -159,7 +173,7 @@ def cmd_reanudar(ahora: float) -> str:
         return "No había pausa: las alertas ya estaban activas."
     guardar_control({"pausa_hasta": None}, ahora, "reanudar")
     e = leer_json(ESTADO_DIR / "estado.json", {})
-    return "\n".join(["🔔 Alertas reanudadas."] + lineas_activas(e))
+    return "\n".join(["🔔 Alertas reanudadas."] + lineas_activas(e, ahora))
 
 
 def cmd_ia(encender: bool, ahora: float) -> str:
@@ -172,6 +186,42 @@ def cmd_ia(encender: bool, ahora: float) -> str:
                 "puede apagar, no encender: hay que habilitarla en el servidor.")
     guardar_control({"ia_detenida": False}, ahora, "ia_on")
     return "✅ IA permitida otra vez (con los mismos topes de gasto)."
+
+
+def silenciar(sid: str, ahora: float) -> str:
+    if not SID_RE.match(sid or ""):
+        return "Uso: /silenciar canal_10"
+    if not activas_de(sid):
+        return f"{sid} no tiene alertas activas: no hay nada que silenciar."
+    c = leer_control()
+    guardar_control({"silenciadas": {**(c.get("silenciadas") or {}), sid: ahora}}, ahora, f"silenciar {sid}")
+    return (f"🔕 {sid}: no te la vuelvo a recordar. Te aviso cuando vuelva a la normalidad, o si "
+            f"después vuelve a fallar.\n/reactivar {sid} para deshacerlo.")
+
+
+def cmd_silenciar(args: list[str], ahora: float) -> str:
+    if args:
+        return silenciar(args[0].lower(), ahora)
+    e = leer_json(ESTADO_DIR / "estado.json", {})
+    control = leer_control()
+    calladas = sorted({a["sid"] for a in e.get("activas", {}).values()
+                       if a.get("sid") and diagnosticos.silencio(a["sid"], a["desde"], control)})
+    lineas = ["Uso: /silenciar <estación> — deja de recordarla hasta que vuelva."]
+    lineas.append(f"Silenciadas ahora: {', '.join(calladas)}" if calladas else "Ninguna estación silenciada.")
+    return "\n".join(lineas)
+
+
+def cmd_reactivar(args: list[str], ahora: float) -> str:
+    sid = (args[0].lower() if args else "")
+    if not SID_RE.match(sid):
+        return "Uso: /reactivar canal_10"
+    c = leer_control()
+    silenciadas = {k: v for k, v in (c.get("silenciadas") or {}).items() if k != sid}
+    guardar_control({"silenciadas": silenciadas, "reactivadas": {**(c.get("reactivadas") or {}), sid: ahora}},
+                    ahora, f"reactivar {sid}")
+    if not activas_de(sid):
+        return f"🔔 {sid} reactivada (ahora no tiene alertas activas)."
+    return f"🔔 {sid}: te la vuelvo a recordar cada 2 h mientras siga fallando."
 
 
 def cmd_ultimos(ahora: float, n: int = 5) -> str:
@@ -206,6 +256,10 @@ def responder(texto: str, ahora: float) -> str | None:
         return cmd_stats(ahora)
     if cmd in ("ultimos", "últimos"):
         return cmd_ultimos(ahora)
+    if cmd in ("silenciar", "silencio", "mute"):
+        return cmd_silenciar(args, ahora)
+    if cmd in ("reactivar", "unmute"):
+        return cmd_reactivar(args, ahora)
     if cmd in ("pausa", "stop"):
         return cmd_pausa(args, ahora)
     if cmd in ("reanudar", "seguir"):
@@ -227,14 +281,20 @@ def autorizado(msg: dict) -> bool:
 
 
 def atender_boton(cq: dict, ahora: float) -> None:
-    """👍/👎 bajo un diagnóstico: guarda la calificación, confirma y deja marcado el botón elegido."""
+    """👍/👎 bajo un diagnóstico: guarda la calificación, confirma y deja marcado el botón elegido.
+    🔕 bajo una alerta: silencia esa estación hasta que vuelva."""
     msg = cq.get("message") or {}
     if not autorizado(msg):
         print("ignorado: botón de un chat no autorizado")
         return
     partes = (cq.get("data") or "").split(":")
     respuesta = "No reconozco ese botón."
-    if len(partes) == 3 and partes[0] == "fb" and partes[2] in ("ok", "mal"):
+    if len(partes) == 2 and partes[0] == "sil" and SID_RE.match(partes[1]):
+        texto = silenciar(partes[1], ahora)
+        respuesta = texto.split("\n")[0][:190]
+        if texto.startswith("🔕"):
+            telegram(texto, responder_a=msg.get("message_id"))
+    elif len(partes) == 3 and partes[0] == "fb" and partes[2] in ("ok", "mal"):
         if diagnosticos.calificar(partes[1], ahora, calificacion=partes[2]):
             elegido = "👍 acertó" if partes[2] == "ok" else "👎 falló"
             respuesta = "Anotado 👍" if partes[2] == "ok" else \

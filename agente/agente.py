@@ -313,6 +313,8 @@ def formatear(res: dict) -> str:
     if len(evid) > MAX_EVIDENCIA:
         lineas.append(f"• (+{len(evid) - MAX_EVIDENCIA} en la auditoría)")
     lineas.append(f"👉 {_corto(r.get('accion_sugerida'), 300)}")
+    if diagnosticos.nada_que_hacer(r) and res.get("tipo") in ("incidente", "revision"):
+        lineas.append("🔕 No te lo vuelvo a recordar; te aviso cuando vuelva.")
     usd = f"US${res['usd']:.2f}" if res.get("usd") is not None else f"{res['uso']['entrada'] + res['uso']['salida']:,} tokens"
     lineas.append(f"— IA {res.get('modelo', MODELO)} · {usd} · {len(res['llamadas'])} herramientas")
     return "\n".join(lineas)
@@ -352,12 +354,20 @@ def procesar_cola() -> None:
             else:
                 try:
                     cliente = cliente or cliente_openai()
-                    es_incidente = inc.get("tipo") == "incidente"
+                    es_incidente = inc.get("tipo") in ("incidente", "revision")
                     mem = diagnosticos.memoria(diagnosticos.claves_de(inc), inc.get("creado") or time.time()) \
                         if es_incidente else []
                     res = investigar(cliente, backend, inc, Presupuesto(), Auditoria(f.stem), memoria=mem)
-                    msg = telegram(formatear(res), responder_a=inc.get("msg_id"),
-                                   teclado=diagnosticos.teclado(f.stem) if es_incidente else None)
+                    res["tipo"] = inc.get("tipo")
+                    msg = None
+                    if inc.get("tipo") == "revision" and diagnosticos.nada_que_hacer(res["reporte"]):
+                        print(f"revisión {f.stem}: sigue igual, no se avisa")       # silenciosa
+                    else:
+                        texto = formatear(res)
+                        if inc.get("tipo") == "revision":
+                            texto = f"🔔 Cambió lo de {', '.join(diagnosticos.claves_de(inc))}:\n{texto}"
+                        msg = telegram(texto, responder_a=inc.get("msg_id"),
+                                       teclado=diagnosticos.teclado(f.stem) if es_incidente else None)
                     diagnosticos.guardar(f.stem, inc, res, msg, time.time())
                 except GastoNoMedido as e:
                     destino = "fallidos"
@@ -408,6 +418,8 @@ def evaluar_reporte(r: dict, esp: dict) -> dict:
     fallas = []
     if esp.get("lado") and r.get("lado") not in ([esp["lado"]] if isinstance(esp["lado"], str) else esp["lado"]):
         fallas.append(f"lado {r.get('lado')} ≠ {esp['lado']}")
+    if "nada_que_hacer" in esp and diagnosticos.nada_que_hacer(r) != esp["nada_que_hacer"]:
+        fallas.append(f"nada_que_hacer {r.get('nada_que_hacer')} ≠ {esp['nada_que_hacer']}")
     for grupo in esp.get("menciona_alguno", []):
         if not any(p.lower() in texto for p in grupo):
             fallas.append(f"no menciona ninguno de {grupo}")

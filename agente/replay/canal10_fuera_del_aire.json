@@ -340,6 +340,7 @@
    "borrar grabaciones",
    "revisar el player",
    "revise el player"
-  ]
+  ],
+  "nada_que_hacer": true
  }
 }

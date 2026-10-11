@@ -325,6 +325,7 @@
    "etapa c",
    "borrar las grabaciones",
    "borrar grabaciones"
-  ]
+  ],
+  "nada_que_hacer": false
  }
 }

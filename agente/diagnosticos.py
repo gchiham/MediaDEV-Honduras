@@ -6,6 +6,12 @@ Dos archivos, un escritor cada uno (el agente y el bot corren en procesos distin
 
 El agente recibe como memoria los últimos diagnósticos de las mismas estaciones, con la
 calificación del operador, para reconocer repeticiones y no insistir en lo que se marcó 👎.
+
+Silencio de recordatorios ("hasta que vuelva"): una alerta activa deja de recordarse cada 2 h si
+- el operador la silenció (/silenciar o botón 🔕; control.json, lo escribe el bot), o
+- el último diagnóstico de la IA para esa estación, posterior al inicio de la alerta, dice que no
+  hay nada que hacer de nuestro lado (nada_que_hacer + lado origen).
+Vale solo para la caída en curso: si la estación vuelve y cae de nuevo, la alerta nueva avisa.
 """
 import re
 import comun
@@ -36,10 +42,41 @@ def guardar(id_: str, inc: dict, res: dict, msg_id: int | None, ahora: float) ->
     todos[id_] = {"ts": ahora, "claves": claves_de(inc), "tipo": inc.get("tipo"), "msg_id": msg_id,
                   "titulo": r.get("titulo"), "causa": r.get("causa_probable"), "lado": r.get("lado"),
                   "confianza": r.get("confianza"), "accion": r.get("accion_sugerida"),
+                  "nada_que_hacer": nada_que_hacer(r),
                   "modelo": res.get("modelo"), "usd": res.get("usd")}
     for viejo in sorted(todos)[:-MAX_DIAGNOSTICOS]:
         todos.pop(viejo)
     escribir_json(_diag_path(), todos)
+
+
+def nada_que_hacer(r: dict) -> bool:
+    """El reporte dice que la falla es del origen y que de nuestro lado no hay nada que hacer."""
+    return r.get("nada_que_hacer") is True and r.get("lado") in ("origen", "sin_problema")
+
+
+def ultimo_de(sid: str, desde: float) -> tuple[str, dict] | None:
+    """Último diagnóstico de esa estación hecho desde 'desde' (id, diagnóstico)."""
+    mejor = None
+    for i, d in leer_json(_diag_path(), {}).items():
+        if sid in d.get("claves", []) and d.get("ts", 0) >= desde and (mejor is None or d["ts"] > mejor[1]["ts"]):
+            mejor = (i, d)
+    return mejor
+
+
+def silencio(sid: str | None, desde: float, control: dict | None = None) -> str | None:
+    """Por qué no se recuerda la alerta de esa estación que empezó en 'desde': 'operador', 'ia' o None."""
+    if not sid:
+        return None
+    control = comun.leer_control() if control is None else control
+    marca = (control.get("silenciadas") or {}).get(sid)
+    if isinstance(marca, (int, float)) and marca >= desde:
+        return "operador"
+    ultimo = ultimo_de(sid, desde)
+    reactivada = (control.get("reactivadas") or {}).get(sid)
+    if ultimo and ultimo[1].get("nada_que_hacer") and not (
+            isinstance(reactivada, (int, float)) and reactivada >= ultimo[1]["ts"]):
+        return "ia"
+    return None
 
 
 def calificaciones() -> dict:

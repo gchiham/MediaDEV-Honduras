@@ -54,7 +54,22 @@ mediaCAP: mediacap-vigia-vista.timer (root) → vista.json saneada (sin credenci
 | `/pausa [h]` (o `/stop`) | Pausa las alertas 1–24 h (1 por defecto). El vigía sigue evaluando; el resumen diario sale igual y avisa la pausa |
 | `/reanudar` | Quita la pausa y muestra lo activo |
 | `/ia_off` · `/ia_on` | Interruptor de emergencia de la IA. `/ia_on` no enciende nada que el servidor tenga apagado (`VIGIA_AGENTE=1` sigue mandando) |
+| `/silenciar <estación>` (o botón 🔕 bajo la alerta) | No recordar esa estación cada 2 h hasta que vuelva. Sin argumento lista las silenciadas |
+| `/reactivar <estación>` | Deshace el silencio (también el que puso la IA) |
+| `/ultimos` | Últimos diagnósticos de la IA con su 👍/👎 |
 | `/ayuda` | Lista de comandos (también aparecen en el menú del bot) |
+
+### Silenciar "hasta que vuelva"
+
+Una alerta activa se recuerda cada 2 h, salvo que esté silenciada:
+- por el operador (`/silenciar` o el botón 🔕), o
+- por la IA: su último diagnóstico de esa estación dice `nada_que_hacer` (origen caído o emisora
+  sin transmitir, nada que hacer de nuestro lado). El diagnóstico lo dice con "🔕 No te lo vuelvo a recordar".
+
+El silencio vale solo para la caída en curso: **la recuperación siempre se avisa**, y si la estación
+vuelve y cae otra vez es una alerta nueva. Las silenciadas por la IA se revisan con IA cada 6 h
+(`tipo: revision`): si sigue igual no llega nada; si la causa cambió, llega "🔔 Cambió lo de…".
+Los mensajes del vigía van en lenguaje claro; el detalle técnico (m3u8, ffmpeg, CB) solo lo recibe la IA.
 
 Solo obedece al chat `TELEGRAM_CHAT_ID`; otros chats se ignoran sin respuesta. Al arrancar
 descarta lo pendiente y nunca ejecuta comandos de más de 10 minutos. El control vive en

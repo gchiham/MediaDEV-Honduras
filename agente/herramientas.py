@@ -69,7 +69,13 @@ TOOLS = [
                              "description": "1 o 2 frases concretas. Si no hay nada de nuestro lado, decirlo "
                                             "(p. ej. 'Nada de nuestro lado; el vigía avisará cuando vuelva')"},
          "lado": {"type": "string", "enum": ["origen", "captura_mediacap", "gateway_red", "uploader_s3",
-                                             "base_datos", "sin_problema", "desconocido"]}}),
+                                             "base_datos", "sin_problema", "desconocido"]},
+         "nada_que_hacer": {"type": "boolean",
+                            "description": "true SOLO si confirmaste que la falla es del origen y el operador "
+                                           "no puede hacer nada (p. ej. la emisora no está transmitiendo). "
+                                           "Con true el vigía deja de recordar la alerta hasta que la estación "
+                                           "vuelva. false si hay algo que revisar o cambiar (una URL nueva en "
+                                           "capture_config, el gateway, mediaCAP) o si no estás seguro."}}),
 ]
 NOMBRES = {t["name"] for t in TOOLS}
 
