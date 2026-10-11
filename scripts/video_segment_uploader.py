@@ -89,6 +89,12 @@ def _seg_real_duration(path: Path) -> float:
     Los segmentos HLS de origen rara vez duran EXACTAMENTE 4s (keyframe-aligned,
     +-0.5s tipico); usar el nominal fijo para construir el manifiesto de tiempo
     real reintroduce el mismo error que este manifiesto existe para eliminar."""
+    d = _probe_duration(path)
+    return float(SEGMENT_DUR) if d is None else d
+
+
+def _probe_duration(path: Path) -> float | None:
+    """ffprobe format=duration; None si falla (no se inventa un valor)."""
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
@@ -96,7 +102,17 @@ def _seg_real_duration(path: Path) -> float:
         )
         return float(r.stdout.strip())
     except Exception:
-        return float(SEGMENT_DUR)
+        return None
+
+
+def _cached_duration(path: Path) -> float:
+    """Duración guardada al extraer (<epoch>.dur, mismo ffprobe); si falta o es ilegible,
+    ffprobe ahora. Así el armado de la hora no lanza ~900 ffprobe seguidos (~3 min con la
+    vuelta del uploader detenida). El .dur no entra al concat: el glob toma solo *.ts."""
+    try:
+        return float(path.with_suffix(".dur").read_text())
+    except (OSError, ValueError):
+        return _seg_real_duration(path)
 
 
 def _audio_s3_key(stream_id: str, h_epoch: int) -> str:
@@ -464,7 +480,7 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
             epoch_start = int(p.stem)
         except ValueError:
             epoch_start = None
-        dur = _seg_real_duration(p)
+        dur = _cached_duration(p)
         manifest.append({"cum_start": round(cum, 3), "epoch_start": epoch_start, "duration": round(dur, 3)})
         cum += dur
     _coverage_upsert_audio(
@@ -688,6 +704,11 @@ def extract_audio(stream_id: str, seg: Path, epoch: int) -> bool:
     if ok:
         os.replace(tmp, out)
         _extract_fails.pop(str(seg), None)
+        dur = _probe_duration(out)                  # se mide ahora, repartido en la hora
+        if dur is not None:
+            dtmp = out.with_name(f"{out.stem}.dur.tmp")
+            dtmp.write_text(f"{dur:.6f}")
+            os.replace(dtmp, out.with_suffix(".dur"))
         return True
     tmp.unlink(missing_ok=True)
     _extract_fails[str(seg)] = _extract_fails.get(str(seg), 0) + 1

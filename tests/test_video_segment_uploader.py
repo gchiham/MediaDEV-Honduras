@@ -6,6 +6,7 @@ S3 es un cliente falso que se puede "caer"; ffmpeg (extracción y armado de la h
 reemplazado por stubs; el reloj es controlado. Escala: "1 GB" = 1 MB.
 """
 import importlib.util
+import json
 import os
 import shutil
 import sys
@@ -37,6 +38,9 @@ class FakeS3:
         if not self.up:
             raise Exception("InvalidAccessKeyId: account suspended")
         self.objects[key] = os.path.getsize(path)
+        if key.endswith(".manifest.json"):
+            self.manifests = getattr(self, "manifests", {})
+            self.manifests[key] = Path(path).read_text()
 
     def head_object(self, Bucket, Key):
         self.calls += 1
@@ -63,7 +67,7 @@ class Base(unittest.TestCase):
         p = mock.patch.multiple(
             vsu, STREAMS_ROOT=self.root, AUDIO_DIR=self.audio, INVALID_DIR=t / "streams" / "_invalid",
             GB=GB, VIDEO_VALIDATE_FFPROBE=False, TV_SHED_MODE="observe",
-            _now=lambda: self.clock[0], _ffmpeg_extract=self._extract,
+            _now=lambda: self.clock[0], _ffmpeg_extract=self._extract, _probe_duration=lambda p: 3.96,
             flush_audio_hour=self._flush, _coverage_table_exists=lambda: False,
             _db_register=lambda *a, **k: None, _pg_write=lambda *a, **k: None,
             _s3_down_until=0.0, _s3_backoff=vsu.S3_BACKOFF_MIN, _loop_n=0, _last_marker_gc=0.0)
@@ -275,6 +279,35 @@ class Garantias(Base):
         self.assertTrue(any(sid == "tnh" for sid, _ in self.flush_calls))
         self.assertTrue(all(vsu._flushed_marker("tnh", h).exists() for _, h in self.flush_calls))
 
+    def test_extraccion_guarda_la_duracion(self):
+        segs = self.series("canal_5", 20, oldest_min=60)
+        self.loop(["canal_5"])
+        a = self.audio_of("canal_5", segs[0])
+        self.assertEqual(a.with_suffix(".dur").read_text(), "3.960000")
+        self.assertFalse(list(a.parent.glob("*.tmp")))
+
+    def test_sin_dur_o_dur_corrupto_vuelve_a_ffprobe(self):
+        d = Path(self._tmp.name) / "x"
+        d.mkdir()
+        a, b, c = d / "1.ts", d / "2.ts", d / "3.ts"
+        for f in (a, b, c):
+            f.write_bytes(b"x")
+        a.with_suffix(".dur").write_text("4.012")
+        c.with_suffix(".dur").write_text("basura")
+        with mock.patch.object(vsu, "_seg_real_duration", return_value=9.9) as probe:
+            self.assertEqual(vsu._cached_duration(a), 4.012)
+            self.assertEqual(vsu._cached_duration(b), 9.9)
+            self.assertEqual(vsu._cached_duration(c), 9.9)
+        self.assertEqual(probe.call_count, 2)
+
+    def test_dur_no_entra_al_concat_ni_cuenta_como_audio(self):
+        segs = self.series("canal_5", 20, oldest_min=60)
+        self.loop(["canal_5"])
+        hdir = self.audio_of("canal_5", segs[0]).parent
+        tomados = sorted(q for q in hdir.glob("*.ts") if q.stem.isdigit())
+        self.assertTrue(tomados)
+        self.assertTrue(all(q.suffix == ".ts" for q in tomados))
+
     def test_modo_off_no_evalua_emergencia(self):
         vsu.TV_SHED_MODE = "off"
         segs = self.series("canal_5", 60, oldest_min=120)
@@ -290,7 +323,8 @@ class IntegracionFfmpegReal(Base):
 
     def setUp(self):
         super().setUp()
-        self._p = mock.patch.multiple(vsu, _ffmpeg_extract=_REAL_EXTRACT, flush_audio_hour=_REAL_FLUSH)
+        self._p = mock.patch.multiple(vsu, _ffmpeg_extract=_REAL_EXTRACT, flush_audio_hour=_REAL_FLUSH,
+                                      _probe_duration=_REAL_PROBE)
         self._p.start()
         self.addCleanup(self._p.stop)
 
@@ -307,8 +341,20 @@ class IntegracionFfmpegReal(Base):
         h = HOUR0 - 3600
         for i, p in enumerate(segs):                       # toda la hora anterior, 1 cada 4 s
             os.utime(p, (h + 600 + i * 4, h + 600 + i * 4))
+        self.loop(["canal_11"])                       # S3 caído: solo extrae (y mide)
+        hdir = vsu.AUDIO_DIR / "canal_11" / vsu._hour_label(h)
+        audios = sorted(q for q in hdir.glob("*.ts") if q.stem.isdigit())
+        esperado = [round(_REAL_PROBE(q), 3) for q in audios]      # lo que medía v1 en el flush
+        self.assertEqual([round(float(q.with_suffix(".dur").read_text()), 3) for q in audios], esperado)
         self.s3.up = True
-        self.loop(["canal_11"])
+        self.clock[0] += 3600
+        probes = []
+        real_srd = vsu._seg_real_duration
+        with mock.patch.object(vsu, "_seg_real_duration", lambda p: probes.append(p) or real_srd(p)):
+            self.loop(["canal_11"])
+        self.assertEqual(probes, [])                  # el flush no lanzó ffprobe: usó los .dur
+        man = json.loads(self.s3.manifests[vsu._manifest_s3_key("canal_11", h)])
+        self.assertEqual([e["duration"] for e in man], esperado)  # manifest idéntico al de v1
         key = vsu._audio_s3_key("canal_11", h)
         self.assertIn(key, self.s3.objects)
         self.assertGreater(self.s3.objects[key], 10_000)
@@ -318,6 +364,7 @@ class IntegracionFfmpegReal(Base):
 
 
 _REAL_EXTRACT = vsu._ffmpeg_extract
+_REAL_PROBE = vsu._probe_duration
 _REAL_FLUSH = vsu.flush_audio_hour
 
 if __name__ == "__main__":
