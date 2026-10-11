@@ -932,6 +932,7 @@ class _TelegramFalso:
     def __init__(self, usuario="mediadev_vigia_bot"):
         import http.server, threading, urllib.parse
         self.pedidos = []
+        self.updates = []                                 # mensajes entrantes para getUpdates
         padre = self
 
         class H(http.server.BaseHTTPRequestHandler):
@@ -940,12 +941,25 @@ class _TelegramFalso:
                 datos = dict(urllib.parse.parse_qsl(self.rfile.read(n).decode())) if n else {}
                 metodo = self.path.rsplit("/", 1)[-1]
                 padre.pedidos.append((metodo, datos))
-                res = {"id": 111, "username": usuario} if metodo == "getMe" else {"message_id": len(padre.pedidos)}
+                if metodo == "getMe":
+                    res = {"id": 111, "username": usuario}
+                elif metodo == "getUpdates":
+                    desde = int(datos.get("offset", 0))
+                    res = [u for u in padre.updates if u["update_id"] >= desde]
+                    if not res:
+                        time.sleep(0.2)                   # imita la espera larga sin trabar la prueba
+                elif metodo == "setMyCommands":
+                    res = True
+                else:
+                    res = {"message_id": len(padre.pedidos)}
                 cuerpo = json.dumps({"ok": True, "result": res}).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(cuerpo)
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(cuerpo)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass                                  # el cliente se fue (la prueba lo terminó)
 
             do_GET = do_POST
 
@@ -1073,6 +1087,189 @@ class Fase1Linux(unittest.TestCase):
                         capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("agente apagado", r.stdout)
+
+
+# ── bot de comandos (/estado /stats /pausa /reanudar /ia_off /ia_on) ─────────
+
+import bot_comandos as bot
+
+
+class BotComandos(unittest.TestCase):
+    T = 1_791_720_000.0                                                    # 2026-10-11 ~10:00 HN
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        p = mock.patch.dict(os.environ, {"TELEGRAM_CHAT_ID": "42", "VIGIA_AGENTE": "", "VIGIA_SIMULAR": "",
+                                         "DATABASE_URL_RO": "", "AGENTE_TOPE_USD_DIA": "3",
+                                         "AGENTE_TOPE_USD_MES": "40"})
+        p.start()
+        self.addCleanup(p.stop)
+        for mod, nombre, valor in ((bot, "ESTADO_DIR", self.tmp), (bot, "COLA_DIR", self.tmp / "cola"),
+                                   (bot, "OFFSET", self.tmp / "bot_offset.json"),
+                                   (comun, "CONTROL", self.tmp / "control.json"),
+                                   (vigia, "ESTADO_DIR", self.tmp), (vigia, "COLA_DIR", self.tmp / "cola")):
+            q = mock.patch.object(mod, nombre, valor)
+            q.start()
+            self.addCleanup(q.stop)
+        self.enviados = []
+        q = mock.patch.object(bot, "telegram", side_effect=lambda t, responder_a=None: self.enviados.append(t))
+        q.start()
+        self.addCleanup(q.stop)
+
+    def msg(self, texto, chat=42, edad=5, uid=1):
+        return {"update_id": uid, "message": {"message_id": uid, "date": int(self.T - edad),
+                                              "chat": {"id": chat, "type": "private"}, "text": texto}}
+
+    def test_solo_obedece_al_chat_configurado(self):
+        self.assertEqual(bot.procesar([self.msg("/pausa 5", chat=999), self.msg("/ia_off", chat=-100, uid=2)],
+                                      self.T), 3)
+        self.assertEqual(self.enviados, [])
+        self.assertFalse((self.tmp / "control.json").exists())
+
+    def test_comandos_viejos_no_se_ejecutan(self):
+        bot.procesar([self.msg("/pausa 5", edad=3600)], self.T)
+        self.assertEqual(self.enviados, [])
+        self.assertIsNone(comun.en_pausa(self.T))
+
+    def test_pausa_y_reanudar(self):
+        bot.procesar([self.msg("/pausa 2")], self.T)
+        self.assertIn("en pausa hasta", self.enviados[-1])
+        self.assertEqual(comun.en_pausa(self.T + 60), self.T + 7200)
+        self.assertIsNone(comun.en_pausa(self.T + 7201))                    # vence sola
+        bot.procesar([self.msg("/reanudar", uid=2)], self.T + 60)
+        self.assertIn("reanudadas", self.enviados[-1])
+        self.assertIsNone(comun.en_pausa(self.T + 120))
+
+    def test_pausa_acotada(self):
+        for arg in ("0", "25", "abc", "-1", "999", "1.5"):
+            self.assertIn("Uso:", bot.cmd_pausa([arg], self.T), arg)
+        self.assertIn("1 h", bot.cmd_pausa([], self.T))
+        self.assertIn("24 h", bot.cmd_pausa(["24h"], self.T))
+        self.assertIn("en pausa", bot.responder("/stop@mediadev_vigia_bot 3", self.T))
+
+    def test_vigia_respeta_la_pausa(self):
+        bot.cmd_pausa(["1"], self.T)
+        envios = []
+        with mock.patch.object(vigia, "ssh_mediacap", return_value=foto(edad=900)), \
+                mock.patch.object(vigia, "telegram", side_effect=lambda t, responder_a=None: envios.append(t)):
+            vigia.vuelta(self.T + 10)
+            vigia.vuelta(self.T + 310)
+        self.assertEqual(envios, [])                                       # en pausa: no avisa
+        e = comun.leer_json(self.tmp / "estado.json", {})
+        self.assertIn("sin_grabar:radio_america", e["activas"])             # pero sí evalúa
+        self.assertEqual(e["stats"][comun.ahora_hn(self.T).strftime("%Y-%m-%d")]["suprimidas"], 1)
+        self.assertIn("en pausa", vigia.latido(foto(), None, e, self.T + 400))
+
+    def test_ia_off_gana_aunque_el_servidor_la_permita(self):
+        with mock.patch.dict(os.environ, {"VIGIA_AGENTE": "1"}):
+            self.assertTrue(vigia.agente_habilitado())
+            bot.procesar([self.msg("/ia_off")], self.T)
+            self.assertFalse(vigia.agente_habilitado())
+            with mock.patch.object(agente, "cliente_openai", side_effect=AssertionError("no debe llamar")), \
+                    mock.patch("builtins.print"):
+                agente.procesar_cola()
+            bot.procesar([self.msg("/ia_on", uid=2)], self.T)
+            self.assertTrue(vigia.agente_habilitado())
+
+    def test_ia_on_no_enciende_lo_que_el_servidor_apaga(self):
+        r = bot.cmd_ia(True, self.T)
+        self.assertIn("solo se puede apagar", r)
+        self.assertFalse((self.tmp / "control.json").exists())
+        self.assertFalse(vigia.agente_habilitado())
+
+    def test_stats_del_dia(self):
+        dia = comun.ahora_hn(self.T).strftime("%Y-%m-%d")
+        comun.escribir_json(self.tmp / "estado.json", {"stats": {
+            dia: {"vueltas": 120, "mensajes": 3, "alertas_nuevas": 2, "recuperadas": 1, "errores": 1},
+            "2026-10-10": {"vueltas": 288, "mensajes": 5}}})
+        ms = int(self.T * 1000)
+        for destino, n in (("hechos", 4), ("omitidos", 1), ("fallidos", 1)):
+            for i in range(n):
+                comun.escribir_json(self.tmp / "cola" / destino / f"{ms - i * 1000}.json", {})
+        comun.escribir_json(self.tmp / "cola" / "hechos" / f"{ms - 86_400_000}.json", {})   # ayer: no cuenta
+        comun.escribir_json(self.tmp / "gasto" / f"{dia}.json", {"usd": 0.4321, "llamadas": 17})
+        comun.escribir_json(self.tmp / "gasto" / f"{dia[:7]}-01.json", {"usd": 2.0})
+        txt = bot.responder("/stats", self.T)
+        self.assertIn("120 vueltas", txt)
+        self.assertIn("3 mensajes (2 nuevas, 1 recuperadas)", txt)
+        self.assertIn("IA: 6 investigaciones (4 completas, 1 omitidas por tope, 1 fallidas)", txt)
+        self.assertIn("17 llamadas", txt)
+        self.assertIn("US$0.43 hoy", txt)
+        self.assertIn("US$2.43 este mes", txt)
+        self.assertIn("2026-10-10: 288 / 5 / 1", txt)
+
+    def test_estado_avisa_si_el_vigia_no_corre(self):
+        comun.escribir_json(self.tmp / "estado.json", {"ultima_vuelta": {"ts": self.T - 3600, "grabando": 18,
+                                                                          "total": 19}})
+        txt = bot.responder("/estado", self.T)
+        self.assertIn("grabando 18 de 19", txt)
+        self.assertIn("no corre desde hace 60 min", txt)
+        self.assertIn("IA: apagada en la config", txt)
+
+    def test_vigia_guarda_ultima_vuelta_y_stats(self):
+        with mock.patch.object(vigia, "ssh_mediacap", return_value=foto()), \
+                mock.patch.object(vigia, "telegram", return_value=None):
+            vigia.vuelta(self.T)
+        e = comun.leer_json(self.tmp / "estado.json", {})
+        self.assertEqual((e["ultima_vuelta"]["grabando"], e["ultima_vuelta"]["total"]), (1, 1))
+        self.assertEqual(list(e["stats"].values())[0]["vueltas"], 1)
+
+    def test_stats_guarda_solo_siete_dias(self):
+        e = {}
+        for d in range(10):
+            vigia.contar(e, self.T + d * 86400, vueltas=1)
+        self.assertEqual(len(e["stats"]), 7)
+
+    def test_texto_libre_y_comando_desconocido(self):
+        self.assertIsNone(bot.responder("hola", self.T))
+        self.assertIn("No conozco /borrar", bot.responder("/borrar todo", self.T))
+        self.assertIn("/pausa", bot.responder("/start", self.T))
+
+    def test_al_arrancar_descarta_lo_pendiente(self):
+        with mock.patch.object(bot, "telegram_api", return_value=[{"update_id": 77}]) as api:
+            self.assertEqual(bot.descartar_pendientes(), 78)
+        self.assertEqual(api.call_args[0][1]["offset"], "-1")
+
+    def test_unidad_del_bot_endurecida(self):
+        unidad = (AGENTE_DIR / "systemd" / "mediadev-vigia-bot.service").read_text(encoding="utf-8")
+        for linea in ("User=mediadev-vigia", "NoNewPrivileges=yes", "ProtectSystem=strict",
+                      "ReadWritePaths=/var/lib/mediadev-vigia", "MemoryMax=96M", "Restart=always"):
+            self.assertIn(linea, unidad)
+
+
+@unittest.skipUnless(ES_ROOT, "integración: necesita Linux como root")
+class BotLinux(unittest.TestCase):
+    """bot_comandos.py como proceso real contra un Telegram falso con updates encolados."""
+
+    def test_bucle_real(self):
+        import subprocess as sp
+        tmp = Path(tempfile.mkdtemp())
+        tg = _TelegramFalso()
+        self.addCleanup(tg.cerrar)
+        ahora = int(time.time())
+        tg.updates = [
+            {"update_id": 10, "message": {"message_id": 1, "date": ahora, "chat": {"id": 42}, "text": "/pausa 2"}},
+            {"update_id": 11, "message": {"message_id": 2, "date": ahora, "chat": {"id": 7}, "text": "/ia_off"}},
+            {"update_id": 12, "message": {"message_id": 3, "date": ahora, "chat": {"id": 42}, "text": "/stats"}}]
+        comun.escribir_json(tmp / "bot_offset.json", {"offset": 10})
+        env = {"PATH": "/usr/bin:/bin", "VIGIA_ESTADO_DIR": str(tmp), "TELEGRAM_API_BASE": tg.base,
+               "TELEGRAM_BOT_TOKEN": "111:token-de-prueba", "TELEGRAM_CHAT_ID": "42"}
+        p = sp.Popen([sys.executable, str(AGENTE_DIR / "bot_comandos.py")], env=env, stdout=sp.PIPE, stderr=sp.PIPE,
+                     text=True)
+        limite = time.time() + 20
+        while time.time() < limite and len(tg.textos()) < 2:
+            time.sleep(0.2)
+        p.terminate()
+        p.wait(10)
+        textos = tg.textos()
+        self.assertEqual(len(textos), 2, textos)                           # el chat 7 no recibe nada
+        self.assertIn("en pausa", textos[0])
+        self.assertIn("📊 Hoy", textos[1])
+        control = comun.leer_json(tmp / "control.json", {})
+        self.assertGreater(control["pausa_hasta"], ahora)
+        self.assertNotIn("ia_detenida", control)
+        self.assertEqual(comun.leer_json(tmp / "bot_offset.json", {})["offset"], 13)
+        self.assertIn("setMyCommands", [m for m, _ in tg.pedidos])
 
 
 if __name__ == "__main__":
