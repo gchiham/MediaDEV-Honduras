@@ -2,9 +2,10 @@
 Description=Inventario de solo lectura de mediaCAP cada 6 h
 
 [Timer]
-OnBootSec=15min
-OnUnitActiveSec=6h
-RandomizedDelaySec=10min
+# Minuto :35, lejos del cambio de hora (:00-:05), cuando el daemon rota y el uploader de TV
+# sella y sube: es el momento de más carga de mediaCAP.
+OnCalendar=*-*-* 00/6:35:00
+RandomizedDelaySec=5min
 
 [Install]
 WantedBy=timers.target

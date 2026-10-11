@@ -13,7 +13,7 @@ for intento in "id" "rm -rf /var/www/streams" "systemctl restart stream-daemon" 
   [ "$("${SSH[@]}" "$intento" 2>/dev/null | sha256sum)" = "$ref" ] \
     && echo "OK    '$intento' -> solo inventario" || { echo "FALLA '$intento' devolvió otra cosa"; fallas=$((fallas+1)); }
 done
-"${SSH[@]}" -t true 2>&1 | grep -qi "pty" && echo "OK    sin TTY" || echo "AVISO revisar TTY a mano"
+"${SSH[@]}" -tt 2>&1 >/dev/null | grep -q "PTY allocation request failed"   && echo "OK    sin TTY" || { echo "FALLA asigna TTY"; fallas=$((fallas+1)); }
 timeout 15 "${SSH[@]}" -N -L 15432:127.0.0.1:5432 -o ExitOnForwardFailure=yes 2>/dev/null \
   && { echo "FALLA permite port forwarding"; fallas=$((fallas+1)); } || echo "OK    sin port forwarding"
 echo ls | timeout 15 sftp -i "$LLAVE" -b - auditor@10.136.0.7 >/dev/null 2>&1 \

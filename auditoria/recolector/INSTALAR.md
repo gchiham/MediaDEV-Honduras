@@ -14,7 +14,7 @@ mediaCAP (root, timer cada 6 h)                         mediaAPP
 | Garantía | Cómo se impone (técnico, no por prompt) |
 |---|---|
 | El recolector no modifica el servidor | `ProtectSystem=strict` + un solo `ReadWritePaths`; `git --no-optional-locks` |
-| No compite con la captura | `Nice=19`, `IOSchedulingClass=idle`, `CPUQuota=20%`, `MemoryMax=200M` (prueba en seco: 3.8 s) |
+| No compite con la captura | `Nice=19`, `IOSchedulingClass=idle`, `CPUQuota=20%`, `MemoryMax=200M`; corre a las :35 cada 6 h, lejos del cierre horario (1.4 s de CPU) |
 | El auditor no ejecuta nada | `ForceCommand /bin/cat …` en sshd **y** `command=` en la llave; también anula sftp/scp |
 | Sin túneles ni shell | `restrict` en la llave + `PermitTTY/AllowTcpForwarding/... no` en sshd |
 | Solo desde mediaAPP | `from="10.136.0.6"` en la llave |
