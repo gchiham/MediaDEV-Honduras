@@ -1,6 +1,6 @@
 # Scripts — CLAUDE.md
 
-> Verificado contra `/opt/media-ai/scripts/` desplegado (9-oct-2026).
+> Verificado contra `/opt/media-ai/scripts/` desplegado (9-oct-2026, incluye la etapa A de las 20:25 HN).
 
 **La captura no vive aquí.** Los ffmpeg los lanza `daemon/stream_daemon.py` (ver
 `daemon/CLAUDE.md`) con la config de `capture_config` en PG. Supervisor sigue activo pero sin
@@ -9,7 +9,8 @@ programas.
 ## Qué corre y cómo
 | Script | Cómo corre | Qué hace |
 |---|---|---|
-| `video_segment_uploader.py` | servicio `video-segment-uploader` | TV: sube `seg_*.ts` a `video_segments/<sid>/YYYY/MM/DD/<epoch_ini>_<epoch_fin>.ts` y los borra del disco. Además arma el audio horario de TV |
+| `video_segment_uploader.py` (v2) | servicio `video-segment-uploader` + drop-in `tv-shed.conf` | TV: extrae audio, arma la hora de audio, sube `seg_*.ts` a `video_segments/<sid>/YYYY/MM/DD/<epoch_ini>_<epoch_fin>.ts` y los borra del disco. Único dueño de los TV pendientes |
+| `segment_janitor.py` | `mediadev-segment-janitor.timer` (cada 10 min), `JANITOR_MODE=observe` | Radio: borra segmentos > 8 h (en `observe` solo registra). TV: no borra, solo mide margen de disco y backlog y alerta por Telegram |
 | `ffmpeg_reaper.py` | `mediadev-ffmpeg-reaper.timer` (cada 5 min) | Si hay más de 1 ffmpeg escribiendo a `/var/www/streams/<sid>/`, deja el más nuevo |
 | `mediadev_logs.py` | servicio `mediadev-logs` | Journal y logs → CloudWatch Logs (claves en `/etc/mediadev-cw.env`) |
 | `mediadev_metrics.py` | servicio `mediadev-metrics` | Métricas de host/procesos → CloudWatch (`MediaDEV`) |
@@ -21,7 +22,17 @@ programas.
 
 Con AWS suspendida (desde el 6-oct), `mediadev-logs` y `mediadev-metrics` fallan con `InvalidClientTokenId`.
 
-## video_segment_uploader.py — detalles que importan
+## video_segment_uploader.py (v2, etapa A) — detalles que importan
+Cada vuelta (15 s): (1) extrae el audio de todos los canales, sin depender de S3; (2) cierra
+1 hora de audio terminada si S3 responde; (3) sube video round-robin, 40/canal, 1 intento sin
+sleep, y ante un fallo el breaker pausa todas las subidas 60 → 600 s; (4) evalúa el descarte
+por disco (`TV_SHED_MODE`: hoy `observe`, solo registra `WOULD SHED`).
+- Un video se sube o descarta solo si su audio está a salvo (extraído, hora cerrada, o 3 fallos
+  de extracción = irrecuperable).
+- Hora cerrada → marcador `_tv_audio/<sid>/.flushed/<hora>` (`uploaded|skipped|invalid|already_in_s3`).
+  No se rearma una hora con marcador, y no se sobrescribe en S3 una hora que ya está con un archivo
+  igual o mayor (≥ 90 % del local).
+- Rollback a v1 y chequeo previo: `mediadev-infra/mediacap/runbooks/2026-10-09-etapa-a/`.
 - **La lista de canales TV la lee de `config/stations.json`** (`type=tv` y `enabled`), no de
   `capture_config`. Al dar de alta o baja un canal TV hay que correr `sync_streams.py --apply`; el uploader
   relee `stations.json` en cada ciclo, así que no hace falta reiniciarlo. Si no se corre el sync, el daemon captura el canal y nadie sube el video.
@@ -48,7 +59,7 @@ sudo /opt/media-ai/scripts/gateway_switch.sh <gateway_id>   # hn01 | hn02 | hn03
 El failover normal lo decide `health_engine` (repo `destroyer`, `cap/gateway/engine/`). No
 editar `gateway.conf` a mano. Gateway activo hoy: `hn03` (RPi-Levi, `10.101.0.6`).
 
-## Cron de root (no está en este repo)
+## Cron de root (no está en este repo; sigue activo en la etapa A, se reemplaza en B/C)
 ```
 */30 * * * * find /var/www/streams/ -maxdepth 2 -name "seg_*.ts" -not -path "*/hch_tv/*" \
              -not -path "*/teleceiba/*" -not -path "*/canal_11/*" -mmin +120 -delete

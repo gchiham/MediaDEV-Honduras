@@ -40,18 +40,15 @@ PG_USER = os.environ.get("PG_USER", "destroyer")
 PG_PASS = os.environ.get("PG_PASS", "")
 PIPELINE_VERSION = os.environ.get("PIPELINE_VERSION", "utc_v2")
 
+_LOG_FILE = os.environ.get("UPLOADER_LOG", "/var/log/streams/video_uploader.log")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("/var/log/streams/video_uploader.log"),
-    ]
+    handlers=[logging.StreamHandler()]
+    + ([logging.FileHandler(_LOG_FILE)] if os.path.isdir(os.path.dirname(_LOG_FILE)) else []),
 )
 log = logging.getLogger("video-uploader")
 
-# Per-stream audio accumulation state: {stream_id: {hour_epoch, segs_dir}}
-_audio_state: dict = {}
 _schema_cols: dict[str, set[str]] = {}
 _video_coverage: dict = {}
 
@@ -394,10 +391,12 @@ def validate_audio_file(mp3_path: Path) -> tuple[bool, float | None, str | None]
         return True, duration, f"partial_{int(duration)}s"
     return True, duration, None
 
-def upload_file_verified(s3_client, local_path: Path, key: str, content_type: str) -> tuple[bool, str | None]:
+def upload_file_verified(s3_client, local_path: Path, key: str, content_type: str,
+                         attempts: int | None = None) -> tuple[bool, str | None]:
     size = local_path.stat().st_size
     last_error = None
-    for attempt in range(1, S3_UPLOAD_RETRIES + 1):
+    attempts = attempts or S3_UPLOAD_RETRIES
+    for attempt in range(1, attempts + 1):
         try:
             s3_client.upload_file(str(local_path), S3_BUCKET, key,
                                   ExtraArgs={"ContentType": content_type})
@@ -407,7 +406,8 @@ def upload_file_verified(s3_client, local_path: Path, key: str, content_type: st
             return True, None
         except Exception as e:
             last_error = str(e)
-            time.sleep(min(2 ** attempt, 15))
+            if attempt < attempts:          # antes dormía también tras el último intento
+                time.sleep(min(2 ** attempt, 15))
     return False, last_error
 
 def concat_file_line(path: Path) -> str:
@@ -423,8 +423,10 @@ def parse_hour_label(label: str) -> int | None:
             continue
     return None
 
-def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path) -> None:
-    """Concatena mini-segs de audio acumulados, sube TS raw a S3 para que Destroyer encode."""
+def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path) -> str:
+    """Concatena mini-segs de audio acumulados, sube TS raw a S3 para que Destroyer encode.
+    Devuelve 'uploaded' | 'skipped' (pocos segs, dir borrado) | 'invalid' (dir conservado) |
+    'upload_failed' (dir conservado, se reintenta)."""
     # Solo segmentos legitimos: se llaman {epoch:010d}.ts. Excluye explicitamente el
     # <hora>.ts de salida, que se escribe en este mismo dir: si un flush previo murio
     # antes del rmtree, incluirlo aqui realimenta el concat y el archivo crece sin fin
@@ -442,7 +444,7 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
             reason=f"insufficient_segments_{len(segs)}",
         )
         shutil.rmtree(segs_dir, ignore_errors=True)
-        return
+        return "skipped"
 
     ts_path    = segs_dir / f"{h_label}.ts"
     concat_txt = segs_dir / "list.txt"
@@ -487,7 +489,7 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
             reason="ffmpeg_failed",
             last_error=r.stderr[-300:],
         )
-        return
+        return "invalid"
 
     # Guarda de cordura: con -c copy la salida debe pesar aproximadamente lo mismo que la
     # suma de sus entradas. Un desborde grosero significa que el concat se realimento (el
@@ -509,7 +511,7 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
             reason="concat_runaway",
             last_error=f"ratio={ratio:.1f}x entrada={entrada} salida={salida}",
         )
-        return
+        return "invalid"
 
     key = _audio_s3_key(stream_id, hour_epoch)
     hour_start_utc = datetime.fromtimestamp(hour_epoch, tz=timezone.utc)
@@ -529,7 +531,7 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
             upload_attempts=S3_UPLOAD_RETRIES,
             last_error=err,
         )
-        return
+        return "upload_failed"
 
     log.info(f"[{stream_id}] {h_label}.ts → s3://{S3_BUCKET}/{key}  ({len(segs)} segs, {size//1024//1024}MB raw)")
     try:
@@ -553,53 +555,7 @@ def flush_audio_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path)
         upload_attempts=1,
     )
     shutil.rmtree(segs_dir, ignore_errors=True)
-
-def recover_stale_audio_dirs(s3_client, tv_streams: list[str]) -> None:
-    current_hour = int(datetime.now(timezone.utc).timestamp()) // 3600 * 3600
-    for stream_id in tv_streams:
-        root = AUDIO_DIR / stream_id
-        if not root.exists():
-            continue
-        for hour_dir in sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.name):
-            hour_epoch = parse_hour_label(hour_dir.name)
-            if hour_epoch is None or hour_epoch >= current_hour:
-                continue
-            flush_audio_hour(s3_client, stream_id, hour_epoch, hour_dir)
-
-
-def save_audio_seg(s3_client, stream_id: str, seg_path: Path, epoch_start: int) -> bool:
-    """Extrae audio del segmento de video y lo acumula en el directorio de la hora actual."""
-    hour_epoch = (epoch_start // 3600) * 3600
-    state      = _audio_state.get(stream_id, {})
-
-    # Si cambió la hora, flush de la hora anterior
-    if state.get("hour_epoch") is not None and state["hour_epoch"] != hour_epoch:
-        flush_audio_hour(s3_client, stream_id, state["hour_epoch"], state["segs_dir"])
-        state = {}
-
-    # Inicializar estado para la hora actual
-    if state.get("hour_epoch") != hour_epoch:
-        h_label  = _hour_label(hour_epoch)
-        new_dir  = AUDIO_DIR / stream_id / h_label
-        new_dir.mkdir(parents=True, exist_ok=True)
-        state    = {"hour_epoch": hour_epoch, "segs_dir": new_dir}
-        _audio_state[stream_id] = state
-
-    # Extraer audio como TS audio-only (AAC copy, rápido sin re-encode)
-    audio_out = state["segs_dir"] / f"{epoch_start:010d}.ts"
-    if audio_out.exists():
-        return True
-
-    result = subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error",
-         "-i", str(seg_path), "-vn", "-c:a", "copy", str(audio_out)],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0 or not audio_out.exists():
-        log.warning(f"[{stream_id}] audio extract error {seg_path.name}: {(result.stderr or '')[-200:]}")
-        return False
-    return True
-
+    return "uploaded"
 
 # ── Video upload ──────────────────────────────────────────────────────────────
 
@@ -614,91 +570,370 @@ def quarantine_segment(seg_path: Path, stream_id: str) -> None:
     except Exception as e:
         log.warning(f"[{stream_id}] no se pudo mover segmento inválido {seg_path.name}: {e}")
 
-def upload_segment(s3_client, seg_path: Path, stream_id: str) -> bool:
-    mtime       = int(seg_path.stat().st_mtime)
-    epoch_start = mtime - SEGMENT_DUR
-    epoch_end   = mtime
-    key = s3_key(stream_id, epoch_start, epoch_end)
-    valid, duration, reason = validate_video_segment(seg_path)
-    size = seg_path.stat().st_size if seg_path.exists() else 0
+# ── v2 (oct 2026): bucle sin bloqueo entre canales ────────────────────────────
+# Antes (v1), cada segmento se procesaba "extraer audio -> subir (3 intentos con sleep) ->
+# borrar" y el canal se recorría entero antes de pasar al siguiente. Con S3 caído, el primer
+# canal con backlog acaparaba el bucle (~14 s por segmento) y los demás canales ni siquiera
+# extraían su audio. Ahora cada vuelta hace, en orden:
+#   1. extracción de audio de TODOS los canales (local, no depende de S3)
+#   2. flush de horas de audio completas (solo si S3 está disponible, con presupuesto)
+#   3. subida de video round-robin entre canales, 1 intento por segmento, sin sleep
+#   4. descarte de TV por emergencia de disco (TV_SHED_MODE: off | observe | enforce)
+# Un circuit breaker pausa TODAS las subidas tras un fallo (backoff 60 s -> 600 s); audio y
+# video quedan en disco y se suben al volver S3.
+GB = 1024 ** 3
+S3_BACKOFF_MIN = int(os.environ.get("S3_BACKOFF_MIN", "60"))
+S3_BACKOFF_MAX = int(os.environ.get("S3_BACKOFF_MAX", "600"))
+UPLOAD_MAX_PER_CHANNEL = int(os.environ.get("UPLOAD_MAX_PER_CHANNEL", "40"))   # por vuelta
+EXTRACT_MAX_PER_LOOP = int(os.environ.get("EXTRACT_MAX_PER_LOOP", "300"))      # por canal y vuelta
+FLUSH_MAX_PER_LOOP = int(os.environ.get("FLUSH_MAX_PER_LOOP", "1"))            # horas por vuelta: cada flush tarda ~2.5 min (ffprobe x900)
+AUDIO_FLUSH_GRACE = int(os.environ.get("AUDIO_FLUSH_GRACE", "120"))            # s tras el fin de la hora
+AUDIO_EXTRACT_MAX_FAILS = int(os.environ.get("AUDIO_EXTRACT_MAX_FAILS", "3"))
+FLUSHED_MARKER_KEEP_H = int(os.environ.get("FLUSHED_MARKER_KEEP_H", "48"))
+TV_SHED_MODE = os.environ.get("TV_SHED_MODE", "observe").strip().lower()      # off | observe | enforce
+EMERGENCY_FREE_GB = float(os.environ.get("EMERGENCY_FREE_GB", "15"))
+TARGET_FREE_GB = float(os.environ.get("TARGET_FREE_GB", "20"))
+TV_SHED_MIN_AGE_MIN = float(os.environ.get("TV_SHED_MIN_AGE_MIN", "30"))
+STALE_WRITER_S = int(os.environ.get("STALE_WRITER_S", "120"))   # segmento más nuevo sin cambios = canal detenido
 
+_s3_down_until = 0.0
+_s3_backoff = S3_BACKOFF_MIN
+_extract_fails: dict[str, int] = {}
+_loop_n = 0
+_last_marker_gc = 0.0
+
+
+def _now() -> float:
+    return time.time()
+
+
+def s3_available() -> bool:
+    return _now() >= _s3_down_until
+
+
+def s3_failed(err: str | None) -> None:
+    global _s3_down_until, _s3_backoff
+    _s3_down_until = _now() + _s3_backoff
+    log.warning(f"S3 no disponible ({(err or '')[:200]}); subidas en pausa {_s3_backoff}s "
+                "(audio y video siguen en disco)")
+    _s3_backoff = min(_s3_backoff * 2, S3_BACKOFF_MAX)
+
+
+def s3_ok() -> None:
+    global _s3_backoff
+    _s3_backoff = S3_BACKOFF_MIN
+
+
+def _seg_index(p: Path) -> int:
+    try:
+        return int(p.stem[4:])
+    except ValueError:
+        return -1
+
+
+def _seg_epoch(seg: Path) -> int | None:
+    try:
+        return int(seg.stat().st_mtime) - SEGMENT_DUR
+    except FileNotFoundError:
+        return None
+
+
+def _hour_of(epoch: int) -> int:
+    return (epoch // 3600) * 3600
+
+
+def _audio_seg_path(stream_id: str, epoch: int) -> Path:
+    return AUDIO_DIR / stream_id / _hour_label(_hour_of(epoch)) / f"{epoch:010d}.ts"
+
+
+def _flushed_marker(stream_id: str, hour_epoch: int) -> Path:
+    return AUDIO_DIR / stream_id / ".flushed" / _hour_label(hour_epoch)
+
+
+def _mark_flushed(stream_id: str, hour_epoch: int, status: str) -> None:
+    m = _flushed_marker(stream_id, hour_epoch)
+    m.parent.mkdir(parents=True, exist_ok=True)
+    m.write_text(status)
+
+
+def audio_safe(stream_id: str, seg: Path, epoch: int) -> bool:
+    """True si el audio de este segmento ya está a salvo (extraído localmente, o su hora ya se
+    cerró), o si no tiene audio recuperable (extracción falló AUDIO_EXTRACT_MAX_FAILS veces).
+    Solo un segmento audio_safe puede subirse-y-borrarse o descartarse."""
+    return (_audio_seg_path(stream_id, epoch).exists()
+            or _flushed_marker(stream_id, _hour_of(epoch)).exists()
+            or _extract_fails.get(str(seg), 0) >= AUDIO_EXTRACT_MAX_FAILS)
+
+
+def _ffmpeg_extract(src: Path, dst: Path) -> bool:
+    r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
+                        "-vn", "-c:a", "copy", "-f", "mpegts", str(dst)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        log.warning(f"audio extract error {src.name}: {(r.stderr or '')[-200:]}")
+    return r.returncode == 0
+
+
+def extract_audio(stream_id: str, seg: Path, epoch: int) -> bool:
+    """Extrae el audio del segmento a _tv_audio/<sid>/<hora>/<epoch>.ts. Idempotente y atómica
+    (escribe .part y renombra): un corte a mitad no deja un archivo que parezca completo."""
+    if _flushed_marker(stream_id, _hour_of(epoch)).exists():
+        return True
+    out = _audio_seg_path(stream_id, epoch)
+    if out.exists():
+        return True
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(f"{out.stem}.part.ts")      # stem no numérico: el flush lo ignora
+    ok = _ffmpeg_extract(seg, tmp) and tmp.exists() and tmp.stat().st_size > 0
+    if ok:
+        os.replace(tmp, out)
+        _extract_fails.pop(str(seg), None)
+        return True
+    tmp.unlink(missing_ok=True)
+    _extract_fails[str(seg)] = _extract_fails.get(str(seg), 0) + 1
+    return False
+
+
+def _s3_size(s3_client, key: str) -> int | None:
+    """Tamaño del objeto, None si no existe. Cualquier otro error se propaga."""
+    try:
+        return int(s3_client.head_object(Bucket=S3_BUCKET, Key=key).get("ContentLength", 0))
+    except Exception as e:
+        code = str(getattr(e, "response", {}).get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return None
+        raise
+
+
+def flush_hour(s3_client, stream_id: str, hour_epoch: int, segs_dir: Path) -> str:
+    """flush_audio_hour con dos guardas: no reescribe en S3 una hora que ya está con un
+    archivo igual o más grande (un dir re-creado tras un flush previo sería parcial), y
+    deja marcador para no volver a armar una hora ya cerrada."""
+    key = _audio_s3_key(stream_id, hour_epoch)
+    local = sum(q.stat().st_size for q in segs_dir.glob("*.ts") if q.stem.isdigit())
+    try:
+        remote = _s3_size(s3_client, key)
+    except Exception as e:
+        s3_failed(str(e))
+        return "upload_failed"
+    if remote is not None and local and remote >= 0.9 * local:
+        log.info(f"[{stream_id}] {segs_dir.name}: ya en S3 ({remote} B >= local {local} B); no se reescribe")
+        _mark_flushed(stream_id, hour_epoch, "already_in_s3")
+        shutil.rmtree(segs_dir, ignore_errors=True)
+        return "already_in_s3"
+    status = flush_audio_hour(s3_client, stream_id, hour_epoch, segs_dir) or "upload_failed"
+    if status == "upload_failed":
+        s3_failed(f"flush {stream_id} {segs_dir.name}")
+    else:
+        if status == "uploaded":
+            s3_ok()
+        _mark_flushed(stream_id, hour_epoch, status)   # 'invalid' conserva el dir para revisión
+    return status
+
+
+def flush_ready_hours(s3_client, stream_id: str, hold_hours: set, budget: int) -> int:
+    """Cierra horas de audio terminadas (fin + AUDIO_FLUSH_GRACE) cuyos segmentos ya se
+    extrajeron todos. Reemplaza a recover_stale_audio_dirs: reintenta solo, sin reiniciar."""
+    root = AUDIO_DIR / stream_id
+    if budget <= 0 or not root.is_dir():
+        return 0
+    done = 0
+    for d in sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")):
+        h = parse_hour_label(d.name)
+        if h is None or h in hold_hours or _now() < h + 3600 + AUDIO_FLUSH_GRACE:
+            continue
+        if _flushed_marker(stream_id, h).exists():
+            continue                                   # 'invalid': dir conservado a propósito
+        if done >= budget or not s3_available():
+            break
+        done += 1
+        if flush_hour(s3_client, stream_id, h, d) == "upload_failed":
+            break
+    return done
+
+
+def upload_segment(s3_client, seg_path: Path, stream_id: str) -> str:
+    """Un intento de subida. 'uploaded' | 'failed' | 'invalid' | 'no_audio' | 'gone'."""
+    try:
+        mtime = int(seg_path.stat().st_mtime)
+        epoch_start = mtime - SEGMENT_DUR
+        if not audio_safe(stream_id, seg_path, epoch_start):
+            return "no_audio"                     # nunca borrar video cuyo audio no está a salvo
+        key = s3_key(stream_id, epoch_start, mtime)
+        valid, duration, reason = validate_video_segment(seg_path)
+        size = seg_path.stat().st_size
+    except FileNotFoundError:
+        return "gone"
     if not valid:
         log.error(f"[{stream_id}] segmento inválido {seg_path.name}: {reason}")
-        _video_coverage_add(
-            stream_id, epoch_start, "invalid",
-            seconds=0, size_bytes=0, reason=reason, last_error=reason,
-        )
+        _video_coverage_add(stream_id, epoch_start, "invalid",
+                            seconds=0, size_bytes=0, reason=reason, last_error=reason)
         quarantine_segment(seg_path, stream_id)
-        return False
-
+        return "invalid"
     try:
-        # Extraer audio ANTES de borrar el .ts de video
-        save_audio_seg(s3_client, stream_id, seg_path, epoch_start)
-        ok, err = upload_file_verified(s3_client, seg_path, key, "video/mp2t")
-        if not ok:
-            raise RuntimeError(err or "upload failed")
-        _video_coverage_add(
-            stream_id, epoch_start, "uploaded",
-            seconds=duration or SEGMENT_DUR,
-            size_bytes=size,
-            upload_attempts=1,
-            reason=reason,
-        )
-        seg_path.unlink()
-        return True
-    except Exception as e:
-        log.error(f"[{stream_id}] Error subiendo {seg_path.name}: {e}")
-        _video_coverage_add(
-            stream_id, epoch_start, "upload_failed",
-            seconds=0,
-            size_bytes=0,
-            upload_attempts=S3_UPLOAD_RETRIES,
-            reason=reason,
-            last_error=str(e),
-        )
-        return False
+        ok, err = upload_file_verified(s3_client, seg_path, key, "video/mp2t", attempts=1)
+    except FileNotFoundError:
+        return "gone"
+    if not ok:
+        _video_coverage_add(stream_id, epoch_start, "upload_failed", seconds=0, size_bytes=0,
+                            upload_attempts=1, reason=reason, last_error=err)
+        s3_failed(err)
+        return "failed"
+    s3_ok()
+    _video_coverage_add(stream_id, epoch_start, "uploaded", seconds=duration or SEGMENT_DUR,
+                        size_bytes=size, upload_attempts=1, reason=reason)
+    seg_path.unlink(missing_ok=True)
+    return "uploaded"
 
-def process_stream(s3_client, stream_id: str):
-    stream_dir = STREAMS_ROOT / stream_id
-    if not stream_dir.exists():
-        return 0
 
-    segs = sorted(stream_dir.glob("seg_*.ts"), key=lambda f: f.name)
-    if len(segs) <= HLS_KEEP:
-        return 0
+def disk_free_bytes(path: Path) -> int:
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize
 
-    to_upload = segs[:-HLS_KEEP]
-    uploaded = 0
-    for seg in to_upload:
-        if upload_segment(s3_client, seg, stream_id):
-            uploaded += 1
 
-    _video_coverage_flush(stream_id)
-    if uploaded:
-        log.info(f"[{stream_id}] {uploaded} segmentos subidos")
-    return uploaded
+def shed_tv_segments(work: dict, free_fn=disk_free_bytes) -> dict:
+    """Emergencia de disco: descarta los segmentos TV más viejos de TODOS los canales hasta
+    TARGET_FREE_GB. Solo segmentos con audio a salvo, de más de TV_SHED_MIN_AGE_MIN, fuera de
+    los HLS_KEEP más nuevos. Lo hace el uploader (único dueño de los TV pendientes): no hay
+    otro proceso que los abra en paralelo, así que comprobar-y-borrar no compite."""
+    res = {"mode": TV_SHED_MODE, "emergency": False, "shed": [], "kept_no_audio": 0, "kept_young": 0}
+    if TV_SHED_MODE == "off":
+        return res
+    free = free_fn(STREAMS_ROOT)
+    res["free_gb"] = round(free / GB, 2)
+    if free >= EMERGENCY_FREE_GB * GB:
+        return res
+    res["emergency"] = True
+    now, cands = _now(), []
+    for sid, (eligible, _hold) in work.items():
+        for seg in eligible:
+            try:
+                st = seg.stat()
+            except FileNotFoundError:
+                continue
+            epoch = int(st.st_mtime) - SEGMENT_DUR
+            if now - st.st_mtime < TV_SHED_MIN_AGE_MIN * 60:
+                res["kept_young"] += 1
+            elif not audio_safe(sid, seg, epoch):
+                res["kept_no_audio"] += 1
+            else:
+                cands.append((st.st_mtime, sid, seg, st.st_size, epoch))
+    cands.sort(key=lambda c: c[0])
+    enforce = TV_SHED_MODE == "enforce"
+    for mtime, sid, seg, size, epoch in cands:
+        if free >= TARGET_FREE_GB * GB:
+            break
+        log.warning(f"{'SHED' if enforce else 'WOULD SHED'} tv {sid} {seg.name} size={size} "
+                    f"age={(now - mtime) / 60:.0f}min reason=disco<{EMERGENCY_FREE_GB:g}GB")
+        if enforce:
+            try:
+                seg.unlink()
+            except FileNotFoundError:
+                continue
+            _video_coverage_add(sid, epoch, "upload_failed", reason="shed_disk_emergency",
+                                last_error=f"descartado por disco < {EMERGENCY_FREE_GB:g} GB")
+        free += size
+        res["shed"].append(str(seg))
+    res["free_gb_after"] = round(free / GB, 2)
+    log.warning(f"emergencia de disco [{TV_SHED_MODE}]: {len(res['shed'])} segmentos "
+                f"{'descartados' if enforce else 'se descartarían'}; conservados sin audio="
+                f"{res['kept_no_audio']} jóvenes={res['kept_young']}; libre≈{res['free_gb_after']} GB")
+    return res
+
+
+def _gc_flushed_markers() -> None:
+    global _last_marker_gc
+    if _now() - _last_marker_gc < 3600:
+        return
+    _last_marker_gc = _now()
+    cutoff = _now() - FLUSHED_MARKER_KEEP_H * 3600   # por la hora que nombra, no por mtime
+    for m in AUDIO_DIR.glob("*/.flushed/*"):
+        h = parse_hour_label(m.name)
+        if h is not None and h < cutoff:
+            m.unlink(missing_ok=True)
+
+
+def run_once(s3_client, tv_streams: list[str], free_fn=disk_free_bytes) -> dict:
+    global _loop_n
+    _loop_n += 1
+    work: dict = {}
+    # 1) extracción de audio, todos los canales, sin depender de S3
+    for sid in tv_streams:
+        d = STREAMS_ROOT / sid
+        if not d.is_dir():
+            continue
+        segs = sorted(d.glob("seg_*.ts"), key=_seg_index)
+        # Subida: nunca los HLS_KEEP más nuevos (el playlist los sirve). Audio: se extrae de todos
+        # menos el que ffmpeg está escribiendo; si el canal está detenido, también ese. Si no, un
+        # canal que se cae justo después de una hora dejaría esa hora de audio retenida para siempre.
+        eligible = segs[:-HLS_KEEP] if len(segs) > HLS_KEEP else []
+        to_extract = segs[:-1]
+        if segs:
+            last_ep = _seg_epoch(segs[-1])
+            if last_ep is not None and _now() - (last_ep + SEGMENT_DUR) > STALE_WRITER_S:
+                to_extract = segs
+        hold, n = set(), 0
+        for seg in segs:
+            ep = _seg_epoch(seg)
+            if ep is None or audio_safe(sid, seg, ep):
+                continue
+            if seg in to_extract and n < EXTRACT_MAX_PER_LOOP:
+                n += 1
+                if extract_audio(sid, seg, ep) or audio_safe(sid, seg, ep):
+                    continue
+            hold.add(_hour_of(ep))                   # su hora sigue abierta hasta tener el audio
+        work[sid] = (eligible, hold)
+
+    sids = list(work)
+    if sids:                                         # rotación: ningún canal va siempre primero
+        k = _loop_n % len(sids)
+        sids = sids[k:] + sids[:k]
+
+    # 2) flush de horas de audio terminadas
+    flushed = 0
+    for sid in sids:
+        if flushed >= FLUSH_MAX_PER_LOOP or not s3_available():
+            break
+        flushed += flush_ready_hours(s3_client, sid, work[sid][1], FLUSH_MAX_PER_LOOP - flushed)
+
+    # 3) subida de video round-robin, 1 intento por segmento, corta al primer fallo
+    uploaded = {sid: 0 for sid in sids}
+    order = [(sid, work[sid][0][i]) for i in range(UPLOAD_MAX_PER_CHANNEL)
+             for sid in sids if i < len(work[sid][0])]
+    for sid, seg in order:
+        if not s3_available():
+            break
+        r = upload_segment(s3_client, seg, sid)
+        if r == "uploaded":
+            uploaded[sid] += 1
+        elif r == "failed":
+            break
+    for sid, n in uploaded.items():
+        if n:
+            log.info(f"[{sid}] {n} segmentos subidos")
+    _video_coverage_flush()
+
+    # 4) emergencia de disco
+    shed = shed_tv_segments(work, free_fn)
+    _gc_flushed_markers()
+    return {"uploaded": uploaded, "flushed": flushed, "shed": shed}
 
 
 def run():
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     INVALID_DIR.mkdir(parents=True, exist_ok=True)
     tv_streams = get_tv_streams()
-    log.info(f"Video uploader iniciado — TV streams: {tv_streams}")
+    log.info(f"Video uploader v2 iniciado — TV streams: {tv_streams} shed={TV_SHED_MODE}")
     s3_client = get_s3()
-    recover_stale_audio_dirs(s3_client, tv_streams)
-
     while True:
         refreshed = get_tv_streams()
         if refreshed and refreshed != tv_streams:
             tv_streams = refreshed
             log.info(f"TV streams actualizados: {tv_streams}")
-            recover_stale_audio_dirs(s3_client, tv_streams)
-        for stream_id in tv_streams:
-            try:
-                process_stream(s3_client, stream_id)
-            except Exception as e:
-                log.error(f"[{stream_id}] {e}")
-        _video_coverage_flush()
+        try:
+            run_once(s3_client, tv_streams)
+        except Exception as e:
+            log.error(f"vuelta del uploader falló: {e}")
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
