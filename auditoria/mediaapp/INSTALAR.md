@@ -5,8 +5,9 @@ Cada 6 h (00/6:50 UTC, 15 min después del recolector de mediaCAP) el usuario `a
 1. hace `git fetch` de sus 3 clones (`MediaDEV-Honduras` público por HTTPS; `destroyer` y
    `mediadev-infra` con **deploy keys de solo lectura**, una por repo);
 2. pide el inventario a mediaCAP (`ssh auditor@10.136.0.7`: solo puede recibir ese JSON);
-3. corre `auditoria/comparador.py` y deja `reportes/drift-<UTC>.{md,json}` y `reportes/ultimo.md`
-   (30 días de retención).
+3. corre `auditoria/comparador.py` y `reglas_mediacap.py` y deja `reportes/drift-<UTC>.{md,json}` y `reportes/ultimo.md`
+   (30 días de retención);
+4. corre `informe.py` (OpenAI + Telegram, solo si cambiaron los hallazgos): `reportes/informe.md`.
 
 ```
 /var/lib/mediacap-auditor/            auditor:auditor 750 (home del usuario, sin shell)
@@ -20,7 +21,8 @@ Cada 6 h (00/6:50 UTC, 15 min después del recolector de mediaCAP) el usuario `a
 
 El servicio corre como `auditor` con `ProtectSystem=strict` (solo escribe en
 `/var/lib/mediacap-auditor`), `NoNewPrivileges`, `Nice=10`, `CPUQuota=50%`, `MemoryMax=300M`.
-No comparte nada con media-app ni con el vigía. `rc=1` del comparador (hay CONFIRMED) no es falla.
+Lee `/etc/mediacap-auditor.env` (root 600) vía `EnvironmentFile`: el usuario no puede leer el archivo.
+No comparte nada con media-app ni con el vigía (el bot de Telegram es el mismo, con su token copiado). `rc=1` del comparador (hay CONFIRMED) no es falla.
 
 ```bash
 systemctl start mediacap-auditor-comparador.service        # corrida manual

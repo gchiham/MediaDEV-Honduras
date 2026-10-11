@@ -76,3 +76,22 @@ python auditoria/comparador.py --inventario inventario.json \
 
 Un archivo que difiere **solo** en valores redactados (el repo lleva placeholders) sale como
 FALSE_POSITIVE, no como drift. Las units de paquete (`/usr/lib/systemd`) no se comparan.
+
+## Informe con IA (OpenAI)
+
+`informe.py` toma los hallazgos del comparador y de las reglas, los interpreta con OpenAI y avisa
+por Telegram. Corre en mediaAPP al final de `correr_comparador.sh`; el último informe queda en
+`/var/lib/mediacap-auditor/reportes/informe.md`.
+
+- **Solo si cambió algo:** la huella es el conjunto (regla, ubicación, estado). Igual que la corrida
+  anterior → reutiliza el análisis: sin llamada, sin costo, sin mensaje.
+- **La IA opina, no decide:** sin herramientas, JSON con esquema estricto. Prioridad, interpretación,
+  acción y "posible falso positivo" se muestran aparte; el estado determinista nunca cambia. Ids
+  inventados se descartan.
+- **Datos, no instrucciones:** hallazgos redactados otra vez y enviados en `input`; `instructions` es
+  fija (con `informe_contexto.md`). Los FALSE_POSITIVE no viajan.
+- **Costo:** `AUDITOR_PRECIO_*` en `/etc/mediacap-auditor.env` (sin precios no llama); peor caso contra
+  `AUDITOR_TOPE_USD_LLAMADA` y `AUDITOR_BUDGET_USD` (mensual); gasto real en
+  `/var/lib/mediacap-auditor/informe/gasto.jsonl`. Primera corrida: 15 hallazgos, US$0.065.
+- **Telegram:** texto plano, una vez por cambio (nuevos/resueltos). Si la IA falla, el aviso sale igual
+  sin análisis y la IA se reintenta en silencio en la corrida siguiente.
