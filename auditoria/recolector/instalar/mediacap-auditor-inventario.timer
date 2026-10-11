@@ -1,0 +1,10 @@
+[Unit]
+Description=Inventario de solo lectura de mediaCAP cada 6 h
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=6h
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

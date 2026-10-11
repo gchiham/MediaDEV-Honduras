@@ -1,0 +1,2 @@
+# /etc/ssh/authorized_keys/auditor (root:root 644). Una sola línea; from = IP privada de mediaAPP.
+restrict,from="10.136.0.6",command="/bin/cat /var/lib/mediacap-auditor/inventario.json" ssh-ed25519 AAAA...REEMPLAZAR... mediacap-auditor

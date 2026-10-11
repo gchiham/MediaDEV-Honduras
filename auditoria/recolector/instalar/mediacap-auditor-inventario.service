@@ -1,0 +1,20 @@
+# mediaCAP: inventario de solo lectura para el auditor de código (corre en mediaAPP).
+# ProtectSystem=strict = el kernel deja TODO en solo lectura salvo ReadWritePaths: aunque el
+# script tuviera un bug, no puede modificar el servidor. Recursos acotados: no compite con ffmpeg.
+[Unit]
+Description=Inventario de solo lectura de mediaCAP para el auditor
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/bin/mediacap-auditor-inventario
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=20%
+MemoryMax=200M
+TimeoutStartSec=120
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ReadWritePaths=/var/lib/mediacap-auditor

@@ -48,3 +48,9 @@ python -m unittest tests.test_reglas_mediacap -v
 
 Regla nueva: una función `regla_x(arbol, archivo)` en `REGLAS_PY`, con una prueba que reproduzca
 el patrón del incidente y otra con la versión corregida.
+
+## Recolector (mediaCAP → mediaAPP)
+
+`recolector/` genera en mediaCAP un inventario de solo lectura de lo desplegado (git, hashes,
+units, cron, versiones, disco) que el auditor lee por SSH sin poder ejecutar nada. Diseño,
+garantías, instalación y rollback en [`recolector/INSTALAR.md`](recolector/INSTALAR.md).

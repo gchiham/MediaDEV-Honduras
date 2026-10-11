@@ -1,0 +1,9 @@
+# Permisos esperados en mediaCAP para el auditor. Formato: ruta  dueño  grupo  modo
+# Regla: nada de lo que define o ejecuta el auditor es escribible por el usuario auditor.
+/usr/local/bin/mediacap-auditor-inventario                  root  root     755
+/etc/ssh/authorized_keys                                    root  root     755
+/etc/ssh/authorized_keys/auditor                            root  root     644
+/var/lib/mediacap-auditor                                   root  auditor  750
+/var/lib/mediacap-auditor/inventario.json                   root  auditor  640
+/etc/systemd/system/mediacap-auditor-inventario.service     root  root     644
+/etc/systemd/system/mediacap-auditor-inventario.timer       root  root     644
