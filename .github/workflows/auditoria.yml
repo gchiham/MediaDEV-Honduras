@@ -89,7 +89,7 @@ jobs:
           curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${v}/gitleaks_${v}_linux_x64.tar.gz" \
             | tar -xz gitleaks
       - name: Árbol actual (bloquea)
-        run: ./gitleaks dir . --redact --no-banner
+        run: ./gitleaks dir . --redact --no-banner --verbose     # --verbose: archivo y línea (valor redactado)
       - name: Historial (informativo)
         if: always()
         run: |
