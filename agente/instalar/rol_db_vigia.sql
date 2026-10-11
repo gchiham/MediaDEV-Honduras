@@ -1,4 +1,11 @@
 -- Rol de SOLO LECTURA para el vigía (fase 1). Lo corre un administrador (doadmin) en destroyer_db.
+--
+-- HECHO el 11-oct-2026 sin doadmin (no está en los nodos), por una vía equivalente:
+--   1. usuario vigia_ro creado con la API de DigitalOcean (POST /v2/databases/<id>/users);
+--   2. GRANT SELECT de abajo, ejecutado como destroyer (dueño de las tres tablas);
+--   3. los ALTER ROLE ... SET, ejecutados por el propio vigia_ro (un rol puede fijar los suyos).
+--   Sin CONNECTION LIMIT (requiere CREATEROLE). Verificado: solo lectura, solo SELECT en 3 tablas.
+--   Registro: CHANGES.log de mediaAPP. Rollback: borrar el usuario en el panel/API de DO.
 -- La contraseña NO va en este archivo: generarla en el momento y guardarla solo en
 -- /etc/mediadev-agent.env de mediaAPP (DATABASE_URL_RO). Revisar antes de ejecutar.
 --
