@@ -1,0 +1,15 @@
+# mediaCAP: genera la vista saneada de la config de captura para el usuario vigia.
+# Unico proceso que lee el cache del daemon (con credenciales); escribe solo /var/lib/mediadev-vigia.
+[Unit]
+Description=Vista saneada de capture_config para el vigia (solo lectura del cache)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/bin/mediacap-vista
+Nice=19
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ReadWritePaths=/var/lib/mediadev-vigia

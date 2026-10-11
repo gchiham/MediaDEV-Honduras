@@ -1,0 +1,15 @@
+# Permisos esperados en mediaCAP para el agente vigía. Formato: ruta  dueño  grupo  modo
+# Regla: nada de lo que define o ejecuta el forced command es escribible por vigia.
+# verificar_mediacap.sh compara esto con la realidad (solo lectura).
+/usr/local/bin/mediacap-ro                  root  root   755
+/usr/local/bin/mediacap-vista               root  root   755
+/etc/ssh/authorized_keys                    root  root   755
+/etc/ssh/authorized_keys/vigia              root  root   644
+/etc/mediadev/stream_config.cache.json      root  root   640
+/etc/mediadev/vigia-bloqueados.txt          root  root   644
+/etc/mediadev/gateway.conf                  root  root   644
+/var/lib/mediadev-vigia                     root  vigia  750
+/var/lib/mediadev-vigia/vista.json          root  vigia  640
+/var/lib/mediacap-ro                        vigia vigia  700
+/etc/systemd/system/mediacap-vigia-vista.service  root root 644
+/etc/systemd/system/mediacap-vigia-vista.timer    root root 644

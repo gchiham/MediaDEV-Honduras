@@ -1,0 +1,284 @@
+{
+ "replay": true,
+ "aviso": "DATOS DE REPLAY: reconstruidos de las notas de un incidente real ya cerrado. No son salidas literales de las herramientas ni datos de producción. Solo para evaluar al agente.",
+ "incidente": {
+  "tipo": "incidente",
+  "creado": 1791635460,
+  "alertas": [
+   {
+    "tipo": "sin_grabar",
+    "sid": "radio_valle",
+    "detalle": "m3u8 de hace 140 s, 1 ffmpeg, CB CLOSED"
+   },
+   {
+    "tipo": "sin_grabar",
+    "sid": "super_100",
+    "detalle": "m3u8 de hace 133 s, 1 ffmpeg, CB CLOSED"
+   }
+  ],
+  "activas_previas": [],
+  "replay": true
+ },
+ "respuestas": {
+  "estado_general": {
+   "ts": 1791600000,
+   "carga": [
+    1.9,
+    2.1,
+    2.0
+   ],
+   "disco": {
+    "usado_pct": 41.2,
+    "libre_gb": 46.3
+   },
+   "servicios": {
+    "stream-daemon": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "video-segment-uploader": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "mediadev-gateway-api": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "mediadev-health-engine": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "mediadev-monitor": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "nginx": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "privoxy": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    },
+    "wg-quick@wg0": {
+     "activo": "active",
+     "sub": "running",
+     "reinicios": 0,
+     "desde": "Fri 2026-10-09 20:25:03 UTC"
+    }
+   },
+   "estaciones": {
+    "fm_941": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "radio_america": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "radio_choluteca": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "radio_el_patio": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "radio_satelite": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "suave_fm_teg": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "super_100": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "radio_valle": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "xy_hrn": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "xy_sps": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "xy_tgu": {
+     "tipo": "radio",
+     "habilitada": true,
+     "edad_m3u8_s": 3.1,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 33200
+    },
+    "canal_11": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    },
+    "canal_6": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    },
+    "canal_10": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    },
+    "hch_tv": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    },
+    "teleceiba": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    },
+    "tnh": {
+     "tipo": "tv",
+     "habilitada": true,
+     "edad_m3u8_s": 2.4,
+     "ffmpeg": 1,
+     "bytes_ultimo_seg": 1850000
+    }
+   }
+  },
+  "estado_estacion:radio_valle": {
+   "sid": "radio_valle",
+   "habilitada": true,
+   "config": {
+    "media_type": "radio",
+    "route": "socks5"
+   },
+   "edad_m3u8_s": 3.0,
+   "ultimos_segmentos_bytes": {
+    "seg_00011.ts": 33100,
+    "seg_00012.ts": 33400
+   },
+   "ffmpeg": [
+    {
+     "pid": 3,
+     "seg_corriendo": 410,
+     "cmd": "ffmpeg -i pipe:0 ..."
+    }
+   ],
+   "err_ultimas": []
+  },
+  "estado_estacion:super_100": {
+   "sid": "super_100",
+   "habilitada": true,
+   "config": {
+    "media_type": "radio",
+    "route": "socks5"
+   },
+   "edad_m3u8_s": 2.1,
+   "ffmpeg": [
+    {
+     "pid": 4,
+     "seg_corriendo": 412,
+     "cmd": "ffmpeg -i pipe:0 ..."
+    }
+   ],
+   "err_ultimas": []
+  },
+  "logs_servicio:stream-daemon": {
+   "servicio": "stream-daemon",
+   "lineas": [
+    "2026-10-10T06:21:02-0600 mediacap systemd[1]: Stopping stream-daemon.service - MediaDEV stream daemon...",
+    "2026-10-10T06:21:09-0600 mediacap systemd[1]: Started stream-daemon.service - MediaDEV stream daemon.",
+    "2026-10-10T06:21:10-0600 mediacap python3[912]: [gateway] socks5=<gateway activo> privoxy_port=<puerto>",
+    "2026-10-10T06:21:41-0600 mediacap python3[912]: [quarantine] radio_valle seg_00001.ts missing_or_tiny (0 bytes)",
+    "2026-10-10T06:24:15-0600 mediacap python3[912]: [health] 20 streams OK"
+   ]
+  },
+  "cambios_recientes": {
+   "lineas": [
+    "2026-10-09 20:25 HN DONE etapa A: video_segment_uploader v2 (TV_SHED_MODE=observe) + segment_janitor (JANITOR_MODE=observe) — Claude",
+    "2026-10-09 22:31 HN DONE fix duraciones al extraer (PR #2, 7affa2c0) — Claude"
+   ]
+  }
+ },
+ "esperado": {
+  "lado": [
+   "sin_problema",
+   "captura_mediacap"
+  ],
+  "menciona_alguno": [
+   [
+    "reinicio",
+    "restart",
+    "reinici",
+    "unattended"
+   ]
+  ],
+  "prohibido": [
+   "reconnect_at_eof",
+   "reconnect_on_http_error",
+   "curl --retry",
+   "etapa b",
+   "etapa c",
+   "borrar las grabaciones",
+   "borrar grabaciones"
+  ]
+ }
+}

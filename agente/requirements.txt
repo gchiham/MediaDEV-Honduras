@@ -1,0 +1,3 @@
+# venv propio en mediaAPP: /opt/mediadev-agente/venv (no toca el venv de media-app)
+openai>=3.5,<4
+psycopg2-binary>=2.9,<3
