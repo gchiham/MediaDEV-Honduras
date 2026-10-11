@@ -246,7 +246,7 @@ def mensaje_telegram(hallazgos, nuevos, resueltos, ia, motivo_sin_ia) -> str:
         lineas += ["", "Nuevos:"]
         for i in sorted(nuevos, key=lambda i: (ia_por_id.get(i, {}).get("prioridad") or por_id[i]["severidad"])):
             h, a = por_id[i], ia_por_id.get(i, {})
-            lineas.append(f"• [{a.get('prioridad') or h['severidad']}] {h['titulo']} — {h['archivo']}")
+            lineas.append(f"• [{a.get('prioridad') or h['severidad']}] {h['titulo']} — {_loc(h)}")
             if a.get("accion"):
                 lineas.append(f"  → {a['accion']}")
     if resueltos:
@@ -256,6 +256,10 @@ def mensaje_telegram(hallazgos, nuevos, resueltos, ia, motivo_sin_ia) -> str:
 
 
 # ── informe ──────────────────────────────────────────────────────────────────
+
+def _loc(h):
+    return f"{h['archivo']}:{h['linea']}" if h.get("linea") else h["archivo"]
+
 
 def a_markdown(hallazgos, ia, nuevos, resueltos, nota_ia, gasto) -> str:
     ia_por_id = {h["id"]: h for h in (ia or {}).get("hallazgos", [])}
@@ -277,7 +281,7 @@ def a_markdown(hallazgos, ia, nuevos, resueltos, nota_ia, gasto) -> str:
         a = ia_por_id.get(h["id"], {})
         fp = " ⚠ posible falso positivo" if a.get("posible_falso_positivo") else ""
         out.append(f"| {h['estado']}{' 🆕' if h['id'] in nuevos else ''} | {h['severidad']} | "
-                   f"{a.get('prioridad', '—')} | {h['regla']} | `{celda(h['archivo'])}` | {celda(h['titulo'])} | "
+                   f"{a.get('prioridad', '—')} | {h['regla']} | `{celda(_loc(h))}` | {celda(h['titulo'])} | "
                    f"{celda(a.get('interpretacion', '—'))}{fp} | {celda(a.get('accion', '—'))} |")
     if resueltos:
         out += ["", "## Resueltos desde el informe anterior", ""] + [f"- {r}" for r in resueltos]

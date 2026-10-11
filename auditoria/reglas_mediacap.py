@@ -228,7 +228,7 @@ def auditar(raiz: Path):
                 hallazgos.append(hallazgo(
                     "MC000", "POTENTIAL", "P3", rel, e.lineno or 1,
                     "El archivo no es Python válido",
-                    f"{e.msg}. Si un servicio lo ejecutara, fallaría al arrancar.",
+                    f"{e.msg}. Falla al importarlo o ejecutarlo.",
                     "Buscar si algún unit systemd, cron o import lo usa; si no, moverlo a archive/."))
                 continue
             res = [h for r in REGLAS_PY for h in r(arbol, rel)]
