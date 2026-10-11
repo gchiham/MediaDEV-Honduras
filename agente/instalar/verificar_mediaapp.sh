@@ -32,12 +32,24 @@ for p in "$APP" "$APP/vigia.py" "$APP/comun.py" "$APP/venv" "$ENVF" /etc/mediade
 done
 sudo -u "$USR" test -r "$ENVF" && mal "$USR puede leer $ENVF directamente" || ok "$ENVF solo lo lee systemd"
 
-# 3) variables (solo nombres) y fase 1: IA apagada
+# 3) variables (solo nombres) y fase: 1 = IA apagada; 2 = IA encendida (VIGIA_AGENTE=1)
 for v in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID MEDIACAP_SSH DATABASE_URL_RO; do
   [[ -n "$(valor $v)" ]] && ok "$v definida" || mal "$v no definida"
 done
-[[ "$(valor VIGIA_AGENTE)" == "1" ]] && mal "VIGIA_AGENTE=1: la IA está encendida (fase 1 la deja apagada)" \
-  || ok "IA apagada (VIGIA_AGENTE != 1)"
+if [[ "$(valor VIGIA_AGENTE)" == "1" ]]; then
+  FASE=2
+  ok "fase 2: IA encendida (VIGIA_AGENTE=1)"
+  for v in OPENAI_API_KEY AGENTE_MODELO AGENTE_TOPE_USD_DIA AGENTE_TOPE_USD_MES; do
+    [[ -n "$(valor $v)" ]] && ok "$v definida" || mal "$v no definida (fase 2 la necesita)"
+  done
+  "$PY" -c "import openai" 2>/dev/null && ok "openai instalado en el venv" || mal "falta openai en el venv"
+  modelo="$(valor AGENTE_MODELO)"
+  (cd "$APP" && "$PY" -c "import sys, agente; sys.exit(0 if agente.precios_de('$modelo') else 1)") 2>/dev/null \
+    && ok "precios conocidos para $modelo" || mal "sin precios para $modelo: el agente no correría"
+else
+  FASE=1
+  ok "fase 1: IA apagada (VIGIA_AGENTE != 1)"
+fi
 
 # 4) el bot es nuevo: su id no coincide con el de ningún otro token de este nodo
 nuevo_id="$(valor TELEGRAM_BOT_TOKEN | cut -d: -f1)"
@@ -73,11 +85,17 @@ c = psycopg2.connect(os.environ["DATABASE_URL_RO"], connect_timeout=8); cur = c.
 cur.execute("SHOW default_transaction_read_only"); print("ro", cur.fetchone()[0])
 cur.execute("SELECT has_table_privilege(%s, %s)", ("public.capture_config", "INSERT")); print("insert", cur.fetchone()[0])
 cur.execute("SELECT has_table_privilege(%s, %s)", ("public.mediadev_events", "SELECT")); print("eventos", cur.fetchone()[0])
+cur.execute("SELECT has_table_privilege(%s, %s)", ("public.advertisements", "SELECT")); print("anuncios", cur.fetchone()[0])
 cur.execute("SELECT count(*) FROM capture_config WHERE is_enabled"); print("habilitadas", cur.fetchone()[0])
 c.close()' 2>&1)"
 echo "$r" | grep -qx "ro on" && ok "DB: transacciones de solo lectura" || mal "DB: no es read-only ($r)"
 echo "$r" | grep -qx "insert False" && ok "DB: sin INSERT" || mal "DB: tiene INSERT"
-echo "$r" | grep -qx "eventos False" && ok "DB: sin tablas de fase 2" || mal "DB: tiene permisos de más"
+if [[ $FASE == 2 ]]; then
+  echo "$r" | grep -qx "eventos True" && ok "DB: lee las tablas de fase 2" || mal "DB: faltan permisos de fase 2"
+else
+  echo "$r" | grep -qx "eventos False" && ok "DB: sin tablas de fase 2" || mal "DB: tiene permisos de más"
+fi
+echo "$r" | grep -qx "anuncios False" && ok "DB: sin acceso a anuncios" || mal "DB: puede leer anuncios"
 echo "$r" | grep -q "^habilitadas [0-9]" && ok "DB: $(echo "$r" | grep ^habilitadas)" || mal "DB: no lee capture_config"
 
 # 7) una vuelta completa simulada (no manda a Telegram ni guarda estado)
