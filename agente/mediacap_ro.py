@@ -211,10 +211,11 @@ def volumen(path: Path, externo: bool = False) -> dict:
 
 
 def servicio(nombre: str) -> dict:
-    rc, out = run(["systemctl", "show", nombre, "-p", "ActiveState", "-p", "SubState",
+    rc, out = run(["systemctl", "show", nombre, "-p", "LoadState", "-p", "ActiveState", "-p", "SubState",
                    "-p", "NRestarts", "-p", "ActiveEnterTimestamp"])
     d = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
-    return {"activo": d.get("ActiveState"), "sub": d.get("SubState"),
+    return {"instalado": d.get("LoadState") not in ("not-found", None),
+            "activo": d.get("ActiveState"), "sub": d.get("SubState"),
             "reinicios": int(d["NRestarts"]) if d.get("NRestarts", "").isdigit() else None,
             "desde": d.get("ActiveEnterTimestamp")}
 
@@ -502,6 +503,12 @@ COMANDOS = {
 }
 
 
+# argumentos máximos por subcomando: lo que sobra se rechaza, no se ignora
+MAX_ARGS = {"chequeo": 1, "estado_general": 0, "estado_estacion": 1, "leer_err": 2,
+            "logs_servicio": 3, "medir_audio": 2, "probar_origen": 1, "estado_uploader": 0,
+            "cambios_recientes": 1}
+
+
 def despachar(linea: str) -> dict:
     if len(linea) > 200:
         return {"error": "comando demasiado largo"}
@@ -512,8 +519,9 @@ def despachar(linea: str) -> dict:
     if not partes or partes[0] not in COMANDOS:
         return {"error": f"comando no permitido: {partes[0][:40] if partes else ''}",
                 "permitidos": sorted(COMANDOS)}
-    if len(partes) > 4 or any(len(p) > 64 for p in partes):
-        return {"error": "demasiados argumentos o argumento demasiado largo"}
+    if len(partes) - 1 > MAX_ARGS[partes[0]] or any(len(p) > 64 for p in partes):
+        return {"error": f"demasiados argumentos para {partes[0]} (máximo {MAX_ARGS[partes[0]]}) "
+                         f"o argumento demasiado largo"}
     if partes[0] == "chequeo" and any(a != "--audio" for a in partes[1:]):
         return {"error": "chequeo solo acepta --audio"}
     try:

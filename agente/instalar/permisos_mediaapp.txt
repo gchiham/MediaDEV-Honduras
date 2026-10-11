@@ -1,0 +1,17 @@
+# Permisos esperados en mediaAPP para el vigía. Formato: ruta  dueño  grupo  modo
+# Regla: el usuario del servicio (mediadev-vigia) no puede modificar su propio código, su unidad,
+# el archivo de secretos ni known_hosts; solo escribe su estado y su auditoría.
+/opt/mediadev-agente                          root            root            755
+/opt/mediadev-agente/vigia.py                 root            root            644
+/opt/mediadev-agente/comun.py                 root            root            644
+/opt/mediadev-agente/agente.py                root            root            644
+/opt/mediadev-agente/herramientas.py          root            root            644
+/opt/mediadev-agente/venv                     root            root            755
+/etc/mediadev-agent.env                       root            root            600
+/etc/mediadev-vigia                           root            mediadev-vigia  750
+/etc/mediadev-vigia/id_ed25519                mediadev-vigia  mediadev-vigia  600
+/etc/mediadev-vigia/known_hosts               root            mediadev-vigia  640
+/var/lib/mediadev-vigia                       mediadev-vigia  mediadev-vigia  750
+/var/log/mediadev-agent                       mediadev-vigia  mediadev-vigia  750
+/etc/systemd/system/mediadev-vigia.service    root            root            644
+/etc/systemd/system/mediadev-vigia.timer      root            root            644

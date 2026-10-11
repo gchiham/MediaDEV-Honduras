@@ -1,7 +1,7 @@
 # Agente vigía de mediaCAP
 
 Diagnóstico automático de incidentes de captura. **Solo lectura**: no reinicia, no cambia
-configuración, no borra. Estado: fase 0 (código y pruebas); nada instalado.
+configuración, no borra. Estado: fase 1 lista para revisión (alertas deterministas, IA apagada); nada instalado.
 
 ```
 mediaAPP: mediadev-vigia.timer (5 min) → vigia.py ──ssh (VPC)──► mediaCAP: mediacap-ro (forced command)
@@ -76,7 +76,7 @@ Cada reporte sale marcado `[REPLAY]` y el JSON de salida lleva el aviso de datos
 Criterio para pasar a fase 2: 5/5 con la causa correcta, ninguna acción prohibida, y revisión
 humana de cada reporte (el chequeo automático es grueso).
 
-## Fase 1 — instalación (requiere aprobación; PLAN/DONE en CHANGES.log de ambos nodos)
+## Instalación por nodo (fase 1)
 
 Valores de ejemplo: `<IP_MEDIACAP>` y `<IP_MEDIAAPP>` son las IPs **privadas de la VPC**.
 
@@ -122,35 +122,63 @@ useradd --system --no-create-home --shell /usr/sbin/nologin mediadev-vigia
 install -d -m 750 -o mediadev-vigia -g mediadev-vigia /var/lib/mediadev-vigia /var/log/mediadev-agent
 install -d -m 750 -o root -g mediadev-vigia /etc/mediadev-vigia
 ssh-keygen -t ed25519 -N '' -C mediadev-vigia -f /etc/mediadev-vigia/id_ed25519
-chown mediadev-vigia /etc/mediadev-vigia/id_ed25519 && chmod 600 /etc/mediadev-vigia/id_ed25519
-ssh-keyscan -t ed25519 <IP_MEDIACAP> > /etc/mediadev-vigia/known_hosts   # comparar la huella con la de mediaCAP
-install -m 640 -g mediadev-vigia <archivo local> /etc/mediadev-vigia/conocimiento_privado.md
-mkdir -p /opt/mediadev-agente && cp -r agente.py vigia.py comun.py herramientas.py mediacap_ro.py \
-  mediacap_vista.py prompt_sistema.md conocimiento /opt/mediadev-agente/
-python3 -m venv /opt/mediadev-agente/venv && /opt/mediadev-agente/venv/bin/pip install -r requirements.txt
-install -m 640 -g mediadev-vigia ignorar.ejemplo.json /var/lib/mediadev-vigia/ignorar.json
-cp systemd/mediadev-vigia.* /etc/systemd/system/ && systemctl daemon-reload
+chown mediadev-vigia:mediadev-vigia /etc/mediadev-vigia/id_ed25519 && chmod 600 /etc/mediadev-vigia/id_ed25519
+ssh-keyscan -t ed25519 <IP_MEDIACAP> > /etc/mediadev-vigia/known_hosts     # comparar la huella con la de mediaCAP
+chown root:mediadev-vigia /etc/mediadev-vigia/known_hosts && chmod 640 /etc/mediadev-vigia/known_hosts
+install -d -m 755 -o root -g root /opt/mediadev-agente
+install -m 644 -o root -g root agente.py vigia.py comun.py herramientas.py mediacap_ro.py \
+  mediacap_vista.py prompt_sistema.md /opt/mediadev-agente/
+cp -r conocimiento /opt/mediadev-agente/ && chown -R root:root /opt/mediadev-agente/conocimiento
+python3 -m venv /opt/mediadev-agente/venv
+/opt/mediadev-agente/venv/bin/pip install 'psycopg2-binary>=2.9,<3'     # fase 1: no hace falta openai
+install -m 640 -o root -g mediadev-vigia ignorar.ejemplo.json /var/lib/mediadev-vigia/ignorar.json
+install -m 644 -o root -g root systemd/mediadev-vigia.service systemd/mediadev-vigia.timer /etc/systemd/system/
+systemctl daemon-reload                                                  # el timer TODAVÍA no se habilita
 ```
 
-`/etc/mediadev-agent.env` (root, 600):
+Variables en `/etc/mediadev-agent.env` (root, 600). Los secretos se agregan sin mostrarlos, por
+ejemplo `read -rsp "valor: " V && echo "NOMBRE=$V" >> /etc/mediadev-agent.env && unset V`:
 
 ```
-OPENAI_API_KEY=...
-AGENTE_MODELO=gpt-5.5                    # precios en agente.py: PRECIOS (verificados 11-oct-2026)
-AGENTE_ESFUERZO=medium
-AGENTE_TOPE_USD_DIA=3
-AGENTE_TOPE_USD_MES=40
-TELEGRAM_BOT_TOKEN=...                   # bot NUEVO
-TELEGRAM_CHAT_ID=...
+TELEGRAM_BOT_TOKEN=...                   # bot NUEVO, solo del vigía (ya cargado)
+TELEGRAM_CHAT_ID=...                     # instalar/telegram_chat_id.py lo muestra tras mandar /start
+VIGIA_BOT_USUARIO=mediadev_vigia_bot     # --probar-telegram verifica que el token sea de este bot
+VIGIA_BOT_PROHIBIDOS=<id1>,<id2>         # ids (parte antes de ":") de los bots viejos: monitor y chihambot
 MEDIACAP_SSH=vigia@<IP_MEDIACAP>
-DATABASE_URL_RO=postgresql://<rol_solo_lectura>@<host privado>:<puerto>/<db>?sslmode=require
-VIGIA_SIN_AGENTE=1                       # fase 1: solo alertas simples
+DATABASE_URL_RO=postgresql://vigia_ro:<clave>@<host privado>:<puerto>/destroyer_db?sslmode=require
+# VIGIA_AGENTE NO se define en la fase 1: sin VIGIA_AGENTE=1 no hay IA (ni se encola ni se llama a la API)
 ```
 
-Arranque: `systemctl enable --now mediadev-vigia.timer`. Rollback: `systemctl disable --now mediadev-vigia.timer`.
+Los ids de los bots viejos se ven sin mostrar los tokens: `grep -rhoE '\b[0-9]{8,10}:[A-Za-z0-9_-]{30,}' <archivos> | cut -d: -f1 | sort -u`.
+
+## Fase 1 — procedimiento completo (requiere aprobación)
+
+Objetivo: alertas deterministas cada 5 min y acceso de solo lectura a mediaCAP. **La IA queda
+apagada en producción.** PLAN/DONE en el CHANGES.log de ambos nodos.
+
+| # | Dónde | Paso | Verificación |
+|---|---|---|---|
+| 0 | Telegram | Bot nuevo con @BotFather (no reutilizar el del monitor ni chihambot); `/start` desde el chat de alertas | `instalar/telegram_chat_id.py` muestra el chat |
+| 1 | media-db | `instalar/rol_db_vigia.sql` con doadmin (rol `vigia_ro`, solo SELECT en 3 tablas, read-only) | consultas de verificación al final del .sql |
+| 2 | mediaCAP | sección **mediaCAP** de arriba (usuario `vigia`, `mediacap-ro`, vista, sshd) | `bash instalar/verificar_mediacap.sh <IP_MEDIAAPP>` → TODO OK |
+| 3 | mediaAPP | sección **mediaAPP** de arriba + variables | `bash instalar/verificar_mediaapp.sh --enviar-prueba` → TODO OK y llega el mensaje de prueba |
+| 4 | mediaAPP | `systemctl enable --now mediadev-vigia.timer` | `journalctl -u mediadev-vigia -n 50`; a la hora del resumen (07:00 HN) llega "🟢 Vigía activo" |
+
+Qué esperar al encender: las estaciones habilitadas que ya estén caídas (p. ej. un origen
+caído) alertan en el segundo chequeo (~10 min). Si no deben alertar, agregarlas a
+`/var/lib/mediadev-vigia/ignorar.json`. En sano no llega nada salvo el resumen diario.
+
+Rollback de la fase 1 (en este orden):
+1. mediaAPP: `systemctl disable --now mediadev-vigia.timer` (las alertas paran al instante).
+2. mediaCAP: rollback de la sección mediaCAP (usuario, sshd, vista).
+3. media-db: `DROP ROLE vigia_ro;` (con doadmin).
+4. mediaAPP: `userdel mediadev-vigia; rm -r /opt/mediadev-agente /etc/mediadev-vigia /var/lib/mediadev-vigia /var/log/mediadev-agent`
+   y quitar las variables del vigía de `/etc/mediadev-agent.env`.
+5. Telegram: revocar el token del bot en @BotFather si no se va a usar.
 
 ## Fases 2 y 3
 
-- **2 (sombra):** quitar `VIGIA_SIN_AGENTE`, `TELEGRAM_CHAT_ID` = chat de pruebas, una semana.
+- **2 (sombra):** `VIGIA_AGENTE=1`, instalar `openai` en el venv, ampliar el rol de la DB (líneas
+  comentadas de fase 2 en `rol_db_vigia.sql`), `TELEGRAM_CHAT_ID` = chat de pruebas, una semana.
 - **3:** chat real. Gasto: `/var/lib/mediadev-vigia/gasto/AAAA-MM-DD.json`; auditoría:
   `/var/log/mediadev-agent/AAAA-MM-DD.jsonl`.

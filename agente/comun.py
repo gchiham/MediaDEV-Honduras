@@ -27,7 +27,8 @@ def ssh_mediacap(comando: str, timeout: int = 60) -> dict:
         return {"error": "MEDIACAP_SSH no configurado"}
     llave = os.environ.get("MEDIACAP_SSH_KEY", "/etc/mediadev-vigia/id_ed25519")
     hosts = os.environ.get("MEDIACAP_KNOWN_HOSTS", "/etc/mediadev-vigia/known_hosts")
-    cmd = ["ssh", "-i", llave, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+    ssh_bin = os.environ.get("MEDIACAP_SSH_BIN", "ssh")          # solo las pruebas lo cambian
+    cmd = [ssh_bin, "-i", llave, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
            "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={hosts}", destino, comando]
     try:
         # entorno mínimo: ssh no hereda la API key, el token de Telegram ni la URL de la DB
@@ -43,24 +44,59 @@ def ssh_mediacap(comando: str, timeout: int = 60) -> dict:
         return {"error": "respuesta no JSON", "inicio": p.stdout[:500]}
 
 
+def _api_telegram() -> str | None:
+    """Base de la API: https://api.telegram.org, salvo un servidor local en las pruebas."""
+    base = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
+    p = urllib.parse.urlsplit(base)
+    if p.scheme == "https" or (p.scheme == "http" and p.hostname in ("127.0.0.1", "localhost")):
+        return base
+    return None
+
+
+def _token_permitido(token: str) -> bool:
+    """El vigía usa un bot PROPIO: si el token es de un bot ya usado por otro servicio (ids en
+    VIGIA_BOT_PROHIBIDOS, p. ej. el del monitor viejo), no se usa."""
+    prohibidos = {x.strip() for x in os.environ.get("VIGIA_BOT_PROHIBIDOS", "").split(",") if x.strip()}
+    return token.split(":", 1)[0] not in prohibidos
+
+
+def _llamar_telegram(metodo: str, datos: dict | None = None) -> dict | None:
+    token, base = os.environ.get("TELEGRAM_BOT_TOKEN"), _api_telegram()
+    if not token or not base:
+        return None
+    if not _token_permitido(token):
+        print("telegram: el token pertenece a un bot prohibido (reutilizado); no se usa")
+        return None
+    req = urllib.request.Request(f"{base}/bot{token}/{metodo}",
+                                 data=urllib.parse.urlencode(datos).encode() if datos else None)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            res = json.load(r)
+        return res.get("result") if res.get("ok") else None
+    except Exception as e:                                   # una alerta caída no tumba el vigía
+        print(f"telegram falló: {type(e).__name__} {getattr(e, 'code', '')}".strip())
+        return None
+
+
 def telegram(texto: str, responder_a: int | None = None) -> int | None:
     """Manda un mensaje; devuelve message_id (para responder en el mismo hilo) o None."""
-    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat:
+    if os.environ.get("VIGIA_SIMULAR") == "1":
+        print(f"[SIMULADO, no se envió]\n{texto}")
+        return None
+    chat = os.environ.get("TELEGRAM_CHAT_ID")
+    if not os.environ.get("TELEGRAM_BOT_TOKEN") or not chat:
         print(f"[telegram desactivado]\n{texto}")
         return None
     datos = {"chat_id": chat, "text": texto[:4000], "disable_web_page_preview": "true"}
     if responder_a:
         datos["reply_to_message_id"] = str(responder_a)
         datos["allow_sending_without_reply"] = "true"
-    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage",
-                                 data=urllib.parse.urlencode(datos).encode())
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return json.load(r).get("result", {}).get("message_id")
-    except Exception as e:                                   # una alerta caída no tumba el vigía
-        print(f"telegram falló: {e}")
-        return None
+    res = _llamar_telegram("sendMessage", datos)
+    return res.get("message_id") if res else None
+
+
+def telegram_getme() -> dict | None:
+    return _llamar_telegram("getMe")
 
 
 def leer_json(path: Path, defecto):

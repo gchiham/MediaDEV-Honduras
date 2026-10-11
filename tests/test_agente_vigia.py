@@ -2,7 +2,7 @@
 
     python -m unittest tests.test_agente_vigia -v
 """
-import json, os, socket, sys, tempfile, types, unittest
+import json, os, socket, sys, tempfile, time, types, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -547,7 +547,7 @@ class Replay(unittest.TestCase):
         cola = tmp / "cola"
         comun.escribir_json(cola / "1.json", {"tipo": "incidente", "replay": True, "alertas": []})
         fcntl_falso = types.SimpleNamespace(flock=lambda *a: None, LOCK_EX=2, LOCK_NB=4)
-        with mock.patch.dict(sys.modules, {"fcntl": fcntl_falso}), \
+        with mock.patch.dict(sys.modules, {"fcntl": fcntl_falso}), mock.patch.dict(os.environ, {"VIGIA_AGENTE": "1"}), \
                 mock.patch.object(agente, "ESTADO_DIR", tmp), mock.patch.object(agente, "COLA_DIR", cola), \
                 mock.patch.object(agente, "cliente_openai", side_effect=AssertionError("no debe llamar a la API")), \
                 mock.patch.object(herramientas, "Real", return_value=None), \
@@ -634,7 +634,7 @@ class GastoSinUso(unittest.TestCase):
         avisos = []
         fcntl_falso = types.SimpleNamespace(flock=lambda *a: None, LOCK_EX=2, LOCK_NB=4)
         pres_real = agente.Presupuesto
-        with mock.patch.dict(sys.modules, {"fcntl": fcntl_falso}), \
+        with mock.patch.dict(sys.modules, {"fcntl": fcntl_falso}), mock.patch.dict(os.environ, {"VIGIA_AGENTE": "1"}), \
                 mock.patch.object(agente, "ESTADO_DIR", self.tmp), mock.patch.object(agente, "COLA_DIR", cola), \
                 mock.patch.object(agente, "AUDITORIA_DIR", self.tmp / "audit"), \
                 mock.patch.object(agente, "cliente_openai", return_value=c), \
@@ -707,14 +707,18 @@ class ForcedCommand(unittest.TestCase):
             self.assertEqual(dueno, "root", ruta)
         self.assertEqual(rutas["/etc/mediadev/stream_config.cache.json"], ["root", "root", "640"])
 
-    def test_verificador_es_solo_lectura(self):
+    def test_verificadores_son_solo_lectura(self):
         import re
-        sh = (AGENTE_DIR / "instalar" / "verificar_mediacap.sh").read_text(encoding="utf-8")
-        codigo = "\n".join(l for l in sh.splitlines() if not l.lstrip().startswith("#"))
-        codigo = re.sub(r"<[A-Z_]+>", "", codigo)          # textos de ayuda como <IP_MEDIAAPP>
-        for prohibido in (r"\bchmod\b", r"\bchown\b", r"\brm\b", r"\bmv\b", r"\btee\b", r"\binstall\b",
-                          r"\buseradd\b", r"\bsystemctl\b", r"\bsed -i\b", r"(?<![2&])>(?!\s*/dev/null)(?!&)"):
-            self.assertIsNone(re.search(prohibido, codigo), prohibido)
+        for nombre in ("verificar_mediacap.sh", "verificar_mediaapp.sh"):
+            sh = (AGENTE_DIR / "instalar" / nombre).read_text(encoding="utf-8")
+            codigo = "\n".join(l for l in sh.splitlines() if not l.lstrip().startswith("#"))
+            codigo = re.sub(r"<[A-Z_]+>", "", codigo)          # textos de ayuda como <IP_MEDIAAPP>
+            for prohibido in (r"\bchmod\b", r"\bchown\b", r"\brm\b", r"\bmv\b", r"\btee\b", r"\binstall\b",
+                              r"\buseradd\b", r"\busermod\b", r"\bsed -i\b", r"\bpsql\b",
+                              r"\bsystemctl\s+(start|stop|restart|reload|enable|disable|daemon-reload|mask|edit|kill)\b",
+                              r"(?<![2&])>(?!\s*/dev/null)(?!&)",
+                              r"\b(INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|GRANT|REVOKE|TRUNCATE)\s"):
+                self.assertIsNone(re.search(prohibido, codigo), f"{nombre}: {prohibido}")
 
     def test_socks5_resuelve_local_y_fija_la_ip(self):
         out = (0, "\n__M__ 200 10 10 0.1 0  text/plain")
@@ -786,6 +790,289 @@ class ArchivosConfiables(unittest.TestCase):
             self.setUp()
             with self.assertRaises(SystemExit, msg=str(kw)):
                 self._vista_main(**kw)
+
+
+# ── fase 1: alertas deterministas, IA apagada, bot propio ────────────────────
+
+class Fase1(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        p = mock.patch.dict(os.environ, {"DATABASE_URL_RO": "", "VIGIA_AGENTE": "", "VIGIA_SIMULAR": ""})
+        p.start()
+        self.addCleanup(p.stop)
+        for nombre in ("ESTADO_DIR", "COLA_DIR"):
+            q = mock.patch.object(vigia, nombre, self.tmp if nombre == "ESTADO_DIR" else self.tmp / "cola")
+            q.start()
+            self.addCleanup(q.stop)
+
+    def vuelta(self, f, t):
+        enviados = []
+        with mock.patch.object(vigia, "ssh_mediacap", return_value=f), \
+                mock.patch.object(vigia, "telegram", side_effect=lambda txt, responder_a=None: enviados.append(txt) or 1), \
+                mock.patch.object(vigia.subprocess, "run", side_effect=AssertionError("no debe lanzar el agente")):
+            vigia.vuelta(t)
+        return enviados
+
+    def test_ia_apagada_por_defecto(self):
+        t = 1_791_600_000.0
+        self.assertFalse(vigia.agente_habilitado())
+        self.vuelta(foto(edad=900), t)
+        enviados = self.vuelta(foto(edad=900), t + 300)
+        self.assertTrue(any("no graba" in m for m in enviados))
+        self.assertFalse(any("investigando" in m for m in enviados))
+        self.assertFalse((self.tmp / "cola").exists())                    # nada encolado
+
+    def test_ia_solo_con_opt_in_explicito(self):
+        for valor in ("", "0", "true", "si", "yes"):
+            with mock.patch.dict(os.environ, {"VIGIA_AGENTE": valor}):
+                self.assertFalse(vigia.agente_habilitado(), valor)
+        with mock.patch.dict(os.environ, {"VIGIA_AGENTE": "1", "VIGIA_SIMULAR": "1"}):
+            self.assertFalse(vigia.agente_habilitado())                   # simular nunca usa IA
+
+    def test_agente_no_llama_a_la_api_sin_opt_in(self):
+        with mock.patch.object(agente, "cliente_openai", side_effect=AssertionError("no debe llamar")), \
+                mock.patch("builtins.print"):
+            agente.procesar_cola()
+
+    def test_latido_diario_una_vez(self):
+        hora = comun.ahora_hn(1_791_600_000).hour
+        with mock.patch.object(vigia, "RESUMEN_HORA_HN", hora):
+            enviados = self.vuelta(foto(), 1_791_600_000.0)
+            self.assertEqual(len(enviados), 1)
+            self.assertIn("Vigía activo", enviados[0])
+            self.assertIn("Estaciones grabando: 1 de 1", enviados[0])
+            self.assertIn("Agente IA: apagado (fase 1)", enviados[0])
+            self.assertEqual(self.vuelta(foto(), 1_791_600_300.0), [])     # mismo día: no repite
+
+    def test_latido_lista_alertas_activas(self):
+        estado = {"activas": {"sin_grabar:radio_x": {"desde": 1_791_600_000, "tipo": "sin_grabar", "sid": "radio_x"}}}
+        txt = vigia.latido(foto(edad=900), None, estado, 1_791_603_600)
+        self.assertIn("Estaciones grabando: 0 de 1", txt)
+        self.assertIn("radio_x — no graba", txt)
+
+    def test_simular_no_guarda_ni_envia(self):
+        with mock.patch.dict(os.environ, {"VIGIA_SIMULAR": "1"}), mock.patch("builtins.print") as pr, \
+                mock.patch.object(comun.urllib.request, "urlopen", side_effect=AssertionError("sin red")):
+            self.assertIsNone(comun.telegram("hola"))
+        self.assertIn("SIMULADO", pr.call_args[0][0])
+        with mock.patch.dict(os.environ, {"VIGIA_SIMULAR": "1"}):
+            self.vuelta(foto(edad=900), 1_791_600_000.0)
+            self.vuelta(foto(edad=900), 1_791_600_300.0)
+        self.assertFalse((self.tmp / "estado.json").exists())
+
+    def test_fallo_del_vigia_avisa_una_vez_por_hora(self):
+        enviados = []
+        with mock.patch.object(vigia, "telegram", side_effect=lambda txt, responder_a=None: enviados.append(txt)):
+            for t in (1_000_000, 1_000_300, 1_003_700):
+                vigia.avisar_fallo(RuntimeError("x"), t)
+        self.assertEqual(len(enviados), 2)
+        self.assertIn("El vigía de mediaCAP falló (RuntimeError)", enviados[0])
+
+    def test_bot_prohibido_no_se_usa(self):
+        with mock.patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "111:abc", "TELEGRAM_CHAT_ID": "1",
+                                          "VIGIA_BOT_PROHIBIDOS": "999, 111"}), \
+                mock.patch.object(comun.urllib.request, "urlopen", side_effect=AssertionError("sin red")), \
+                mock.patch("builtins.print"):
+            self.assertIsNone(comun.telegram("hola"))
+            self.assertIsNone(comun.telegram_getme())
+
+    def test_api_telegram_solo_https_o_local(self):
+        for base, ok in (("https://api.telegram.org", True), ("http://127.0.0.1:8080", True),
+                         ("http://api.telegram.org", False), ("http://evil.example", False), ("ftp://x", False)):
+            with mock.patch.dict(os.environ, {"TELEGRAM_API_BASE": base}):
+                self.assertEqual(comun._api_telegram() is not None, ok, base)
+
+    def test_rol_db_da_solo_lo_que_lee_el_vigia(self):
+        import inspect, re
+        sql = (AGENTE_DIR / "instalar" / "rol_db_vigia.sql").read_text(encoding="utf-8")
+        activas = "\n".join(l for l in sql.splitlines() if not l.lstrip().startswith("--"))
+        concedidas = set(re.findall(r"public\.(\w+)", re.search(r"GRANT SELECT ON (.+?) TO", activas, re.S).group(1)))
+        leidas = set(re.findall(r"(?:FROM|JOIN)\s+(\w+)", inspect.getsource(vigia.leer_db)))
+        self.assertEqual(concedidas, leidas)
+        self.assertIn("default_transaction_read_only = on", activas)
+        self.assertNotRegex(activas, r"GRANT\s+(INSERT|UPDATE|DELETE|ALL)")
+        self.assertNotIn("PASSWORD '", activas)                            # la clave nunca en el repo
+
+    def test_manifiesto_mediaapp(self):
+        filas = [l.split() for l in (AGENTE_DIR / "instalar" / "permisos_mediaapp.txt").read_text().splitlines()
+                 if l.strip() and not l.startswith("#")]
+        rutas = {f[0]: f[1:] for f in filas}
+        self.assertEqual(rutas["/etc/mediadev-agent.env"], ["root", "root", "600"])
+        for ruta, (dueno, grupo, modo) in rutas.items():
+            m = int(modo, 8)
+            escribible = (dueno == "mediadev-vigia" and m & 0o200) or (grupo == "mediadev-vigia" and m & 0o020) or m & 0o002
+            if ruta.startswith(("/var/lib/mediadev-vigia", "/var/log/mediadev-agent", "/etc/mediadev-vigia/id_ed25519")):
+                continue
+            self.assertFalse(escribible, ruta)
+
+    def test_unidad_no_instalada_no_alerta_pero_caida_si(self):
+        f = foto()
+        f["servicios"] = {"no-existe.timer": {"instalado": False, "activo": "inactive", "reinicios": 0},
+                          "stream-daemon": {"instalado": True, "activo": "failed", "sub": "failed", "reinicios": 0}}
+        cond, _, _ = vigia.condiciones(f, None, {}, False, {})
+        self.assertEqual([k for k in cond if k.startswith("servicio")], ["servicio_caido:stream-daemon"])
+
+    def test_argumentos_de_mas_se_rechazan(self):
+        for linea in ("estado_general x", "estado_uploader x", "estado_estacion radio_a && id",
+                      "probar_origen radio_a extra", "chequeo --audio --audio", "cambios_recientes 5 6",
+                      "medir_audio radio_a 3 x", "logs_servicio nginx 10 10 x"):
+            self.assertIn("demasiados argumentos", ro.despachar(linea).get("error", ""), linea)
+
+    def test_unidad_mediaapp_endurecida(self):
+        unidad = (AGENTE_DIR / "systemd" / "mediadev-vigia.service").read_text(encoding="utf-8")
+        for linea in ("User=mediadev-vigia", "EnvironmentFile=/etc/mediadev-agent.env", "NoNewPrivileges=yes",
+                      "ProtectSystem=strict", "ReadWritePaths=/var/lib/mediadev-vigia /var/log/mediadev-agent"):
+            self.assertIn(linea, unidad)
+        self.assertNotIn("VIGIA_AGENTE=1", unidad)
+
+
+class _TelegramFalso:
+    """Servidor HTTP local que imita la API de Telegram y guarda lo que recibe."""
+
+    def __init__(self, usuario="mediadev_vigia_bot"):
+        import http.server, threading, urllib.parse
+        self.pedidos = []
+        padre = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                datos = dict(urllib.parse.parse_qsl(self.rfile.read(n).decode())) if n else {}
+                metodo = self.path.rsplit("/", 1)[-1]
+                padre.pedidos.append((metodo, datos))
+                res = {"id": 111, "username": usuario} if metodo == "getMe" else {"message_id": len(padre.pedidos)}
+                cuerpo = json.dumps({"ok": True, "result": res}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(cuerpo)
+
+            do_GET = do_POST
+
+            def log_message(self, *a):
+                pass
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.srv.server_address[1]}"
+
+    def textos(self):
+        return [d.get("text", "") for m, d in self.pedidos if m == "sendMessage"]
+
+    def cerrar(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+@unittest.skipUnless(ES_ROOT, "integración: necesita Linux como root")
+class Fase1Linux(unittest.TestCase):
+    """vigia.py como proceso real → ssh simulado (forced command con SSH_ORIGINAL_COMMAND y
+    mediacap_ro.py de verdad, python -I, vista de root) → Telegram falso local."""
+
+    def setUp(self):
+        import subprocess as sp
+        self.sp = sp
+        self.tmp = Path(tempfile.mkdtemp())
+        os.chmod(self.tmp, 0o755)
+        streams = self.tmp / "streams"
+        for sid in ("radio_a", "radio_b"):
+            (streams / sid).mkdir(parents=True)
+            (streams / sid / "index.m3u8").write_text("#EXTM3U\n#EXTINF:4,\nseg_00001.ts\n")
+            (streams / sid / "seg_00001.ts").write_bytes(b"\x47" * 4000)
+        (self.tmp / "err").mkdir()
+        vdir = self.tmp / "vista"
+        vdir.mkdir(mode=0o750)
+        os.chmod(vdir, 0o750)
+        (vdir / "vista.json").write_text(json.dumps(vista.construir(
+            [{"slug": s, "media_type": "radio", "route": "direct", "stream_url": f"https://{s}.example/x"}
+             for s in ("radio_a", "radio_b")], [])))
+        os.chmod(vdir / "vista.json", 0o640)
+        self.ssh = self.tmp / "ssh-falso"
+        self.ssh.write_text(
+            "#!/bin/bash\n# simula sshd con ForceCommand: el comando pedido llega en SSH_ORIGINAL_COMMAND\n"
+            'exec env -i PATH=/usr/bin:/bin SSH_ORIGINAL_COMMAND="${@: -1}" '
+            f"STREAMS_ROOT={streams} FFMPEG_ERR_DIR={self.tmp / 'err'} VIGIA_VISTA={vdir / 'vista.json'} "
+            f"MEDIACAP_RO_LOCK={self.tmp / 'lock'} /usr/bin/python3 -I {AGENTE_DIR / 'mediacap_ro.py'}\n")
+        os.chmod(self.ssh, 0o755)
+        self.estado = self.tmp / "estado"
+        self.tg = _TelegramFalso()
+        self.addCleanup(self.tg.cerrar)
+        self.otra_hora = (comun.ahora_hn().hour + 12) % 24
+
+    def correr(self, *args, **env_extra):
+        env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "VIGIA_ESTADO_DIR": str(self.estado),
+               "MEDIACAP_SSH": "vigia@prueba", "MEDIACAP_SSH_BIN": str(self.ssh),
+               "TELEGRAM_API_BASE": self.tg.base, "TELEGRAM_BOT_TOKEN": "111:token-de-prueba",
+               "TELEGRAM_CHAT_ID": "42", "VIGIA_RESUMEN_HORA": str(self.otra_hora), **env_extra}
+        return self.sp.run([sys.executable, str(AGENTE_DIR / "vigia.py"), *args], env=env,
+                           capture_output=True, text=True, timeout=120)
+
+    def envejecer(self, sid, segundos):
+        t = time.time() - segundos
+        os.utime(self.tmp / "streams" / sid / "index.m3u8", (t, t))
+
+    def test_alerta_sostenida_y_recuperacion(self):
+        self.envejecer("radio_a", 600)
+        r = self.correr()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.tg.textos(), [])                              # 1 chequeo: todavía no
+        self.correr()
+        textos = self.tg.textos()
+        self.assertEqual(len(textos), 1)
+        self.assertIn("radio_a — no graba", textos[0])
+        self.assertNotIn("radio_b", textos[0])
+        self.assertNotIn("investigando", textos[0])
+        self.envejecer("radio_a", 0)
+        self.correr()
+        self.assertIn("Recuperado", self.tg.textos()[-1])
+        self.assertFalse((self.estado / "cola").exists())                   # IA apagada: nada en cola
+
+    def test_latido_y_simulacion(self):
+        hora = str(comun.ahora_hn().hour)
+        r = self.correr("--simular", VIGIA_RESUMEN_HORA=hora)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("SIMULADO", r.stdout)
+        self.assertIn("Estaciones grabando: 2 de 2", r.stdout)
+        self.assertEqual(self.tg.pedidos, [])
+        self.assertFalse((self.estado / "estado.json").exists())
+        self.correr(VIGIA_RESUMEN_HORA=hora)
+        self.assertEqual(len(self.tg.textos()), 1)
+        self.assertIn("Vigía activo", self.tg.textos()[0])
+
+    def test_bot_viejo_no_se_usa(self):
+        self.envejecer("radio_a", 600)
+        self.correr(VIGIA_BOT_PROHIBIDOS="111")
+        self.correr(VIGIA_BOT_PROHIBIDOS="111")
+        self.assertEqual(self.tg.pedidos, [])
+
+    def test_probar_telegram(self):
+        r = self.correr("--probar-telegram", VIGIA_BOT_USUARIO="mediadev_vigia_bot")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([m for m, _ in self.tg.pedidos], ["getMe", "sendMessage"])
+        r = self.correr("--probar-telegram", VIGIA_BOT_USUARIO="otro_bot")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual([m for m, _ in self.tg.pedidos].count("sendMessage"), 1)   # no mandó con otro bot
+
+    def test_forced_command_simulado_rechaza_atajos(self):
+        for intento in ("bash", "chequeo; id", "estado_estacion radio_a && id", "cat /etc/shadow", ""):
+            out = self.sp.run([str(self.ssh), "vigia@prueba", intento], capture_output=True, text=True).stdout
+            self.assertIn('"error"', out, intento)
+        out = self.sp.run([str(self.ssh), "vigia@prueba", "chequeo"], capture_output=True, text=True).stdout
+        self.assertEqual(sorted(json.loads(out)["estaciones"]), ["radio_a", "radio_b"])
+
+    def test_falla_del_vigia_avisa(self):
+        self.estado.mkdir()
+        (self.estado / "estado.json").mkdir()                               # rompe la escritura de estado
+        r = self.correr()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertTrue(any("El vigía de mediaCAP falló" in t for t in self.tg.textos()))
+
+    def test_agente_no_corre_sin_opt_in(self):
+        env = {"PATH": "/usr/bin:/bin", "VIGIA_ESTADO_DIR": str(self.estado), "OPENAI_API_KEY": "sk-falsa"}
+        r = self.sp.run([sys.executable, str(AGENTE_DIR / "agente.py"), "--cola"], env=env,
+                        capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("agente apagado", r.stdout)
 
 
 if __name__ == "__main__":
