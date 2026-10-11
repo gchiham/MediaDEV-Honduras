@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """bot_comandos — comandos de Telegram del vigía (corre en mediaAPP como servicio).
 
-/estado  /stats  /pausa [horas]  /reanudar  /ia_off  /ia_on  /ayuda
+/estado  /stats  /ultimos  /pausa [horas]  /reanudar  /ia_off  /ia_on  /ayuda
+Además: botones 👍/👎 bajo cada diagnóstico de la IA, y responder a un diagnóstico con un texto
+lo guarda como comentario (sirve de memoria al agente y para medir su acierto).
 
 Reglas:
 - Solo obedece al chat TELEGRAM_CHAT_ID; a cualquier otro lo ignora sin responder.
@@ -14,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import comun
+import diagnosticos
 from comun import (COLA_DIR, ESTADO_DIR, ahora_hn, en_pausa, escribir_json, hora_hn, ia_detenida,
                    leer_control, leer_json, telegram, telegram_api)
 
@@ -24,6 +27,7 @@ VUELTA_ATRASADA_S = 15 * 60            # sin vuelta del vigía en 15 min = algo 
 
 MENU = [("estado", "Alertas activas y última vuelta del vigía"),
         ("stats", "Vueltas, alertas y uso de IA de hoy"),
+        ("ultimos", "Últimos diagnósticos de la IA y su calificación"),
         ("pausa", "Pausar alertas N horas (1 por defecto, máx. 24)"),
         ("reanudar", "Quitar la pausa de alertas"),
         ("ia_off", "Detener la IA (interruptor de emergencia)"),
@@ -114,6 +118,12 @@ def cmd_stats(ahora: float) -> str:
               f"Gasto IA: US${g.get('usd', 0):.2f} hoy (tope {os.environ.get('AGENTE_TOPE_USD_DIA', '3')}) · "
               f"US${mes:.2f} este mes (tope {os.environ.get('AGENTE_TOPE_USD_MES', '40')})",
               f"IA: {estado_ia()}"]
+    cal = diagnosticos.resumen(ahora)
+    if cal["total"]:
+        calificados = cal["ok"] + cal["mal"]
+        pct = f" → acierto {round(100 * cal['ok'] / calificados)} %" if calificados else ""
+        lineas.append(f"Calificaciones (30 días): {cal['ok']} 👍 / {cal['mal']} 👎 de {cal['total']} "
+                      f"diagnósticos{pct}")
     if g.get("sin_medir"):
         lineas.append(f"⚠ {len(g['sin_medir'])} llamada(s) sin métricas de uso (gasto estimado)")
     previos = [d for d in sorted(e.get("stats", {})) if d < dia][-3:]
@@ -164,8 +174,23 @@ def cmd_ia(encender: bool, ahora: float) -> str:
     return "✅ IA permitida otra vez (con los mismos topes de gasto)."
 
 
+def cmd_ultimos(ahora: float, n: int = 5) -> str:
+    items = diagnosticos.con_calificacion(n=n)
+    if not items:
+        return "Todavía no hay diagnósticos de la IA."
+    lineas = [f"🧠 Últimos {len(items)} diagnósticos de la IA"]
+    for _, d in items:
+        marca = {"ok": "👍", "mal": "👎"}.get(d.get("calificacion"), "·")
+        lineas.append(f"{marca} {ahora_hn(d['ts']).strftime('%d-%b %H:%M')} HN — {d.get('titulo')}")
+        if d.get("comentario"):
+            lineas.append(f"    “{d['comentario'][:120]}”")
+    lineas.append("Califica con los botones bajo cada diagnóstico.")
+    return "\n".join(lineas)
+
+
 def ayuda() -> str:
-    return "Comandos del vigía de mediaCAP:\n" + "\n".join(f"/{c} — {d}" for c, d in MENU)
+    return ("Comandos del vigía de mediaCAP:\n" + "\n".join(f"/{c} — {d}" for c, d in MENU) +
+            "\nBajo cada diagnóstico de la IA: 👍/👎. Responde a un diagnóstico con un texto para comentarlo.")
 
 
 def responder(texto: str, ahora: float) -> str | None:
@@ -179,6 +204,8 @@ def responder(texto: str, ahora: float) -> str | None:
         return cmd_estado(ahora)
     if cmd == "stats":
         return cmd_stats(ahora)
+    if cmd in ("ultimos", "últimos"):
+        return cmd_ultimos(ahora)
     if cmd in ("pausa", "stop"):
         return cmd_pausa(args, ahora)
     if cmd in ("reanudar", "seguir"):
@@ -199,11 +226,47 @@ def autorizado(msg: dict) -> bool:
     return bool(os.environ.get("TELEGRAM_CHAT_ID")) and chat == os.environ["TELEGRAM_CHAT_ID"].strip()
 
 
+def atender_boton(cq: dict, ahora: float) -> None:
+    """👍/👎 bajo un diagnóstico: guarda la calificación, confirma y deja marcado el botón elegido."""
+    msg = cq.get("message") or {}
+    if not autorizado(msg):
+        print("ignorado: botón de un chat no autorizado")
+        return
+    partes = (cq.get("data") or "").split(":")
+    respuesta = "No reconozco ese botón."
+    if len(partes) == 3 and partes[0] == "fb" and partes[2] in ("ok", "mal"):
+        if diagnosticos.calificar(partes[1], ahora, calificacion=partes[2]):
+            elegido = "👍 acertó" if partes[2] == "ok" else "👎 falló"
+            respuesta = "Anotado 👍" if partes[2] == "ok" else \
+                "Anotado 👎. Si quieres, responde a este diagnóstico con qué estuvo mal."
+            telegram_api("editMessageReplyMarkup", {
+                "chat_id": str(msg["chat"]["id"]), "message_id": str(msg.get("message_id")),
+                "reply_markup": json.dumps({"inline_keyboard": [[{"text": f"✅ {elegido}",
+                                                                  "callback_data": cq["data"]}]]})})
+            print(f"calificación: {partes[1]} {partes[2]}")
+        else:
+            respuesta = "Ese diagnóstico ya no está en el historial."
+    telegram_api("answerCallbackQuery", {"callback_query_id": str(cq.get("id")), "text": respuesta})
+
+
+def guardar_comentario(msg: dict, ahora: float) -> str | None:
+    """Un texto que responde a un diagnóstico se guarda como comentario del operador."""
+    id_ = diagnosticos.por_mensaje((msg.get("reply_to_message") or {}).get("message_id"))
+    if not id_ or not diagnosticos.calificar(id_, ahora, comentario=msg.get("text", "")):
+        return None
+    print(f"comentario: {id_}")
+    return "📝 Comentario guardado: el agente lo tendrá en cuenta la próxima vez."
+
+
+
 def procesar(updates: list, ahora: float) -> int | None:
     """Atiende un lote de updates; devuelve el próximo offset (o None si no hubo)."""
     siguiente = None
     for u in updates:
         siguiente = max(siguiente or 0, u.get("update_id", 0) + 1)
+        if u.get("callback_query"):
+            atender_boton(u["callback_query"], ahora)
+            continue
         msg = u.get("message") or {}
         texto = msg.get("text")
         if not texto:
@@ -215,6 +278,8 @@ def procesar(updates: list, ahora: float) -> int | None:
             print("ignorado: comando viejo")
             continue
         r = responder(texto, ahora)
+        if r is None and msg.get("reply_to_message"):
+            r = guardar_comentario(msg, ahora)
         if r:
             telegram(r, responder_a=msg.get("message_id"))
     return siguiente
@@ -232,7 +297,7 @@ def bucle() -> None:
     offset = leer_json(OFFSET, {}).get("offset") or descartar_pendientes()
     print("bot de comandos del vigía escuchando")
     while True:
-        datos = {"timeout": "50", "allowed_updates": '["message"]'}
+        datos = {"timeout": "50", "allowed_updates": '["message", "callback_query"]'}
         if offset:
             datos["offset"] = str(offset)
         updates = telegram_api("getUpdates", datos, timeout=60)

@@ -78,8 +78,9 @@ def _llamar_telegram(metodo: str, datos: dict | None = None, timeout: int = 15) 
         return None
 
 
-def telegram(texto: str, responder_a: int | None = None) -> int | None:
-    """Manda un mensaje; devuelve message_id (para responder en el mismo hilo) o None."""
+def telegram(texto: str, responder_a: int | None = None, teclado: dict | None = None) -> int | None:
+    """Manda un mensaje; devuelve message_id (para responder en el mismo hilo) o None.
+    teclado: botones inline (p. ej. 👍/👎 de un diagnóstico)."""
     if os.environ.get("VIGIA_SIMULAR") == "1":
         print(f"[SIMULADO, no se envió]\n{texto}")
         return None
@@ -91,6 +92,8 @@ def telegram(texto: str, responder_a: int | None = None) -> int | None:
     if responder_a:
         datos["reply_to_message_id"] = str(responder_a)
         datos["allow_sending_without_reply"] = "true"
+    if teclado:
+        datos["reply_markup"] = json.dumps(teclado)
     res = _llamar_telegram("sendMessage", datos)
     return res.get("message_id") if res else None
 
