@@ -358,8 +358,43 @@ def probar_url(entrada: dict | None, route: str | None, media_type: str | None) 
         res["stream"] = r
     else:
         res["pagina"] = _curl(url, socks, 10)
-        res["nota"] = "origen vía resolver (streamlink); solo se prueba que la página responda"
+        host = (urlsplit(url).hostname or "").lower()
+        if any(host == p or host.endswith("." + p) for p in RESOLVER_PLATAFORMAS):
+            res["en_vivo"] = en_vivo_resolver(url)
+        else:
+            res["nota"] = "origen vía página web; solo se prueba que la página responda"
     return res
+
+
+# Plataformas que el daemon resuelve con streamlink (misma lista que _RESOLVER_PLATFORMS).
+RESOLVER_PLATAFORMAS = ("kick.com", "mdstrm.com", "dailymotion.com")
+STREAMLINK = "/usr/local/bin/streamlink"
+
+
+def en_vivo_resolver(url: str) -> dict:
+    """¿La emisora está transmitiendo? `streamlink --json` (igual que el daemon, sin proxy):
+    lista las calidades disponibles sin bajar video. Nunca devuelve las URLs del stream (llevan
+    tokens). Lo que streamlink pida internamente lo decide su plugin de la plataforma."""
+    ip, motivo = resolver_publica(url)
+    if motivo:
+        return {"vivo": None, "error": f"no se prueba: {motivo}"}
+    try:
+        p = subprocess.run(["nice", "-n", "19", "timeout", "30", STREAMLINK, "--json", url],
+                           capture_output=True, text=True, timeout=35, errors="replace",
+                           env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}, stdin=subprocess.DEVNULL)
+        d = json.loads(p.stdout or "{}")
+    except (subprocess.TimeoutExpired, ValueError, OSError) as e:
+        return {"vivo": None, "error": f"streamlink no respondió: {type(e).__name__}"}
+    if not isinstance(d, dict):
+        return {"vivo": None, "error": "respuesta inesperada de streamlink"}
+    if d.get("streams"):
+        meta = d.get("metadata") or {}
+        return {"vivo": True, "calidades": sorted(d["streams"])[:12],
+                "titulo": redactar(str(meta.get("title") or ""))[:120] or None}
+    error = redactar(str(d.get("error") or "sin streams"))[:200]
+    return {"vivo": False, "error": error,
+            "lectura": "la plataforma no ofrece transmisión ahora: la emisora no está en vivo"
+                       if "no playable streams" in error.lower() else None}
 
 
 # ── subcomandos ──────────────────────────────────────────────────────────────
