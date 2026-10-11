@@ -8,6 +8,7 @@ Type=simple
 User=mediadev-vigia
 Group=mediadev-vigia
 EnvironmentFile=/etc/mediadev-agent.env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/mediadev-agente/venv/bin/python /opt/mediadev-agente/bot_comandos.py
 Restart=always
 RestartSec=15
