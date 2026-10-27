@@ -1,4 +1,5 @@
 {
  "estaciones": ["canal_5"],
- "ventanas_hn": [["06:18", "06:30"]]
+ "ventanas_hn": [["06:18", "06:30"]],
+ "silencio_hn": {"xy_hrn": [["23:00", "04:30"]]}
 }

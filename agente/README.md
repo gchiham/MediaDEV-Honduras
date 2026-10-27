@@ -199,6 +199,16 @@ Qué esperar al encender: las estaciones habilitadas que ya estén caídas (p. e
 caído) alertan en el segundo chequeo (~10 min). Si no deben alertar, agregarlas a
 `/var/lib/mediadev-vigia/ignorar.json`. En sano no llega nada salvo el resumen diario.
 
+Reglas contra falsas alarmas (oct-2026):
+- **Carga**: umbral load1 > 7 (la normal en 2 vCPU ronda 4) y no se mide de :00 a :19 HN, cuando todas
+  las radios cierran y suben su hora. El contador no se resetea en esa ventana: una sobrecarga real que
+  dura más que el cierre se avisa igual, a lo sumo 20 min más tarde.
+- **Silencio programado**: `"silencio_hn": {"xy_hrn": [["23:00", "04:30"]]}` en `ignorar.json`. En esa
+  ventana (puede cruzar la medianoche) el silencio de esa estación no se evalúa; fuera de ella se avisa
+  como siempre. HRN sale del aire en silencio ~23:00–04:00 HN todas las noches.
+- **Proveedor**: si 2+ estaciones del mismo host de origen caen (o se quedan mudas) a la vez, el mensaje
+  las junta en una línea. El host sale de `capture_config.stream_url`; solo se guarda el host.
+
 Rollback de la fase 1 (en este orden):
 1. mediaAPP: `systemctl disable --now mediadev-vigia.timer mediadev-vigia-bot` (las alertas paran al instante).
    Para solo silenciar sin desinstalar: `/pausa 24` desde Telegram.
