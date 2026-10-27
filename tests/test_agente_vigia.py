@@ -197,8 +197,9 @@ class Vigia(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-    def paso(self, f, audio=False, ignorar=None, silenciar=False):
-        cond, rein, ev = vigia.condiciones(f, None, ignorar or {}, audio, self.estado.get("reinicios", {}))
+    def paso(self, f, audio=False, ignorar=None, silenciar=False, db=None):
+        cond, rein, ev = vigia.condiciones(f, db, ignorar or {}, audio, self.estado.get("reinicios", {}),
+                                           self.t)
         self.estado["reinicios"] = rein
         r = vigia.evaluar(cond, ev, self.estado, self.t, silenciar)
         self.t += 300
@@ -258,6 +259,85 @@ class Vigia(unittest.TestCase):
         nuevas, _, _ = self.paso(foto(ffmpeg=2, disco=90))
         self.assertEqual(sorted(c["tipo"] for c in nuevas), ["ffmpeg_duplicado"])
         self.assertIn("disco", self.estado["activas"])
+
+    T_0800 = 1_793_023_200.0                                           # 2026-10-26 08:00 HN
+
+    def test_carga_no_cuenta_en_el_cierre_de_hora(self):
+        self.t = self.T_0800                                           # 08:00 … 08:15: no se mide
+        for _ in range(4):
+            self.assertEqual(self.paso({**foto(), "carga": [12.0]})[0], [])
+        self.assertNotIn("carga", self.estado.get("contador", {}))
+        nuevas = [self.paso({**foto(), "carga": [12.0]})[0] for _ in range(3)]   # 08:20, :25, :30
+        self.assertEqual([len(n) for n in nuevas], [0, 0, 1])
+
+    def test_carga_sostenida_cruza_el_cierre_y_avisa(self):
+        self.t = self.T_0800 - 600                                     # 07:50, 07:55: cuenta 2
+        self.paso({**foto(), "carga": [9.0]}); self.paso({**foto(), "carga": [9.0]})
+        for _ in range(4):                                             # 08:00 … 08:15: ni suma ni resetea
+            self.assertEqual(self.paso({**foto(), "carga": [1.0]})[1], [])
+        self.assertEqual(self.estado["contador"]["carga"], 2)
+        self.assertEqual(len(self.paso({**foto(), "carga": [9.0]})[0]), 1)   # 08:20: tercer chequeo
+
+    def test_carga_bajo_el_umbral_no_alerta(self):
+        self.t = self.T_0800 + 1800
+        for _ in range(5):
+            self.assertEqual(self.paso({**foto(), "carga": [6.5]})[0], [])
+
+    def test_silencio_en_horario_fuera_del_aire(self):
+        ign = {"silencio_hn": {"radio_america": [["23:00", "04:30"]]}}
+        self.t = self.T_0800 - 9 * 3600                                # 23:00 HN, cruza la medianoche
+        for _ in range(12):
+            self.assertEqual(self.paso(foto(audio=-91.0), audio=True, ignorar=ign)[0], [])
+        self.assertNotIn("silencio:radio_america", self.estado.get("contador", {}))
+        self.t = self.T_0800 - 3 * 3600                                # 05:00: fuera de la ventana avisa
+        nuevas = [self.paso(foto(audio=-91.0), audio=True, ignorar=ign)[0] for _ in range(3)]
+        self.assertEqual([len(n) for n in nuevas], [0, 0, 1])
+
+    def test_silencio_activo_no_se_recupera_dentro_de_la_ventana(self):
+        ign = {"silencio_hn": {"radio_america": [["23:00", "04:30"]]}}
+        self.t = self.T_0800 - 10 * 3600                               # 22:00: avisa
+        for _ in range(3):
+            self.paso(foto(audio=-91.0), audio=True, ignorar=ign)
+        self.assertIn("silencio:radio_america", self.estado["activas"])
+        self.t = self.T_0800 - 8 * 3600                                # 00:00: ni "ya tiene sonido" ni recordatorio
+        self.assertEqual(self.paso(foto(audio=-15.0), audio=True, ignorar=ign)[1:], ([], []))
+        self.assertIn("silencio:radio_america", self.estado["activas"])
+
+    def test_en_rango(self):
+        self.assertTrue(vigia.en_rango("23:30", "23:00", "04:30"))
+        self.assertTrue(vigia.en_rango("04:30", "23:00", "04:30"))
+        self.assertFalse(vigia.en_rango("12:00", "23:00", "04:30"))
+        self.assertTrue(vigia.en_rango("06:20", "06:18", "06:30"))
+        self.assertFalse(vigia.en_rango("06:31", "06:18", "06:30"))
+
+    def test_agrupa_por_proveedor(self):
+        sec = "ice42.securenetsystems.net"
+        db = {"habilitadas": {s: "radio" for s in ("xy_hrn", "xy_tgu", "hch_radio")}, "cb": {},
+              "proveedor": {"xy_hrn": sec, "xy_tgu": sec, "hch_radio": "otro.example.com"}}
+        f = {**foto(), "estaciones": {s: {"edad_m3u8_s": 900, "ffmpeg": 0} for s in db["habilitadas"]}}
+        self.t = self.T_0800 + 1800
+        self.paso(f, db=db)
+        nuevas, _, _ = self.paso(f, db=db)
+        m = vigia.mensaje(nuevas, [], [], self.t)
+        self.assertIn("🔴 3 alertas", m)
+        self.assertIn(f"• 2 estaciones de {sec} no están grabando: xy_hrn, xy_tgu (probablemente el proveedor)", m)
+        self.assertIn("• hch_radio no está grabando", m)
+        self.assertEqual(m.count("•"), 2)
+        self.assertEqual(self.estado["activas"]["sin_grabar:xy_hrn"]["proveedor"], sec)
+        sano = {**foto(), "estaciones": {s: {"edad_m3u8_s": 2, "ffmpeg": 1} for s in db["habilitadas"]}}
+        _, rec, _ = self.paso(sano, db=db)
+        v = vigia.mensaje([], rec, [], self.t)
+        self.assertIn(f"• xy_hrn, xy_tgu ({sec}) ya graban otra vez", v)
+        rep = vigia.mensaje([], [], [{**c, "desde": self.t - 7200} for c in nuevas], self.t)
+        self.assertIn(f"• 2 estaciones de {sec} — sin grabar desde", rep)
+
+    def test_proveedor_sin_credenciales(self):
+        cur = mock.Mock()
+        cur.fetchall.return_value = [("canal_x", URL_CRED), ("radio_y", "https://u:p@radio.example.com/s?t=1"),
+                                     ("sin_url", None)]
+        p = vigia.leer_proveedores(cur)
+        self.assertEqual(p, {"canal_x": "iptv.example.net", "radio_y": "radio.example.com"})
+        self.assertNotIn("clave", json.dumps(p))
 
     def test_mensaje(self):
         m = vigia.mensaje([{"tipo": "silencio", "sid": "hch_tv", "detalle": "mean -91",

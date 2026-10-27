@@ -11,10 +11,15 @@
   cambió, la IA avisa; si no, no llega nada. La recuperación siempre se avisa.
 
 Estado en $VIGIA_ESTADO_DIR/estado.json; lista de exclusiones en $VIGIA_ESTADO_DIR/ignorar.json:
-    {"estaciones": ["canal_5"], "ventanas_hn": [["06:18", "06:30"]]}
+    {"estaciones": ["canal_5"], "ventanas_hn": [["06:18", "06:30"]],
+     "silencio_hn": {"xy_hrn": [["23:00", "04:30"]]}}
+'silencio_hn' son horarios en que una estación sale del aire en silencio a propósito (las
+ventanas pueden cruzar la medianoche); fuera de ellos su silencio se avisa como siempre.
 """
 import os, subprocess, sys, time
+from collections import defaultdict
 from pathlib import Path
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import diagnosticos
@@ -25,7 +30,8 @@ INTERVALO_AUDIO_MIN = 15          # el chequeo con volumedetect corre cada 15 mi
 STALE_SECS = 90
 SILENCIO_DB = -80.0
 DISCO_PCT = 85.0
-CARGA_MAX = 6.0
+CARGA_MAX = 7.0                   # en 2 vCPU la carga normal ronda 4 (sar, oct-2026)
+CIERRE_HORA_MIN = 20              # :00–:19: todas las radios cierran y suben su hora; la carga sube sola
 REALERTA_S = 2 * 3600
 REVISION_S = 6 * 3600             # re-chequeo con IA (silencioso) de lo que la IA silenció
 COOLDOWN_AGENTE_S = 30 * 60
@@ -55,7 +61,7 @@ def leer_db() -> dict | None:
         hab = dict(cur.fetchall())
         cur.execute("SELECT stream_id, cb_state, cb_fails FROM mediadev_stream_status")
         cb = {r[0]: {"cb": r[1], "fallos": r[2]} for r in cur.fetchall()}
-        return {"habilitadas": hab, "cb": cb}
+        return {"habilitadas": hab, "cb": cb, "proveedor": leer_proveedores(cur)}
     except Exception as e:
         print(f"db: {type(e).__name__}")               # sin el mensaje: puede traer el DSN
         return None
@@ -64,13 +70,37 @@ def leer_db() -> dict | None:
             c.close()
 
 
+def leer_proveedores(cur) -> dict:
+    """{slug: host del origen}. Solo se guarda el host: la URL puede traer credenciales."""
+    try:
+        cur.execute("""SELECT ms.slug, cc.stream_url FROM capture_config cc
+                       JOIN media_sources ms ON ms.id = cc.media_source_id
+                       WHERE cc.is_enabled AND ms.slug IS NOT NULL""")
+        res = {}
+        for sid, url in cur.fetchall():
+            host = urlsplit(url or "").hostname
+            if host:
+                res[sid] = host
+        return res
+    except Exception as e:                            # sin hosts no se agrupa; el resto sigue igual
+        print(f"db proveedores: {type(e).__name__}")
+        return {}
+
+
+def en_rango(hm: str, a: str, b: str) -> bool:
+    """'HH:MM' dentro de [a, b]; si a > b la ventana cruza la medianoche."""
+    return a <= hm <= b if a <= b else hm >= a or hm <= b
+
+
 def condiciones(foto: dict, db: dict | None, ignorar: dict, con_audio: bool,
-                reinicios_previos: dict) -> tuple[dict, dict, set]:
+                reinicios_previos: dict, ahora: float | None = None) -> tuple[dict, dict, set]:
     """Devuelve (condiciones presentes {clave: detalle}, reinicios actuales, claves evaluadas).
 
     'evaluadas' son las claves que este chequeo pudo medir: una clave activa que no está ahí
     (p. ej. silencio en un chequeo sin audio) no se da por recuperada."""
     cond, evaluadas = {}, set()
+    ahora = time.time() if ahora is None else ahora
+    hm = hora_hn(ahora)
     if "error" in foto:
         evaluadas.add("mediacap_inalcanzable")
         cond["mediacap_inalcanzable"] = {"tipo": "mediacap_inalcanzable", "sid": None,
@@ -88,6 +118,8 @@ def condiciones(foto: dict, db: dict | None, ignorar: dict, con_audio: bool,
     habilitadas = (db or {}).get("habilitadas") or {s: e.get("tipo") for s, e in est.items()
                                                      if e.get("habilitada")}
     excluidas = set(ignorar.get("estaciones", []))
+    proveedor = (db or {}).get("proveedor", {})
+    silencio_ok = ignorar.get("silencio_hn", {})
     for sid in sorted(habilitadas):
         if sid in excluidas:
             continue
@@ -97,7 +129,7 @@ def condiciones(foto: dict, db: dict | None, ignorar: dict, con_audio: bool,
         edad = e.get("edad_m3u8_s")
         if edad is None or edad > STALE_SECS:
             cb = (db or {}).get("cb", {}).get(sid, {})
-            cond[k] = {"tipo": "sin_grabar", "sid": sid,
+            cond[k] = {"tipo": "sin_grabar", "sid": sid, "proveedor": proveedor.get(sid),
                        "detalle": f"m3u8 {'inexistente' if edad is None else f'de hace {int(edad)} s'}, "
                                   f"{e.get('ffmpeg', 0)} ffmpeg, CB {cb.get('cb', '?')}",
                        "resumen": f"{sid} no está grabando" + (
@@ -108,22 +140,28 @@ def condiciones(foto: dict, db: dict | None, ignorar: dict, con_audio: bool,
             cond[k] = {"tipo": "ffmpeg_duplicado", "sid": sid, "detalle": f"{e['ffmpeg']} procesos ffmpeg",
                        "resumen": f"{sid} se está grabando doble ({e['ffmpeg']} procesos)"}
         k = f"silencio:{sid}"
-        if con_audio and "audio" in e:
+        # en su horario de silencio la estación no se evalúa: ni alerta ni "ya tiene sonido"
+        fuera_del_aire = any(en_rango(hm, a, b) for a, b in silencio_ok.get(sid, []))
+        if con_audio and "audio" in e and not fuera_del_aire:
             evaluadas.add(k)
             mean = e["audio"].get("mean_db")
             if mean is not None and mean < SILENCIO_DB:
-                cond[k] = {"tipo": "silencio", "sid": sid,
+                cond[k] = {"tipo": "silencio", "sid": sid, "proveedor": proveedor.get(sid),
                            "detalle": f"mean {mean} dB / max {e['audio'].get('max_db')} dB en el último segmento",
                            "resumen": f"{sid} graba, pero sin sonido"}
 
-    evaluadas.update({"disco", "carga"})
+    evaluadas.add("disco")
     d = foto.get("disco", {})
     if d.get("usado_pct", 0) > DISCO_PCT:
         cond["disco"] = {"tipo": "disco", "sid": None,
                          "detalle": f"/ al {d['usado_pct']} % ({d.get('libre_gb')} GB libres)",
                          "resumen": f"el disco de mediaCAP está al {d['usado_pct']} %"}
+    # durante el cierre de hora la carga no se mide: el contador sigue donde estaba, así una
+    # sobrecarga que dura más que el cierre se avisa igual (a lo sumo 20 min más tarde)
     carga = foto.get("carga", [0])
-    if carga and carga[0] > CARGA_MAX:
+    if ahora_hn(ahora).minute >= CIERRE_HORA_MIN:
+        evaluadas.add("carga")
+    if "carga" in evaluadas and carga and carga[0] > CARGA_MAX:
         cond["carga"] = {"tipo": "carga", "sid": None, "detalle": f"load1 {carga[0]}",
                          "resumen": f"mediaCAP está sobrecargado (carga {carga[0]})"}
 
@@ -151,7 +189,7 @@ def condiciones(foto: dict, db: dict | None, ignorar: dict, con_audio: bool,
 
 def en_ventana_ignorada(ignorar: dict, ahora_ts: float) -> bool:
     hm = hora_hn(ahora_ts)
-    return any(a <= hm <= b for a, b in ignorar.get("ventanas_hn", []))
+    return any(en_rango(hm, a, b) for a, b in ignorar.get("ventanas_hn", []))
 
 
 def evaluar(cond: dict, evaluadas: set, estado: dict, ahora: float, silenciar: bool):
@@ -174,11 +212,14 @@ def evaluar(cond: dict, evaluadas: set, estado: dict, ahora: float, silenciar: b
                 repetidas.append({**c, "clave": k, "desde": activas[k]["desde"]})
         elif cont[k] >= UMBRAL.get(tipo, 1) and not silenciar:
             activas[k] = {"desde": ahora, "ultima_alerta": ahora, "tipo": tipo, "sid": c.get("sid")}
+            if c.get("proveedor"):
+                activas[k]["proveedor"] = c["proveedor"]
             nuevas.append(c)
     for k in list(activas):
         if k in evaluadas and k not in cond:
             a = activas.pop(k)
             recuperadas.append({"clave": k, "sid": a.get("sid"), "tipo": a["tipo"],
+                                "proveedor": a.get("proveedor"),
                                 "duracion_min": round((ahora - a["desde"]) / 60)})
     return nuevas, recuperadas, repetidas
 
@@ -232,19 +273,56 @@ def linea_volvio(r: dict) -> str:
            f"(duró {duracion(r['duracion_min'] * 60)})"
 
 
+MIN_GRUPO = 2                     # estaciones del mismo origen con lo mismo a la vez → una sola línea
+GRUPO = {"sin_grabar": ("no están grabando", "ya graban otra vez"),
+         "silencio": ("graban, pero sin sonido", "ya tienen sonido")}
+
+
+def agrupar(items: list[dict]) -> tuple[list[list[dict]], list[dict]]:
+    """(grupos de MIN_GRUPO+ estaciones con el mismo tipo y proveedor, el resto suelto)."""
+    por = defaultdict(list)
+    for c in items:
+        if c.get("proveedor") and c.get("sid") and c["tipo"] in GRUPO:
+            por[(c["tipo"], c["proveedor"])].append(c)
+    grupos = [g for g in por.values() if len(g) >= MIN_GRUPO]
+    en_grupo = {id(c) for g in grupos for c in g}
+    return grupos, [c for c in items if id(c) not in en_grupo]
+
+
+def linea_grupo(g: list[dict], ahora: float, fase: str) -> str:
+    """Una línea por proveedor: lo más probable es que el problema sea del origen, no de cada radio."""
+    sids = ", ".join(c["sid"] for c in g)
+    pasa, volvio = GRUPO[g[0]["tipo"]]
+    origen = g[0]["proveedor"]
+    if fase == "nueva":
+        return f"• {len(g)} estaciones de {origen} {pasa}: {sids} (probablemente el proveedor)"
+    if fase == "repetida":
+        desde = min(c["desde"] for c in g)
+        return f"• {len(g)} estaciones de {origen} — {NOMBRE[g[0]['tipo']]} desde " \
+               f"{cuando(desde, ahora)} ({duracion(ahora - desde)}): {sids}"
+    dura = max(r["duracion_min"] for r in g)
+    return f"• {sids} ({origen}) {volvio} (duró hasta {duracion(dura * 60)})"
+
+
+def lineas(items: list[dict], ahora: float, fase: str) -> list[str]:
+    grupos, sueltas = agrupar(items)
+    una = {"nueva": linea, "repetida": lambda c: linea_repetida(c, ahora), "volvio": linea_volvio}[fase]
+    return [linea_grupo(g, ahora, fase) for g in grupos] + [una(c) for c in sueltas]
+
+
 def mensaje(nuevas, recuperadas, repetidas, ahora, con_agente: bool = False) -> str:
     partes = []
     if nuevas:
         partes.append(f"🔴 {'Alerta' if len(nuevas) == 1 else f'{len(nuevas)} alertas'} · {hora_hn(ahora)} HN")
-        partes += [linea(c) for c in nuevas]
+        partes += lineas(nuevas, ahora, "nueva")
         if con_agente:
             partes.append("🧠 La IA lo está revisando; su diagnóstico llega en este hilo.")
     if repetidas:
         partes.append(f"🟠 Sigue pasando · {hora_hn(ahora)} HN")
-        partes += [linea_repetida(c, ahora) for c in repetidas]
+        partes += lineas(repetidas, ahora, "repetida")
     if recuperadas:
         partes.append(f"✅ Volvió a la normalidad · {hora_hn(ahora)} HN")
-        partes += [linea_volvio(r) for r in recuperadas]
+        partes += lineas(recuperadas, ahora, "volvio")
     if any(c.get("sid") for c in nuevas + repetidas) and not con_agente:     # el botón 🔕 va igual
         partes.append("🔕 Si no hay nada que hacer, silénciala: no te la vuelvo a recordar hasta que vuelva.")
     return "\n".join(partes)
@@ -368,7 +446,7 @@ def vuelta(ahora: float) -> None:
         estado["ultimo_audio"] = ahora
     db = leer_db()
     cond, reinicios, evaluadas = condiciones(foto, db, ignorar, con_audio and "error" not in foto,
-                                             estado.get("reinicios", {}))
+                                             estado.get("reinicios", {}), ahora)
     estado["reinicios"] = reinicios or estado.get("reinicios", {})
     nuevas, recuperadas, repetidas = evaluar(cond, evaluadas, estado, ahora,
                                              en_ventana_ignorada(ignorar, ahora))
